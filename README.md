@@ -39,6 +39,23 @@ deno add jsr:@marianmeres/ws
 > The client is fully runtime-agnostic, so npm consumers lose nothing they could
 > have used.
 
+## ws or sse?
+
+`@marianmeres/sse` is the sibling package: same shape of API, different
+transport, different strengths. In short —
+
+- **Reach for `ws`** when traffic is genuinely bidirectional and chatty
+  (collaborative editing, games, chat with typing indicators), when you need
+  presence, or when you need binary frames.
+- **Reach for `sse`** when traffic is mostly server → client (notifications,
+  live dashboards, progress, activity feeds), or when losing messages across a
+  reconnect is not acceptable — SSE resumes from `Last-Event-ID`, WebSocket has
+  no equivalent.
+
+They are not drop-in replacements for one another and are not meant to be. See
+[COMPARISON.md](https://jsr.io/@marianmeres/sse/doc) in the `sse` package for
+the full table.
+
 ## Usage
 
 ### Client
