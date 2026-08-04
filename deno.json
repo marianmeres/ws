@@ -1,6 +1,6 @@
 {
 	"name": "@marianmeres/ws",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"exports": {
 		".": "./src/mod.ts",
 		"./server": "./src/server.ts",
@@ -35,7 +35,12 @@
 		"@std/path": "jsr:@std/path@^1.1.6"
 	},
 	"publish": {
-		"exclude": [".*", "tests/**", "tmp/**", "example/**"]
+		"exclude": [
+			".*",
+			"tests/**",
+			"tmp/**",
+			"example/**"
+		]
 	},
 	"exclude": [
 		"example/public/dist",
