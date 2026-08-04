@@ -1,0 +1,12 @@
+node_modules/
+.idea
+.DS_Store
+.npm-dist
+tmp/*
+.env
+.env.*
+!.env.example
+
+
+# example: generated client bundle (deno task example:build)
+example/public/dist/
