@@ -14,17 +14,18 @@ import type { WSBroadcastEnvelope, WSPubSubAdapter } from "./abstract.ts";
  * This one simply declines to gossip.
  */
 export class WSPubSubLocal implements WSPubSubAdapter {
+	/** No-op: there are no peers to tell. */
 	publish(_envelope: WSBroadcastEnvelope): Promise<void> {
-		// No peers to tell.
 		return Promise.resolve();
 	}
 
+	/** No-op: nothing ever arrives from elsewhere. @returns a no-op detach */
 	onRemote(_cb: (envelope: WSBroadcastEnvelope) => void): () => void {
 		return () => {};
 	}
 
+	/** No-op: nothing is held. */
 	close(): Promise<void> {
-		// Nothing held.
 		return Promise.resolve();
 	}
 }

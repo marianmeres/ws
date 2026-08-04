@@ -83,20 +83,27 @@ export interface WSEvents {
 	message: WSMessage;
 	/** Membership change in a room subscribed with presence enabled. */
 	presence: WSPresenceEvent;
+	/** Socket closed. `willReconnect` reflects the retry classification. */
 	close: { code: number; reason: string; willReconnect: boolean };
+	/** A retry is scheduled; `delay` is the jittered backoff in ms. */
 	reconnecting: { attempt: number; delay: number };
 	/** Gave up — the only non-retrying exit. */
 	terminated: { code: number; reason: string };
+	/** Something failed but the client carries on: decode, a throwing handler, … */
 	error: Error;
 }
 
 /** Reactive connection state, delivered through the Svelte store contract. */
 export interface WSState {
+	/** Current lifecycle state. */
 	state: WSConnectionState;
+	/** `true` only in the `open` state — authenticated and usable. */
 	connected: boolean;
+	/** `true` while connecting, authenticating or waiting out a backoff. */
 	connecting: boolean;
 	/** Consecutive failed connection attempts; resets to 0 on success. */
 	attempt: number;
+	/** Most recent error, retained until the next successful connect. */
 	lastError: Error | null;
 }
 
@@ -258,6 +265,12 @@ export class WSClient<TAuth = unknown> {
 		| null = null;
 	#wakeListeners: Array<() => void> = [];
 
+	/**
+	 * Nothing connects here — the socket opens on the first `connect()`,
+	 * `subscribe()` or `publish()`.
+	 *
+	 * @param options - see {@link WSClientOptions}; every field has a default
+	 */
 	constructor(options: WSClientOptions<TAuth> = {}) {
 		this.logger = options.logger === undefined ? createClog("ws") : options.logger;
 
@@ -303,6 +316,11 @@ export class WSClient<TAuth = unknown> {
 	/**
 	 * Normalizes an endpoint: relative paths resolve against `location`, and
 	 * `http(s)` is upgraded to `ws(s)`.
+	 *
+	 * @param input - absolute url, or a path when running in a browser
+	 * @returns the normalized `ws(s)://` url
+	 * @throws {WSError} when the input cannot be resolved — outside a browser
+	 * there is no `location` to resolve a relative path against
 	 */
 	static resolveUrl(input: string | URL): URL {
 		const base = typeof globalThis.location !== "undefined"
@@ -324,10 +342,12 @@ export class WSClient<TAuth = unknown> {
 
 	// ---------------------------------------------------------------- getters
 
+	/** `true` only when authenticated and usable — not merely socket-open. */
 	get connected(): boolean {
 		return this.#state === "open";
 	}
 
+	/** Current lifecycle state. See {@link WSConnectionState}. */
 	get connectionState(): WSConnectionState {
 		return this.#state;
 	}
@@ -342,10 +362,17 @@ export class WSClient<TAuth = unknown> {
 		return this.#namespace ?? this.#requestedNamespace;
 	}
 
+	/** Resolved endpoint. A copy — mutating it does not affect the client. */
 	get url(): URL {
 		return new URL(this.#url.href);
 	}
 
+	/**
+	 * The underlying socket, or `null` while disconnected.
+	 *
+	 * Escape hatch for inspection. Sending on it directly bypasses the outbox
+	 * and the ack correlation, so don't.
+	 */
 	get socket(): WebSocket | null {
 		return this.#socket;
 	}
@@ -368,7 +395,11 @@ export class WSClient<TAuth = unknown> {
 		};
 	}
 
-	/** Debug snapshot. */
+	/**
+	 * Debug snapshot: url, state, identity, rooms and outbox counters.
+	 *
+	 * For logging and troubleshooting — the shape is not part of the stable API.
+	 */
 	dump(): Record<string, unknown> {
 		return {
 			url: this.#url.href,
@@ -385,6 +416,13 @@ export class WSClient<TAuth = unknown> {
 
 	// ----------------------------------------------------------------- events
 
+	/**
+	 * Subscribes to a lifecycle event. See {@link WSEvents}.
+	 *
+	 * @param event - event name
+	 * @param cb - handler; a throw here is caught and reported as `error`
+	 * @returns detaches the handler; also `Symbol.dispose`-compatible
+	 */
 	on<K extends keyof WSEvents>(
 		event: K,
 		cb: (data: WSEvents[K]) => void,
@@ -392,6 +430,13 @@ export class WSClient<TAuth = unknown> {
 		return this.#bus.subscribe(event as string, cb as Subscriber);
 	}
 
+	/**
+	 * Like {@link on}, but detaches after the first emission.
+	 *
+	 * @param event - event name
+	 * @param cb - handler
+	 * @returns detaches the handler early, if it has not fired yet
+	 */
 	once<K extends keyof WSEvents>(
 		event: K,
 		cb: (data: WSEvents[K]) => void,
@@ -418,6 +463,8 @@ export class WSClient<TAuth = unknown> {
 	 *
 	 * Calling this is optional when `autoConnect` is on — it is a readiness
 	 * gate, not a prerequisite.
+	 *
+	 * @returns resolves once authenticated
 	 */
 	connect(): Promise<void> {
 		if (this.#state === "disposed") {
@@ -499,6 +546,21 @@ export class WSClient<TAuth = unknown> {
 	 * it resolves as soon as the room is registered — the subscription is then
 	 * guaranteed to be established by the re-subscribe step on the next
 	 * connect, and a failure there surfaces as an `error` event.
+	 *
+	 * @param room - room name, scoped to this client's namespace
+	 * @param handler - receives every message published to the room
+	 * @param options - pass `presence` to enable membership tracking
+	 * @returns detaches this handler; also `Symbol.dispose`-compatible, and
+	 * idempotent, so calling it twice is harmless
+	 * @throws {WSRemoteError} when connected and the server refuses
+	 * @throws {WSDisposedError} when the client was disposed
+	 *
+	 * @example
+	 * ```ts
+	 * const unsub = await ws.subscribe("chat", (msg) => render(msg.payload), {
+	 *     presence: (e) => setMembers(e.members),
+	 * });
+	 * ```
 	 */
 	async subscribe<T = unknown>(
 		room: string,
@@ -547,7 +609,14 @@ export class WSClient<TAuth = unknown> {
 		return unsubscriber;
 	}
 
-	/** Removes every handler for a room and unsubscribes it. */
+	/**
+	 * Removes every handler for a room and unsubscribes it.
+	 *
+	 * The blunt counterpart to the refcounted unsubscriber returned by
+	 * {@link subscribe} — this drops other call sites' handlers too.
+	 *
+	 * @param room - room name; unknown rooms are a no-op
+	 */
 	async unsubscribe(room: string): Promise<void> {
 		this.#assertUsable();
 		if (!this.#rooms.removeRoom(room)) return;
@@ -560,11 +629,24 @@ export class WSClient<TAuth = unknown> {
 		}
 	}
 
+	/**
+	 * Whether the room is held locally.
+	 *
+	 * Reflects local intent, not server state: a room registered while offline
+	 * reads `true` before the wire subscription exists.
+	 *
+	 * @param room - room name
+	 */
 	isSubscribed(room: string): boolean {
 		return this.#rooms.has(room);
 	}
 
-	/** Last known membership of a presence-enabled room. */
+	/**
+	 * Last known membership of a presence-enabled room.
+	 *
+	 * @param room - room name
+	 * @returns a copy of the members; empty when the room has no presence
+	 */
 	members(room: string): string[] {
 		return this.#rooms.members(room);
 	}
@@ -577,6 +659,17 @@ export class WSClient<TAuth = unknown> {
 	 * Resolves with the recipient count once the server acknowledges. While
 	 * disconnected the frame is buffered and the promise stays pending until it
 	 * flushes — bounded by `sendTimeout`, never indefinitely.
+	 *
+	 * @param room - target room
+	 * @param payload - opaque application data; never inspected or mutated
+	 * @param namespace - must equal this client's namespace; the server rejects
+	 * anything else, so this is only useful for asserting the expected one
+	 * @returns the recipient count reported by the receiving server instance —
+	 * best-effort telemetry, not a delivery guarantee
+	 * @throws {WSTimeoutError} `sendTimeout` elapsed with no acknowledgement
+	 * @throws {WSOutboxDropError} evicted from a full outbox
+	 * @throws {WSNotConnectedError} sent while offline with `outboxMaxSize: 0`
+	 * @throws {WSRemoteError} the server rejected it with a `nack`
 	 */
 	publish<T = unknown>(
 		room: string,
@@ -600,6 +693,12 @@ export class WSClient<TAuth = unknown> {
 	 * This crosses the isolation boundary, which is why it is its own method
 	 * rather than a flag on {@link publish} — the server gates it separately
 	 * via `allowBroadcast`, and it denies by default.
+	 *
+	 * @param room - target room, in every namespace at once
+	 * @param payload - opaque application data
+	 * @returns the recipient count across all namespaces on the receiving
+	 * server instance
+	 * @throws {WSRemoteError} with code `forbidden` when `allowBroadcast` denies
 	 */
 	broadcast<T = unknown>(room: string, payload: T): Promise<WSPublishResult> {
 		this.#assertUsable();
@@ -1043,6 +1142,21 @@ export class WSClient<TAuth = unknown> {
  *
  * Both this and the class are exported, following the `PubSub` /
  * `createPubSub` precedent in `@marianmeres/pubsub`.
+ *
+ * @param options - see {@link WSClientOptions}
+ * @returns a client that has not connected yet
+ *
+ * @example
+ * ```ts
+ * const ws = createWSClient({
+ *     url: "wss://example.com/ws",
+ *     namespace: "org-123",
+ *     auth: () => session.token, // re-read on every reconnect
+ * });
+ *
+ * await ws.subscribe("chat", (msg) => console.log(msg.from, msg.payload));
+ * await ws.publish("chat", { text: "hello" });
+ * ```
  */
 export function createWSClient<TAuth = unknown>(
 	options: WSClientOptions<TAuth> = {},

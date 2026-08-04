@@ -9,8 +9,18 @@
 
 import type { WSErrorInfo } from "./frames.ts";
 
-/** Base class for everything thrown by this library. */
+/**
+ * Base class for everything thrown by this library.
+ *
+ * `name` is set from the concrete subclass, so it survives bundling and reads
+ * correctly in logs.
+ */
 export class WSError extends Error {
+	/**
+	 * Creates the error and stamps `name` from the concrete subclass.
+	 *
+	 * @param message - human-readable description
+	 */
 	constructor(message: string) {
 		super(message);
 		this.name = new.target.name;
@@ -24,7 +34,18 @@ export class WSError extends Error {
  * it is logged at error level and rejects any pending `connect()`.
  */
 export class WSTerminatedError extends WSError {
-	constructor(readonly code: number, readonly reason: string) {
+	/**
+	 * Built from the close event that ended the connection.
+	 *
+	 * @param code - the close code that ended it
+	 * @param reason - the close reason, possibly empty
+	 */
+	constructor(
+		/** WebSocket close code that caused the termination. */
+		readonly code: number,
+		/** Close reason as sent by the peer. May be an empty string. */
+		readonly reason: string,
+	) {
 		super(`Connection terminated (${code})${reason ? `: ${reason}` : ""}`);
 	}
 }
@@ -36,6 +57,11 @@ export class WSTerminatedError extends WSError {
  * *your await*, not the connection attempt.
  */
 export class WSConnectTimeoutError extends WSError {
+	/**
+	 * Reports the deadline that was exceeded.
+	 *
+	 * @param ms - the elapsed `connectTimeout`
+	 */
 	constructor(ms: number) {
 		super(`Not connected within ${ms}ms (still retrying in background)`);
 	}
@@ -43,6 +69,11 @@ export class WSConnectTimeoutError extends WSError {
 
 /** `sendTimeout` elapsed while queued, in flight, or awaiting an ack. */
 export class WSTimeoutError extends WSError {
+	/**
+	 * Reports the deadline that was exceeded.
+	 *
+	 * @param ms - the elapsed `sendTimeout`
+	 */
 	constructor(ms: number) {
 		super(`No acknowledgement within ${ms}ms`);
 	}
@@ -57,7 +88,14 @@ export class WSOutboxDropError extends WSError {
 
 /** The server rejected the operation with a `nack`. */
 export class WSRemoteError extends WSError {
+	/** Machine-readable code from the server — see `ERROR_CODE`. */
 	readonly code: string;
+
+	/**
+	 * Lifts a wire-level error detail into a throwable.
+	 *
+	 * @param info - the error detail carried by the `nack` frame
+	 */
 	constructor(info: WSErrorInfo) {
 		super(info.message);
 		this.code = info.code;

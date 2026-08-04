@@ -1,11 +1,24 @@
 # API
 
-## Functions
+Three entry points:
+
+| Import                     | Contains                                  | Runtime   |
+| -------------------------- | ----------------------------------------- | --------- |
+| `@marianmeres/ws`          | the client, plus everything from protocol | any       |
+| `@marianmeres/ws/server`   | the reference server                      | Deno only |
+| `@marianmeres/ws/protocol` | wire definitions only, dependency-free    | any       |
+
+---
+
+## Client
 
 ### `createWSClient(options?)`
 
-Creates a client. `WSClient` is also exported for `new WSClient(options)` — same
-thing, following the `PubSub` / `createPubSub` precedent.
+Creates a client. Nothing connects until the first `connect()`, `subscribe()`
+or `publish()`.
+
+`WSClient` is exported too — `new WSClient(options)` is the same thing,
+following the `PubSub` / `createPubSub` precedent.
 
 **Parameters**
 
@@ -31,11 +44,278 @@ thing, following the `PubSub` / `createPubSub` precedent.
 
 **Returns** `WSClient`
 
+**Example**
+
+```typescript
+import { createWSClient } from "@marianmeres/ws";
+
+const ws = createWSClient({
+	url: "wss://example.com/ws",
+	namespace: "org-123",
+	auth: () => session.token, // re-read on every reconnect
+});
+
+const unsub = await ws.subscribe("chat", (msg) => {
+	console.log(msg.from, msg.payload, msg.timestamp);
+});
+
+const { recipients } = await ws.publish("chat", { text: "hello" });
+
+unsub();
+ws.dispose();
+```
+
 ---
+
+### `WSClient`
+
+The type behind `createWSClient()`. Generic over the auth payload:
+`WSClient<TAuth>`.
+
+#### Lifecycle
+
+##### `connect(): Promise<void>`
+
+Starts the connection and resolves once authenticated.
+
+Idempotent — concurrent calls share one promise, and it resolves immediately
+when already connected. Optional when `autoConnect` is on; it is a readiness
+gate, not a prerequisite.
+
+Rejects **only** where retrying cannot help:
+
+- `WSTerminatedError` — a terminal close code
+- `WSConnectTimeoutError` — `connectTimeout` elapsed. Retrying continues in the
+  background, so this bounds _your await_, not the connection attempt
+- `WSDisposedError` — the client was disposed
+
+Ordinary network failure never rejects; that is what the infinite retry is for.
+
+##### `disconnect(): void`
+
+Stops retrying and closes the socket. **Resumable** — handlers, room
+subscriptions and buffered sends all survive, so a later `connect()` picks up
+where it left off.
+
+##### `dispose(): void`
+
+Terminal teardown: disconnects, then drops every handler, room, timer and
+pending promise. Pending sends reject with `WSDisposedError`. The instance is
+unusable afterwards.
+
+#### Subscriptions
+
+##### `subscribe<T>(room, handler, options?): Promise<Unsubscriber>`
+
+Subscribes to a room and attaches a handler.
+
+The handler is attached **synchronously**, before any frame goes out, so
+nothing arriving between the request and its acknowledgement is lost.
+
+Rooms are refcounted: N handlers produce one wire subscription, and the returned
+unsubscriber detaches only this handler — the `unsub` frame goes out when it was
+the last one. The unsubscriber is idempotent and `Symbol.dispose`-compatible.
+
+When connected this awaits the server's acknowledgement, so a refused
+subscription rejects here. When not connected it resolves once the room is
+registered; the subscription is then established by the re-subscribe on the next
+connect, and a failure there surfaces as an `error` event.
+
+**Parameters**
+
+- `room` (string) — room name, scoped to this client's namespace
+- `handler` (`MessageHandler<T>`) — receives every message published to the room
+- `options.presence` (`PresenceHandler`, optional) — enables presence for this
+  room
+
+**Example**
+
+```typescript
+const unsub = await ws.subscribe("room", (msg) => render(msg.payload), {
+	presence: (e) => {
+		// e.event is "sync" | "join" | "leave"
+		setMembers(e.members);
+	},
+});
+```
+
+##### `unsubscribe(room): Promise<void>`
+
+Removes **every** handler for a room and unsubscribes it — the blunt
+counterpart to the refcounted unsubscriber above. Unknown rooms are a no-op.
+
+##### `isSubscribed(room): boolean`
+
+Whether the room is held locally. Reflects local intent, not server state: a
+room registered while offline reads `true` before the wire subscription exists.
+
+##### `members(room): string[]`
+
+Last known membership of a presence-enabled room. Empty for rooms without
+presence.
+
+#### Sending
+
+##### `publish<T>(room, payload, namespace?): Promise<WSPublishResult>`
+
+Publishes to a room within this client's namespace. Resolves with the recipient
+count once the server acknowledges.
+
+While disconnected the frame is buffered and the promise stays pending until it
+flushes — bounded by `sendTimeout`, never indefinitely.
+
+`namespace` must equal the client's own; the server rejects anything else, so it
+is only useful for asserting the expected one.
+
+**Throws** `WSTimeoutError`, `WSOutboxDropError`, `WSNotConnectedError`,
+`WSRemoteError`, `WSDisposedError`
+
+##### `broadcast<T>(room, payload): Promise<WSPublishResult>`
+
+Publishes to a room across **all** namespaces.
+
+A separate method rather than a flag on `publish()` because crossing an
+isolation boundary deserves its own name and its own server-side check:
+`allowBroadcast` **denies by default**, and a refusal arrives as a
+`WSRemoteError` with code `"forbidden"`.
+
+#### Events
+
+##### `on<K>(event, cb): Unsubscriber` / `once<K>(event, cb): Unsubscriber`
+
+Subscribe to a lifecycle event; see [`WSEvents`](#wsevents). The returned
+unsubscriber is `Symbol.dispose`-compatible.
+
+#### Properties
+
+| Member            | Type                      | Notes                                           |
+| ----------------- | ------------------------- | ----------------------------------------------- |
+| `state`           | Svelte store of `WSState` | Fires immediately, then on every change         |
+| `connected`       | `boolean`                 | `true` only in `open` — not merely socket-open  |
+| `connectionState` | `WSConnectionState`       |                                                 |
+| `clientId`        | `string \| null`          | Server-assigned; `null` until connected         |
+| `namespace`       | `string`                  | The server's assignment wins over the request   |
+| `rooms`           | `string[]`                | Rooms currently held                            |
+| `socket`          | `WebSocket \| null`       | Escape hatch; sending on it bypasses the outbox |
+| `url`             | `URL`                     | A copy — mutating it does nothing               |
+| `logger`          | `Logger \| null`          | Assignable; set to `null` to silence            |
+| `dump()`          | `Record<string, unknown>` | Debug snapshot; shape is not stable API         |
+
+##### `WSClient.resolveUrl(input): URL` (static)
+
+Normalizes an endpoint: relative paths resolve against `location`, and
+`http(s)` is upgraded to `ws(s)`. Throws `WSError` when it cannot resolve —
+outside a browser there is no `location` for a relative path.
+
+---
+
+### `backoffDelay(attempt, base, max, rnd?)`
+
+Exponential backoff with **equal jitter**. Returns a delay in `[d/2, d]` where
+`d = min(max, base * 2^(attempt-1))`.
+
+Equal jitter rather than full jitter: full jitter can produce near-zero waits,
+which means a server coming back up gets hammered by the very clients it just
+dropped.
+
+**Parameters**
+
+- `attempt` (number) — 1-based attempt number
+- `base` (number) — initial delay in ms
+- `max` (number) — ceiling in ms
+- `rnd` (`() => number`, optional) — randomness source. Default `Math.random`
+
+**Returns** `number` — delay in ms
+
+Exported mainly so the curve is testable.
+
+---
+
+## Client types
+
+### `WSClientOptions<TAuth>`
+
+The options object documented under
+[`createWSClient`](#createwsclientoptions).
+
+### `SubscribeOptions`
+
+```typescript
+{
+	presence?: PresenceHandler;
+}
+```
+
+Presence is enabled by _providing a handler_ rather than by a separate boolean —
+one way to express the intent instead of two that can disagree. It is opt-in
+per room because a 10k-subscriber room does not want a join event per peer every
+time the fleet reconnects.
+
+### `MessageHandler<T>` / `PresenceHandler`
+
+```typescript
+type MessageHandler<T = unknown> = (msg: WSMessage<T>) => void;
+type PresenceHandler = (event: WSPresenceEvent) => void;
+```
+
+A throwing handler is caught, reported through the `error` event, and does not
+stop delivery to the others.
+
+### `WSEvents`
+
+| Event          | Payload                            |
+| -------------- | ---------------------------------- |
+| `open`         | `void` — socket open, pre-auth     |
+| `connected`    | `{ clientId, namespace }`          |
+| `message`      | `WSMessage` — firehose, every room |
+| `presence`     | `WSPresenceEvent`                  |
+| `close`        | `{ code, reason, willReconnect }`  |
+| `reconnecting` | `{ attempt, delay }`               |
+| `terminated`   | `{ code, reason }` — gave up       |
+| `error`        | `Error`                            |
+
+`error` means something failed but the client carried on (a decode failure, a
+throwing handler). `terminated` is the only non-retrying exit.
+
+### `WSState`
+
+```typescript
+{
+	state: WSConnectionState;
+	connected: boolean; // true only in "open"
+	connecting: boolean; // connecting | authenticating | reconnecting
+	attempt: number; // consecutive failures; resets to 0 on success
+	lastError: Error | null;
+}
+```
+
+Delivered through the Svelte store contract, so `$state` works directly in a
+component and any other store-compatible consumer works too:
+
+```svelte
+<script>
+    const state = ws.state;
+</script>
+
+{#if $state.connected}<Online />{:else if $state.attempt > 0}
+    <p>Reconnecting… (attempt {$state.attempt})</p>
+{/if}
+```
+
+### `WSConnectionState`
+
+`"idle" | "connecting" | "authenticating" | "open" | "reconnecting" | "terminated" | "disposed"`
+
+---
+
+## Server
+
+Import from `@marianmeres/ws/server`. **JSR only** — it needs
+`Deno.upgradeWebSocket`, so the npm package ships the client alone.
 
 ### `createWSApp(mountPath?, middlewares?, options?)`
 
-Creates the reference server. Import from `@marianmeres/ws/server` (JSR only).
+Creates a mountable demino app plus the service it is wired to.
 
 **Parameters**
 
@@ -53,123 +333,132 @@ Creates the reference server. Import from `@marianmeres/ws/server` (JSR only).
 | `options.maxFramesPerSecond` | `number`                               | `100`                     | Rate cap → `4009`                                                              |
 | `options.adapter`            | `WSPubSubAdapter`                      | `WSPubSubLocal`           | Cross-instance fan-out                                                         |
 | `options.logger`             | `Logger \| null`                       | `createClog("ws:server")` | `null` silences                                                                |
+| `options.encode` / `.decode` | `WSEncoder` / `WSDecoder`              | JSON                      | Must match the client's                                                        |
 
-**Returns** `{ app: Demino, service: WSService }`
+**Returns** `WSApp` — `{ app: Demino, service: WSService }`
+
+**Routes**, relative to `mountPath`:
+
+| Method | Path                          | Returns                     | Notes                                     |
+| ------ | ----------------------------- | --------------------------- | ----------------------------------------- |
+| GET    | `/`                           | 101, or 426 without upgrade | WebSocket upgrade                         |
+| GET    | `/stats`                      | `WSStats`                   | Guarded by `httpAuth` when supplied       |
+| POST   | `/publish/[namespace]/[room]` | `{ ok: true, recipients }`  | Requires `httpAuth`, else **not mounted** |
+| POST   | `/broadcast/[room]`           | `{ ok: true, recipients }`  | Requires `httpAuth`, else **not mounted** |
+
+The POST routes take the JSON request body as the message payload.
+
+**Example**
+
+```typescript
+import { createWSApp } from "@marianmeres/ws/server";
+
+const { app, service } = createWSApp("/ws", [], {
+	verify: async (payload, req) => {
+		const user = await authenticate((payload as any)?.token);
+		// Returning null closes the socket with 4001.
+		return user ? { clientId: user.id, namespace: user.orgId } : null;
+	},
+	allowBroadcast: (ctx, room) => room === "announcements" && ctx.meta.admin === true,
+});
+
+await service.publish("notifications", { text: "deploy finished" }, "org-123");
+
+Deno.serve(app);
+```
 
 ---
 
-### `backoffDelay(attempt, base, max, rnd?)`
-
-Exponential backoff with equal jitter. Returns a delay in `[d/2, d]` where
-`d = min(max, base * 2^(attempt-1))`. Exported mainly so the curve is testable.
-
-## Types
-
-### `WSClient`
-
-```typescript
-connect(): Promise<void>
-disconnect(): void
-dispose(): void
-
-subscribe<T>(room, handler, options?): Promise<Unsubscriber>
-unsubscribe(room): Promise<void>
-isSubscribed(room): boolean
-members(room): string[]
-
-publish<T>(room, payload, namespace?): Promise<{ recipients: number }>
-broadcast<T>(room, payload): Promise<{ recipients: number }>
-
-on<K>(event, cb): Unsubscriber
-once<K>(event, cb): Unsubscriber
-
-get state(): { subscribe(cb): Unsubscriber }   // Svelte store contract
-get connected(): boolean
-get connectionState(): WSConnectionState
-get clientId(): string | null
-get namespace(): string
-get rooms(): string[]
-get socket(): WebSocket | null
-get url(): URL
-dump(): Record<string, unknown>
-```
-
-`connect()` is idempotent — concurrent calls share one promise, and it resolves
-immediately when already connected. It rejects **only** where retrying cannot
-help: `WSTerminatedError` (terminal close code) or `WSConnectTimeoutError`
-(`connectTimeout` elapsed; retrying continues in the background). Ordinary
-network failure never rejects.
-
-`subscribe()` attaches the handler **synchronously**, before any frame goes out,
-so nothing arriving between the request and its acknowledgement is lost. When
-connected it awaits the server's acknowledgement, so a refused subscription
-rejects here; when not connected it resolves once registered, and the
-subscription is established by the re-subscribe on the next connect.
-
-### `WSEvents`
-
-| Event          | Payload                            |
-| -------------- | ---------------------------------- |
-| `open`         | `void` — socket open, pre-auth     |
-| `connected`    | `{ clientId, namespace }`          |
-| `message`      | `WSMessage` — firehose, every room |
-| `presence`     | `WSPresenceEvent`                  |
-| `close`        | `{ code, reason, willReconnect }`  |
-| `reconnecting` | `{ attempt, delay }`               |
-| `terminated`   | `{ code, reason }` — gave up       |
-| `error`        | `Error`                            |
-
-### `WSState`
-
-```typescript
-{
-	state: WSConnectionState;
-	connected: boolean;
-	connecting: boolean;
-	attempt: number;
-	lastError: Error | null;
-}
-```
-
-### `WSConnectionState`
-
-`"idle" | "connecting" | "authenticating" | "open" | "reconnecting" | "terminated" | "disposed"`
-
-### `WSMessage<T>`
-
-```typescript
-{
-	room: string;
-	namespace: string;
-	from: string | null;
-	payload: T;
-	timestamp: number;
-}
-```
-
-`from` is `null` when the message was injected server-side, which is how a
-client distinguishes server pushes from peer traffic.
-
-### `WSPresenceEvent`
-
-```typescript
-{ event: "sync" | "join" | "leave"; room: string; namespace: string;
-  clientId: string | null; members: string[]; timestamp: number }
-```
-
-`sync` carries the full snapshot and has a `null` `clientId`. It fires on every
-(re)subscribe, including after a reconnect — membership may have changed
-entirely while the client was away.
-
 ### `WSService`
 
+Owns every connection, the room index, presence and delivery. Usable standalone
+— `new WSService(options)`, driven from any `Deno.serve` handler — or through
+`createWSApp`, which mounts it as a demino app.
+
+##### `handleUpgrade(request): Response`
+
+Upgrades an HTTP request and takes ownership of the socket. Return the 101
+response from your route handler unmodified.
+
+##### `publish(room, payload, namespace?, from?): Promise<number>`
+
+Injects a message from server-side code. Delivered messages carry `from: null`
+unless you pass one, which is how clients tell server pushes from peer traffic.
+
+`namespace` defaults to `"default"`. Resolves with the recipients on **this
+instance**; peers are propagated to but not counted.
+
+##### `broadcast(room, payload, from?): Promise<number>`
+
+Publishes into a room across every namespace. `allowBroadcast` does not apply —
+that gate exists to stop _clients_ crossing the boundary, and code calling this
+is already inside the trust boundary.
+
+##### `members(room, namespace?): string[]`
+
+Every subscriber of the room, whether or not they asked for presence — presence
+controls who gets _told_ about membership, not who counts as a member.
+Instance-local.
+
+##### `stats(): WSStats`
+
+Counts only, never client ids, so it stays safe to expose unguarded in
+development.
+
+##### `close(): Promise<void>`
+
+Closes every connection and releases all timers. Idempotent. Sockets close with
+`1001 GOING_AWAY`, which is _recoverable_ — clients reconnect, which is what you
+want for a rolling deploy.
+
+##### `logger`
+
+Assignable. Set to `null` to silence.
+
+---
+
+## Server types
+
+### `WSApp`
+
 ```typescript
-handleUpgrade(request): Response
-publish(room, payload, namespace?, from?): Promise<number>
-broadcast(room, payload, from?): Promise<number>
-members(room, namespace?): string[]
-stats(): WSStats
-close(): Promise<void>
+{
+	app: Demino; // mount it, or serve it directly
+	service: WSService; // inject messages, read stats, shut down
+}
+```
+
+### `WSAppOptions`
+
+`WSServiceOptions` plus `httpAuth` and `deminoOptions` — see the
+[`createWSApp` table](#createwsappmountpath-middlewares-options).
+
+### `WSServiceOptions`
+
+Everything in that table except `httpAuth` and `deminoOptions`.
+
+### `WSConnectionContext`
+
+```typescript
+{
+	clientId: string;
+	namespace: string;
+	meta: Record<string, unknown>; // whatever verify() returned
+	request: Request; // the original upgrade request
+}
+```
+
+Passed to `allowBroadcast`.
+
+### `WSStats`
+
+```typescript
+{
+	connections: number; // authenticated
+	pending: number; // not yet authenticated
+	rooms: number; // distinct room names in use
+	namespaces: Record<string, number>; // connections per namespace
+}
 ```
 
 ### `WSPubSubAdapter`
@@ -181,21 +470,157 @@ close(): Promise<void>
 ```
 
 Local delivery is always the service's job; an adapter only propagates to peer
-instances. Only `WSPubSubLocal` (a no-op) ships today.
+instances and receives what peers send. That division is why `recipients` counts
+are instance-local and documented as best-effort telemetry.
 
-### Errors
+A rejection from `publish()` is logged and swallowed — failed gossip must not
+fail a publish that already succeeded locally.
 
-All extend `WSError`.
+### `WSPubSubLocal`
 
-| Error                   | Thrown when                                      |
-| ----------------------- | ------------------------------------------------ |
-| `WSTerminatedError`     | Terminal close code; carries `code` and `reason` |
-| `WSConnectTimeoutError` | `connectTimeout` elapsed (retrying continues)    |
-| `WSTimeoutError`        | `sendTimeout` elapsed with no acknowledgement    |
-| `WSOutboxDropError`     | Evicted from a full outbox                       |
-| `WSRemoteError`         | Server sent a `nack`; carries `code`             |
-| `WSNotConnectedError`   | Sent while disconnected with `outboxMaxSize: 0`  |
-| `WSDisposedError`       | Client was disposed                              |
+The default adapter, and the only one that ships today: there are no peer
+instances, so propagation is a no-op. Everything still works — the service
+delivers locally regardless of adapter. Redis / Deno-KV adapters are an
+unimplemented seam.
+
+### `WSBroadcastEnvelope`
+
+```typescript
+{
+	namespace: string | null; // null for a cross-namespace broadcast
+	message: WSMessage;
+}
+```
+
+---
+
+## Protocol
+
+Also re-exported from `@marianmeres/ws`. Dependency-free, for anyone
+implementing this protocol against a different server or client.
+
+### `WSMessage<T>`
+
+```typescript
+{
+	room: string;
+	namespace: string;
+	from: string | null;
+	payload: T;
+	timestamp: number; // server-assigned epoch ms
+}
+```
+
+`from` is `null` when the message was injected server-side. For a broadcast,
+`namespace` is the receiver's own — not the sender's.
+
+`payload` is **opaque**: never inspected, never mutated. Your payload may carry
+its own `type` field and nothing collides.
+
+### `WSPresenceEvent`
+
+```typescript
+{
+	event: "sync" | "join" | "leave";
+	room: string;
+	namespace: string;
+	clientId: string | null; // who joined/left; null for sync
+	members: string[];       // full membership after this event
+	timestamp: number;
+}
+```
+
+`sync` carries the full snapshot and fires on every (re)subscribe, including
+after a reconnect — membership may have changed entirely while the client was
+away.
+
+### `WSPublishResult`
+
+```typescript
+{
+	recipients: number;
+}
+```
+
+Sockets the message was handed to **on the receiving server instance**.
+Best-effort telemetry, never a delivery guarantee.
+
+### `AuthResult`
+
+What the server's `verify()` hook returns. `null` rejects the connection.
+
+```typescript
+{
+	clientId?: string;                // default: generated
+	namespace?: string;               // overrides the client's request
+	meta?: Record<string, unknown>;   // surfaces on WSConnectionContext
+}
+```
+
+### `WSErrorInfo`
+
+```typescript
+{
+	code: string; // machine-readable — see ERROR_CODE
+	message: string; // human-readable. Never parse this
+}
+```
+
+### `SubRequest`
+
+```typescript
+{
+	room: string;
+	presence?: boolean;
+}
+```
+
+### `ClientFrame` / `ServerFrame` / `WSFrame`
+
+Discriminated unions over `FRAME`, keyed on `type`. `WSFrame` is either
+direction. You need these only to write a custom `encode`/`decode` or a
+third-party implementation.
+
+| Direction       | Frames                                                     |
+| --------------- | ---------------------------------------------------------- |
+| client → server | `auth`, `sub`, `unsub`, `pub`, `broadcast`, `ping`         |
+| server → client | `hello`, `ack`, `nack`, `msg`, `presence`, `pong`, `error` |
+
+A `msg` frame minus its `type` field _is_ a `WSMessage` — no translation layer,
+no divergence between wire names and API names.
+
+### `PresenceEventType`
+
+`"sync" | "join" | "leave"` — the value union of `PRESENCE`.
+
+### `WSEncoder` / `WSDecoder`
+
+```typescript
+type WSEncoder = (frame: WSFrame) => string | ArrayBufferView | ArrayBuffer;
+type WSDecoder = (raw: string | ArrayBuffer) => WSFrame;
+```
+
+Default to JSON on both sides. Override both ends together — a mismatch closes
+the socket with `4400 PROTOCOL_ERROR`.
+
+---
+
+## Errors
+
+All extend `WSError`, so callers can branch on `instanceof` rather than
+string-matching messages.
+
+| Error                   | Thrown when                                     | Extra            |
+| ----------------------- | ----------------------------------------------- | ---------------- |
+| `WSTerminatedError`     | Terminal close code                             | `code`, `reason` |
+| `WSConnectTimeoutError` | `connectTimeout` elapsed (retrying continues)   |                  |
+| `WSTimeoutError`        | `sendTimeout` elapsed with no acknowledgement   |                  |
+| `WSOutboxDropError`     | Evicted from a full outbox                      |                  |
+| `WSRemoteError`         | Server sent a `nack`                            | `code`           |
+| `WSNotConnectedError`   | Sent while disconnected with `outboxMaxSize: 0` |                  |
+| `WSDisposedError`       | Client was disposed                             |                  |
+
+---
 
 ## Constants
 
@@ -203,7 +628,14 @@ All extend `WSError`.
 
 `1`. Announced by the server in `hello`; a mismatch warns rather than fails.
 
+### `DEFAULT_NAMESPACE`
+
+`"default"` — used when the client does not specify one.
+
 ### `CLOSE`
+
+WebSocket close codes. The `4xxx` range is reserved for application use by
+RFC 6455.
 
 | Name              | Code | Reconnects?          |
 | ----------------- | ---- | -------------------- |
@@ -220,7 +652,21 @@ All extend `WSError`.
 | `PROTOCOL_ERROR`  | 4400 | yes                  |
 | `CLIENT_GONE`     | 4900 | n/a (local)          |
 
-### `FRAME`, `ERROR_CODE`, `PRESENCE`, `DEFAULT_NAMESPACE`
+### `DEFAULT_TERMINAL_CLOSE_CODES`
 
-Frame type, error code and presence event discriminators, and the `"default"`
-namespace. See `@marianmeres/ws/protocol`.
+`[4001, 4003]` — the default for `terminalCloseCodes`. Everything _not_ listed
+reconnects, including a server-sent `1000`.
+
+### `FRAME`
+
+Frame type discriminators — the `type` field of every frame. See
+[`ClientFrame` / `ServerFrame`](#clientframe--serverframe--wsframe).
+
+### `ERROR_CODE`
+
+`"unauthorized" | "forbidden" | "bad_request" | "rate_limited" | "internal"` —
+the `code` on `WSErrorInfo` and `WSRemoteError`.
+
+### `PRESENCE`
+
+`"sync" | "join" | "leave"` — presence event discriminators.

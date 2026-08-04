@@ -54,18 +54,23 @@ export type PresenceEventType = (typeof PRESENCE)[keyof typeof PRESENCE];
  * completely while the client was away.
  */
 export interface WSPresenceEvent {
+	/** Whether this is a full snapshot or a join/leave delta. */
 	event: PresenceEventType;
+	/** Room the membership change happened in. */
 	room: string;
+	/** Namespace the room belongs to. */
 	namespace: string;
 	/** The client that joined or left. `null` for `sync`. */
 	clientId: string | null;
 	/** Full membership after applying this event. */
 	members: string[];
+	/** Server-assigned epoch milliseconds. */
 	timestamp: number;
 }
 
 /** A single room subscription request. */
 export interface SubRequest {
+	/** Room name to join. */
 	room: string;
 	/** Track membership and deliver `presence` frames for this room. */
 	presence?: boolean;

@@ -75,6 +75,24 @@ export interface WSApp {
  * | GET    | `/stats`                      | Guarded by `httpAuth` if set |
  * | POST   | `/publish/[namespace]/[room]` | Requires `httpAuth`          |
  * | POST   | `/broadcast/[room]`           | Requires `httpAuth`          |
+ *
+ * The returned `service` is the one the app is wired to, so server-side
+ * injection and the sockets share a single registry.
+ *
+ * @param mountPath - demino mount path. Default `/ws`
+ * @param middlewares - applied to every route on this app
+ * @param options - see {@link WSAppOptions}
+ * @returns the demino app and its service
+ *
+ * @example
+ * ```ts
+ * const { app, service } = createWSApp("/ws", [], {
+ *     verify: (payload) => ({ clientId: String(payload) }),
+ * });
+ *
+ * Deno.serve(app);
+ * await service.publish("general", { text: "hi" });
+ * ```
  */
 export function createWSApp(
 	mountPath: string = "/ws",

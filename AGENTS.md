@@ -92,16 +92,49 @@ not mounted without `httpAuth`. Do not "helpfully" relax either.
 **Delivery is at-most-once.** Transmitted-but-unacked sends are never resent.
 If that changes, the server needs deduplication first.
 
+## Publishing (JSR + npm)
+
+This package publishes to **both** JSR and npm, and JSR's constraints are the
+binding ones. Anything added to a public API surface must satisfy:
+
+| Requirement           | Rule                                                                           |
+| --------------------- | ------------------------------------------------------------------------------ |
+| Explicit return types | Every exported function, method and getter — no inferred returns               |
+| No slow types         | Nothing in a public signature whose type JSR cannot resolve without inference  |
+| Module docs           | A `/** … @module */` block at the top of **every** file, entry point or not    |
+| Symbol docs           | Every export **and its members** — fields, methods, getters, ctors, const keys |
+| `@param` / `@returns` | On anything non-obvious; `@throws` wherever a typed error can surface          |
+| `@example`            | On entry-point modules and the primary factories                               |
+
+Two commands enforce all of it — run both, they check different things:
+
+```bash
+deno doc --lint src/mod.ts src/server.ts src/protocol.ts   # JSDoc + return types
+deno publish --dry-run --allow-dirty                       # slow types + packaging
+```
+
+`deno doc --lint` is the strict one. Note it does **not** accept a JSDoc block
+containing only tags — `/** @param x - … */` still counts as undocumented. Lead
+with a description sentence, then the tags.
+
+Version and publish via `deno task rp` (patch) / `deno task rpm` (minor); both
+run `deno publish` then the npm build.
+
 ## Before Making Changes
 
 1. `deno task test` — 39 tests, all real sockets against a real server
-2. `deno lint && deno fmt --check && deno check src/mod.ts src/server.ts`
-3. Touching the wire? Update `src/protocol/` first, then both sides
-4. Touching reconnect, outbox or heartbeat? Read `tests/resilience.test.ts`
+2. `deno lint && deno fmt --check && deno check src/mod.ts src/server.ts src/protocol.ts`
+3. Touched a public signature? `deno doc --lint src/mod.ts src/server.ts
+   src/protocol.ts` **and** `deno publish --dry-run --allow-dirty`
+4. Touching the wire? Update `src/protocol/` first, then both sides
+5. Touching reconnect, outbox or heartbeat? Read `tests/resilience.test.ts`
    first — those tests encode the failure modes the design exists to handle
-5. `deno task npm:build` if packaging changed (npm ships the **client only**;
-   the server is Deno-only and excluded via `sourceFiles`)
-6. Changing the client or server API? Run `deno task example` and click through
+6. `deno task npm:build` if packaging changed (npm ships the **client only**;
+   the server is Deno-only and excluded via `sourceFiles`) — a new file under
+   `src/client/` or `src/protocol/` must be added to `sourceFiles` by hand
+7. Adding or changing a public export? Update `API.md` — it documents **all**
+   of them, and that completeness is the contract
+8. Changing the client or server API? Run `deno task example` and click through
    it — the example is the only place the whole stack runs together
 
 ## Known Gaps
@@ -119,6 +152,10 @@ If that changes, the server needs deduplication first.
 | Document            | Purpose                                          |
 | ------------------- | ------------------------------------------------ |
 | `README.md`         | Human-facing overview and usage                  |
-| `API.md`            | Complete API reference                           |
+| `API.md`            | Complete API reference — every public export     |
 | `example/README.md` | The reference app: what it demonstrates, and how |
-| `tmp/spec.md`       | Design spec and the decision log behind it       |
+
+`tmp/spec.md` (design spec and decision log) is referenced in some commits but
+is **untracked** — `tmp/*` is gitignored, so it does not exist in a fresh clone.
+The rationale that matters is duplicated as JSDoc on the symbol it explains;
+read that rather than reconstructing it.

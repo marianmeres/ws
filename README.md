@@ -53,8 +53,8 @@ transport, different strengths. In short —
   no equivalent.
 
 They are not drop-in replacements for one another and are not meant to be. See
-[COMPARISON.md](https://jsr.io/@marianmeres/sse/doc) in the `sse` package for
-the full table.
+[COMPARISON.md](https://github.com/marianmeres/sse/blob/master/COMPARISON.md)
+in the `sse` package for the full table.
 
 ## Usage
 
@@ -153,7 +153,7 @@ Mounted routes, relative to the mount path:
 ## Example
 
 A complete room chat — demino server plus a plain HTML client — lives in
-[example/](example/):
+[example/](https://github.com/marianmeres/ws/tree/master/example):
 
 ```bash
 deno task example    # builds the client bundle, then serves on :8000
@@ -161,7 +161,8 @@ deno task example    # builds the client bundle, then serves on :8000
 
 It exercises the handshake, namespaces, rooms, presence, acknowledged
 publishes, the broadcast gate, reconnect with buffered sends, HTTP injection
-and the pub/sub adapter seam. See [example/README.md](example/README.md).
+and the pub/sub adapter seam. See
+[example/README.md](https://github.com/marianmeres/ws/blob/master/example/README.md).
 
 ## Concepts
 

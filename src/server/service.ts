@@ -29,9 +29,13 @@ import { WSPubSubLocal } from "./adapters/local.ts";
 
 /** What a hook knows about a connection. */
 export interface WSConnectionContext {
+	/** Assigned client id, unique across live connections. */
 	clientId: string;
+	/** Namespace the connection was placed in. */
 	namespace: string;
+	/** Whatever `verify` returned as `meta`. Empty object when it returned none. */
 	meta: Record<string, unknown>;
+	/** The original upgrade request — headers, cookies, url. */
 	request: Request;
 }
 
@@ -76,9 +80,13 @@ export interface WSServiceOptions {
 	maxFrameSize?: number;
 	/** Per-connection frame rate cap. Default 100/s. */
 	maxFramesPerSecond?: number;
+	/** Cross-instance fan-out. Default {@link WSPubSubLocal} (single instance). */
 	adapter?: WSPubSubAdapter;
+	/** `null` disables logging. Default `createClog("ws:server")`. */
 	logger?: Logger | null;
+	/** Custom wire encoder. Must match the client's. */
 	encode?: WSEncoder;
+	/** Custom wire decoder. Must match the client's. */
 	decode?: WSDecoder;
 }
 
@@ -141,6 +149,12 @@ export class WSService {
 	#unsubscribeRemote: () => void;
 	#closed = false;
 
+	/**
+	 * Starts the idle sweeper and attaches to the adapter. Pair it with
+	 * {@link close} — a service left running holds an interval timer.
+	 *
+	 * @param options - see {@link WSServiceOptions}
+	 */
 	constructor(options: WSServiceOptions = {}) {
 		this.logger = options.logger === undefined
 			? createClog("ws:server")
@@ -180,6 +194,12 @@ export class WSService {
 	 *
 	 * Returns the 101 response, which must be returned from the route handler
 	 * unmodified.
+	 *
+	 * Deno-only: backed by `Deno.upgradeWebSocket`.
+	 *
+	 * @param request - the upgrade request
+	 * @returns the 101 response to hand straight back to the runtime
+	 * @throws {TypeError} when the request is not a valid upgrade
 	 */
 	handleUpgrade(request: Request): Response {
 		const { socket, response } = Deno.upgradeWebSocket(request);
@@ -218,6 +238,18 @@ export class WSService {
 	 *
 	 * Delivered messages carry `from: null`, which is how clients distinguish
 	 * server-injected messages from peer traffic.
+	 *
+	 * @param room - target room
+	 * @param payload - opaque application data
+	 * @param namespace - defaults to `"default"`
+	 * @param from - attribute the message to a client id instead of the server
+	 * @returns recipients on **this instance**; peers are propagated to but not
+	 * counted
+	 *
+	 * @example
+	 * ```ts
+	 * await service.publish("notifications", { text: "deploy finished" }, "org-123");
+	 * ```
 	 */
 	publish(
 		room: string,
@@ -236,7 +268,18 @@ export class WSService {
 		return this.#propagate({ namespace, message }, recipients);
 	}
 
-	/** Publishes into a room across every namespace. */
+	/**
+	 * Publishes into a room across every namespace.
+	 *
+	 * Server-side, so `allowBroadcast` does not apply — that gate exists to
+	 * stop *clients* crossing the boundary, and code calling this is already
+	 * inside the trust boundary.
+	 *
+	 * @param room - target room, in every namespace at once
+	 * @param payload - opaque application data
+	 * @param from - attribute the message to a client id instead of the server
+	 * @returns recipients on this instance, across all namespaces
+	 */
 	broadcast(
 		room: string,
 		payload: unknown,
@@ -254,6 +297,12 @@ export class WSService {
 		return this.#propagate({ namespace: null, message }, recipients);
 	}
 
+	/**
+	 * Connection counts for this instance.
+	 *
+	 * Counts only — never client ids — so it stays safe to expose on an
+	 * unguarded `/stats` route in development.
+	 */
 	stats(): WSStats {
 		const namespaces: Record<string, number> = {};
 		for (const conn of this.#connections.values()) {
@@ -267,12 +316,26 @@ export class WSService {
 		};
 	}
 
-	/** Members of a room within a namespace. */
+	/**
+	 * Members of a room within a namespace.
+	 *
+	 * Every subscriber is listed, whether or not they asked for presence —
+	 * presence controls who gets *told* about membership, not who counts as a
+	 * member. Instance-local.
+	 *
+	 * @param room - room name
+	 * @param namespace - defaults to `"default"`
+	 */
 	members(room: string, namespace: string = DEFAULT_NAMESPACE): string[] {
 		return [...(this.#index.get(room)?.get(namespace) ?? [])];
 	}
 
-	/** Closes every connection and releases all timers. */
+	/**
+	 * Closes every connection and releases all timers.
+	 *
+	 * Idempotent. Sockets close with `1001 GOING_AWAY`, which is *recoverable* —
+	 * clients will reconnect, which is what you want for a rolling deploy.
+	 */
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;

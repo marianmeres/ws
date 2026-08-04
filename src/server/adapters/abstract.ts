@@ -20,14 +20,25 @@ import type { WSMessage } from "../../protocol/frames.ts";
 export interface WSBroadcastEnvelope {
 	/** Target namespace, or `null` for a cross-namespace broadcast. */
 	namespace: string | null;
+	/** The message as it was delivered locally. */
 	message: WSMessage;
 }
 
 /** Propagates messages between server instances. */
 export interface WSPubSubAdapter {
-	/** Hand off to peer instances. Local delivery has already happened. */
+	/**
+	 * Hand off to peer instances. Local delivery has already happened.
+	 *
+	 * A rejection is logged and swallowed — a failed gossip must not fail the
+	 * publish that already succeeded locally.
+	 */
 	publish(envelope: WSBroadcastEnvelope): Promise<void>;
-	/** Register the sink for messages arriving from peers. */
+	/**
+	 * Register the sink for messages arriving from peers.
+	 *
+	 * @returns detaches the sink
+	 */
 	onRemote(cb: (envelope: WSBroadcastEnvelope) => void): () => void;
+	/** Release connections and timers. Called by `WSService.close()`. */
 	close(): Promise<void>;
 }

@@ -27,19 +27,33 @@ export const DEFAULT_NAMESPACE = "default";
  */
 export const FRAME = {
 	// client -> server
+	/** Handshake. Always the first frame; carries the auth payload. */
 	AUTH: "auth",
+	/** Join one or more rooms, optionally with presence. */
 	SUB: "sub",
+	/** Leave one or more rooms. */
 	UNSUB: "unsub",
+	/** Publish into a room within the connection's own namespace. */
 	PUB: "pub",
+	/** Publish into a room across every namespace. Gated server-side. */
 	BROADCAST: "broadcast",
+	/** Liveness probe. Answered with `pong`. */
 	PING: "ping",
+
 	// server -> client
+	/** Handshake accepted; carries the assigned id, namespace and version. */
 	HELLO: "hello",
+	/** Positive acknowledgement of a correlated request. */
 	ACK: "ack",
+	/** Negative acknowledgement; carries a `WSErrorInfo`. */
 	NACK: "nack",
+	/** A message delivered to a subscribed room. */
 	MSG: "msg",
+	/** A membership change in a presence-enabled room. */
 	PRESENCE: "presence",
+	/** Reply to `ping`. */
 	PONG: "pong",
+	/** Uncorrelated error — not tied to any request id. */
 	ERROR: "error",
 } as const;
 
@@ -51,9 +65,11 @@ export const FRAME = {
 export const CLOSE = {
 	/** Normal closure. Server-sent means "restarting" — the client reconnects. */
 	NORMAL: 1000,
+	/** Endpoint going away (shutdown, navigation). Recoverable. */
 	GOING_AWAY: 1001,
 	/** No close frame received. The everyday network drop. */
 	ABNORMAL: 1006,
+	/** Unexpected server-side condition. Recoverable. */
 	INTERNAL_ERROR: 1011,
 
 	/** Authentication rejected. Terminal — retrying cannot help. */
@@ -88,10 +104,15 @@ export const DEFAULT_TERMINAL_CLOSE_CODES: readonly number[] = [
 
 /** Application-level error codes carried in `nack`/`error` frames. */
 export const ERROR_CODE = {
+	/** Operation attempted before the handshake completed. */
 	UNAUTHORIZED: "unauthorized",
+	/** Authenticated, but not permitted — e.g. a denied broadcast. */
 	FORBIDDEN: "forbidden",
+	/** Malformed or nonsensical frame. */
 	BAD_REQUEST: "bad_request",
+	/** Frame rate cap exceeded. */
 	RATE_LIMITED: "rate_limited",
+	/** Unexpected server-side failure. */
 	INTERNAL: "internal",
 } as const;
 
@@ -99,6 +120,8 @@ export const ERROR_CODE = {
 export const PRESENCE = {
 	/** Full membership snapshot, sent on every (re)subscribe. */
 	SYNC: "sync",
+	/** A client joined the room. Delta — `clientId` is the joiner. */
 	JOIN: "join",
+	/** A client left the room. Delta — `clientId` is the leaver. */
 	LEAVE: "leave",
 } as const;
