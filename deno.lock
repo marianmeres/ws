@@ -15,6 +15,7 @@
     "jsr:@marianmeres/midware@^1.5.0": "1.5.0",
     "jsr:@marianmeres/npmbuild@^1.16.0": "1.16.0",
     "jsr:@marianmeres/pubsub@3": "3.0.0",
+    "jsr:@marianmeres/release@*": "2.0.0",
     "jsr:@marianmeres/simple-router@^3.4.0": "3.4.0",
     "jsr:@marianmeres/store@3": "3.0.1",
     "jsr:@marianmeres/ticker@^1.17.1": "1.17.1",
@@ -161,6 +162,9 @@
     },
     "@marianmeres/pubsub@3.0.0": {
       "integrity": "9bc40e60362801663fb23e0c00a353abec7684840b6bea410facba09c083677b"
+    },
+    "@marianmeres/release@2.0.0": {
+      "integrity": "a0358067f8500edaa795f22f6f962765a7f20edd6d8869c0793f11ee02fb47c0"
     },
     "@marianmeres/simple-router@3.4.0": {
       "integrity": "0066d33ef73a148051b1f3daf60876047803cd993704d0efa69d07a0a30bf9e8",
