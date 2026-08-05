@@ -1,0 +1,4 @@
+WebSocket client with namespaces, rooms, presence, buffered sends, acknowledged publishes
+and robust auto-reconnect (including half-open connection detection), runtime-agnostic
+(browsers, Deno, Node 22+, Bun, Workers). Includes a mountable Deno reference server
+implementing the same protocol.
