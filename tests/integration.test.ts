@@ -2,13 +2,26 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import type { DeminoHandler } from "@marianmeres/demino";
 
 import { createWSClient } from "../src/mod.ts";
-import type { WSMessage, WSPresenceEvent } from "../src/protocol/frames.ts";
+import type {
+	WSEncoder,
+	WSMessage,
+	WSPresenceEvent,
+	WSRequestedIdentity,
+} from "../src/protocol/frames.ts";
+import { FRAME } from "../src/protocol/constants.ts";
 import { WSRemoteError, WSTerminatedError } from "../src/protocol/errors.ts";
 import { startServer, until } from "./_helpers.ts";
 
 /** Quiet, heartbeat-free client — liveness has its own tests. */
 const client = (url: string, options: Record<string, unknown> = {}) =>
 	createWSClient({ url, logger: null, pingInterval: 0, ...options });
+
+/** The HTTP guard the mounted routes exist because of. */
+const adminOnly: DeminoHandler = (req: Request) => {
+	if (req.headers.get("x-key") !== "secret") {
+		return new Response("unauthorized", { status: 401 });
+	}
+};
 
 Deno.test("connect, subscribe, publish, deliver", async () => {
 	const server = startServer();
@@ -120,6 +133,67 @@ Deno.test("broadcast crosses namespaces when allowed", async () => {
 		);
 		// Receivers always see the namespace they actually live in.
 		assertEquals(seenByTwo[0].namespace, "org-2");
+	} finally {
+		one.dispose();
+		two.dispose();
+		await server.stop();
+	}
+});
+
+/** Counts how many times a `msg` frame went through the encoder. */
+function countingEncoder(): { encode: WSEncoder; count: () => number } {
+	let count = 0;
+	return {
+		encode: (frame) => {
+			if (frame.type === FRAME.MSG) count++;
+			return JSON.stringify(frame);
+		},
+		count: () => count,
+	};
+}
+
+Deno.test("a fan-out frame is encoded once, not once per subscriber", async () => {
+	const encoder = countingEncoder();
+	const server = startServer({ encode: encoder.encode });
+	const clients = ["a", "b", "c"].map((id) => client(server.url, { clientId: id }));
+
+	try {
+		const seen: WSMessage[] = [];
+		for (const c of clients) {
+			await c.connect();
+			await c.subscribe("chat", (m) => seen.push(m));
+		}
+
+		const { recipients } = await clients[0].publish("chat", { text: "hi" });
+		assertEquals(recipients, 3);
+		await until(() => seen.length === 3, "all three subscribers receive it");
+		assertEquals(encoder.count(), 1, "one namespace, one encoding");
+	} finally {
+		for (const c of clients) c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a broadcast is encoded once per namespace", async () => {
+	const encoder = countingEncoder();
+	const server = startServer({
+		encode: encoder.encode,
+		allowBroadcast: () => true,
+	});
+	const one = client(server.url, { namespace: "org-1" });
+	const two = client(server.url, { namespace: "org-2" });
+
+	try {
+		const seen: WSMessage[] = [];
+		await one.connect();
+		await two.connect();
+		await one.subscribe("alerts", (m) => seen.push(m));
+		await two.subscribe("alerts", (m) => seen.push(m));
+
+		const { recipients } = await one.broadcast("alerts", { text: "maintenance" });
+		assertEquals(recipients, 2);
+		await until(() => seen.length === 2, "both namespaces receive it");
+		assertEquals(encoder.count(), 2, "two namespaces, two encodings");
 	} finally {
 		one.dispose();
 		two.dispose();
@@ -309,29 +383,95 @@ Deno.test("verify assigns clientId and namespace", async () => {
 	}
 });
 
-Deno.test("HTTP injection routes are absent without httpAuth", async () => {
+Deno.test("verify sees the identity the client requested", async () => {
+	const seen: WSRequestedIdentity[] = [];
+	const server = startServer({
+		verify: (_payload, _request, requested) => {
+			seen.push(requested);
+			return {};
+		},
+	});
+	const c = client(server.url, { clientId: "alice", namespace: "org-1" });
+
+	try {
+		await c.connect();
+		assertEquals(seen, [{ clientId: "alice", namespace: "org-1" }]);
+		// Unchanged fallback: nothing assigned, so the proposals are honoured.
+		assertEquals(c.clientId, "alice");
+		assertEquals(c.namespace, "org-1");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("verify can reject a namespace the client is not entitled to", async () => {
+	const server = startServer({
+		verify: (payload, _request, requested) => {
+			const org = (payload as { org?: string })?.org;
+			return requested.namespace === org ? {} : null;
+		},
+	});
+	const intruder = client(server.url, {
+		namespace: "org-2",
+		auth: () => ({ org: "org-1" }),
+	});
+	const tenant = client(server.url, {
+		namespace: "org-1",
+		auth: () => ({ org: "org-1" }),
+	});
+
+	try {
+		const error = await assertRejects(() => intruder.connect(), WSTerminatedError);
+		assertEquals(error.code, 4001);
+
+		await tenant.connect();
+		assertEquals(tenant.namespace, "org-1");
+	} finally {
+		intruder.dispose();
+		tenant.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("HTTP routes are absent without httpAuth", async () => {
 	const server = startServer();
 	try {
 		// Mounting an unauthenticated "push into any room" endpoint by default
-		// would be a real vulnerability.
-		const res = await fetch(`${server.httpUrl}/publish/default/chat`, {
+		// would be a real vulnerability; and /stats names every namespace that
+		// is online, which in a multi-tenant deployment lists the tenants.
+		const injected = await fetch(`${server.httpUrl}/publish/default/chat`, {
 			method: "POST",
 			body: JSON.stringify({ x: 1 }),
 		});
+		await injected.body?.cancel();
+		assertEquals(injected.status, 404);
+
+		const stats = await fetch(`${server.httpUrl}/stats`);
+		await stats.body?.cancel();
+		assertEquals(stats.status, 404);
+	} finally {
+		await server.stop();
+	}
+});
+
+Deno.test("a malformed injection body is the client's mistake, not a 500", async () => {
+	const server = startServer({ httpAuth: adminOnly });
+	try {
+		const res = await fetch(`${server.httpUrl}/publish/default/chat`, {
+			method: "POST",
+			headers: { "x-key": "secret", "content-type": "application/json" },
+			body: "{ not json",
+		});
 		await res.body?.cancel();
-		assertEquals(res.status, 404);
+		assertEquals(res.status, 400);
 	} finally {
 		await server.stop();
 	}
 });
 
 Deno.test("HTTP injection works when guarded", async () => {
-	const httpAuth: DeminoHandler = (req: Request) => {
-		if (req.headers.get("x-key") !== "secret") {
-			return new Response("unauthorized", { status: 401 });
-		}
-	};
-	const server = startServer({ httpAuth, allowBroadcast: () => true });
+	const server = startServer({ httpAuth: adminOnly, allowBroadcast: () => true });
 	const c = client(server.url);
 
 	try {
@@ -363,7 +503,7 @@ Deno.test("HTTP injection works when guarded", async () => {
 });
 
 Deno.test("stats reports connections, rooms and namespaces", async () => {
-	const server = startServer();
+	const server = startServer({ httpAuth: adminOnly });
 	const one = client(server.url, { namespace: "org-1" });
 	const two = client(server.url, { namespace: "org-1" });
 
@@ -372,7 +512,10 @@ Deno.test("stats reports connections, rooms and namespaces", async () => {
 		await two.connect();
 		await one.subscribe("chat", () => {});
 
-		const res = await fetch(`${server.httpUrl}/stats`);
+		const res = await fetch(`${server.httpUrl}/stats`, {
+			headers: { "x-key": "secret" },
+		});
+		assertEquals(res.status, 200);
 		const stats = await res.json();
 		assertEquals(stats.connections, 2);
 		assertEquals(stats.rooms, 1);
@@ -390,6 +533,81 @@ Deno.test("a plain GET on the upgrade route explains itself", async () => {
 		const res = await fetch(server.httpUrl);
 		await res.body?.cancel();
 		assertEquals(res.status, 426);
+	} finally {
+		await server.stop();
+	}
+});
+
+/** A handshake request built by hand, so the `Origin` can be chosen freely. */
+function upgradeFetch(url: string, origin?: string): Promise<Response> {
+	const headers: Record<string, string> = {
+		upgrade: "websocket",
+		connection: "Upgrade",
+		"sec-websocket-key": btoa("0123456789abcdef"),
+		"sec-websocket-version": "13",
+	};
+	if (origin !== undefined) headers.origin = origin;
+	return fetch(url, { headers });
+}
+
+Deno.test("an unlisted Origin is refused before verify runs", async () => {
+	let verifyCalls = 0;
+	const server = startServer({
+		allowedOrigins: ["https://app.example"],
+		verify: () => {
+			verifyCalls++;
+			return {};
+		},
+	});
+
+	try {
+		const res = await upgradeFetch(server.httpUrl, "https://evil.example");
+		assertEquals(res.status, 403);
+		assertEquals(await res.text(), "Origin not allowed");
+		assertEquals(verifyCalls, 0);
+
+		const allowed = await upgradeFetch(server.httpUrl, "https://app.example");
+		assertEquals(allowed.status, 101);
+		await allowed.body?.cancel();
+	} finally {
+		await server.stop();
+	}
+});
+
+Deno.test("the array form lets a client that sends no Origin through", async () => {
+	// Only browsers send the header; Deno's own WebSocket sends none.
+	const server = startServer({ allowedOrigins: ["https://app.example"] });
+	const c = client(server.url);
+
+	try {
+		await c.connect();
+		assertEquals(c.connected, true);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("the function form decides on its own", async () => {
+	const seen: (string | null)[] = [];
+	const server = startServer({
+		allowedOrigins: (origin) => {
+			seen.push(origin);
+			return origin === "https://app.example";
+		},
+	});
+
+	try {
+		// Unlike the array form, a missing Origin is not a free pass here.
+		const missing = await upgradeFetch(server.httpUrl);
+		await missing.body?.cancel();
+		assertEquals(missing.status, 403);
+
+		const allowed = await upgradeFetch(server.httpUrl, "https://app.example");
+		assertEquals(allowed.status, 101);
+		await allowed.body?.cancel();
+
+		assertEquals(seen, [null, "https://app.example"]);
 	} finally {
 		await server.stop();
 	}

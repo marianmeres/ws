@@ -20,9 +20,11 @@ import type {
 	ClientFrame,
 	PresenceEventType,
 	ServerFrame,
+	SubRequest,
 	WSDecoder,
 	WSEncoder,
 	WSMessage,
+	WSRequestedIdentity,
 } from "../protocol/frames.ts";
 import type { WSBroadcastEnvelope, WSPubSubAdapter } from "./adapters/abstract.ts";
 import { WSPubSubLocal } from "./adapters/local.ts";
@@ -57,11 +59,30 @@ export interface WSServiceOptions {
 	 * Authenticates a connection. Return `null` (or throw) to reject with
 	 * {@link CLOSE.AUTH_FAILED}. Omitted entirely means "no authentication",
 	 * which is fine for development and not for anything else.
+	 *
+	 * **Isolation rule.** Namespace is the isolation boundary and `clientId` is
+	 * the identity peers see, yet both fall back to what the client asked for:
+	 * assigned → requested → generated. In any multi-tenant deployment `verify`
+	 * must therefore return `namespace` and `clientId`; otherwise the client's
+	 * proposals are honoured verbatim. `requested` carries those proposals so
+	 * they can be validated here, instead of being duplicated into `payload`.
 	 */
 	verify?: (
 		payload: unknown,
 		request: Request,
+		requested: WSRequestedIdentity,
 	) => Promise<AuthResult | null> | AuthResult | null;
+	/**
+	 * Origins allowed to open a socket. Unset means no check — safe only when
+	 * `verify` does not rely on cookies, because a cookie-authenticated socket
+	 * with no origin check is the cross-site WebSocket hijacking setup: a page
+	 * on any other site opens one and the browser attaches the cookies.
+	 *
+	 * An array permits a *missing* `Origin` (non-browser clients send none) and
+	 * requires a listed one when present; a function decides on its own. A
+	 * rejected request is answered `403` and never reaches `verify`.
+	 */
+	allowedOrigins?: string[] | ((origin: string | null, request: Request) => boolean);
 	/**
 	 * Gate for cross-namespace broadcast. **Denies by default** — letting any
 	 * client punch through every namespace boundary is not a safe default, and
@@ -72,7 +93,13 @@ export interface WSServiceOptions {
 		ctx: WSConnectionContext,
 		room: string,
 	) => boolean | Promise<boolean>;
-	/** Deadline for the client's `auth` frame. Default 5_000. */
+	/**
+	 * Deadline for the client's `auth` frame. Default 5_000.
+	 *
+	 * It bounds the *arrival* of the frame, not the handshake: the timer is
+	 * cleared the moment the frame lands, so a slow `verify` is bounded only by
+	 * the client's own liveness deadline (10 s in the stock client).
+	 */
 	authTimeout?: number;
 	/** Close a connection silent for this long. Default 60_000 (~2 missed pings). */
 	idleTimeout?: number;
@@ -99,6 +126,10 @@ interface Connection {
 	meta: Record<string, unknown>;
 	request: Request;
 	authed: boolean;
+	/** A handshake is in flight — `verify` has been called and has not answered. */
+	verifying: boolean;
+	/** The socket is gone and must never be registered again. */
+	closed: boolean;
 	lastSeen: number;
 	authTimer?: ReturnType<typeof setTimeout>;
 	windowStart: number;
@@ -116,6 +147,11 @@ const defaultEncode: WSEncoder = (frame) => JSON.stringify(frame);
 const defaultDecode: WSDecoder = (raw) =>
 	JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw));
 
+/** The value if it is a usable string, `undefined` otherwise. */
+function nonEmptyString(value: unknown): string | undefined {
+	return typeof value === "string" && value ? value : undefined;
+}
+
 /**
  * Owns every connection, the room index, and message delivery.
  *
@@ -126,10 +162,17 @@ export class WSService {
 	#options: Required<
 		Omit<
 			WSServiceOptions,
-			"verify" | "allowBroadcast" | "adapter" | "logger" | "encode" | "decode"
+			| "verify"
+			| "allowedOrigins"
+			| "allowBroadcast"
+			| "adapter"
+			| "logger"
+			| "encode"
+			| "decode"
 		>
 	>;
 	#verify: WSServiceOptions["verify"];
+	#allowedOrigins: WSServiceOptions["allowedOrigins"];
 	#allowBroadcast: WSServiceOptions["allowBroadcast"];
 	#adapter: WSPubSubAdapter;
 	#encode: WSEncoder;
@@ -168,6 +211,7 @@ export class WSService {
 				DEFAULTS.maxFramesPerSecond,
 		};
 		this.#verify = options.verify;
+		this.#allowedOrigins = options.allowedOrigins;
 		this.#allowBroadcast = options.allowBroadcast;
 		this.#adapter = options.adapter ?? new WSPubSubLocal();
 		this.#encode = options.encode ?? defaultEncode;
@@ -197,11 +241,21 @@ export class WSService {
 	 *
 	 * Deno-only: backed by `Deno.upgradeWebSocket`.
 	 *
+	 * When {@link WSServiceOptions.allowedOrigins} is set and the request's
+	 * `Origin` is not allowed, nothing is upgraded and a `403` comes back
+	 * instead — `verify` is never reached.
+	 *
 	 * @param request - the upgrade request
-	 * @returns the 101 response to hand straight back to the runtime
+	 * @returns the 101 response to hand straight back to the runtime, or `403`
 	 * @throws {TypeError} when the request is not a valid upgrade
 	 */
 	handleUpgrade(request: Request): Response {
+		const origin = request.headers.get("origin");
+		if (!this.#originAllowed(origin, request)) {
+			this.logger?.debug?.(`upgrade rejected, origin: ${origin}`);
+			return new Response("Origin not allowed", { status: 403 });
+		}
+
 		const { socket, response } = Deno.upgradeWebSocket(request);
 
 		const conn: Connection = {
@@ -212,6 +266,8 @@ export class WSService {
 			meta: {},
 			request,
 			authed: false,
+			verifying: false,
+			closed: false,
 			lastSeen: Date.now(),
 			windowStart: Date.now(),
 			windowCount: 0,
@@ -225,7 +281,13 @@ export class WSService {
 		}, this.#options.authTimeout);
 
 		socket.onmessage = (event: MessageEvent) => {
-			void this.#onMessage(conn, event.data);
+			// Last line of defence. `#onMessage` contains its own throws; if one
+			// ever escapes anyway, it must cost this socket and not the process —
+			// an unhandled rejection is fatal in Deno.
+			void this.#onMessage(conn, event.data).catch((e) => {
+				this.logger?.error?.(`unhandled frame error (${conn.id}): ${e}`);
+				this.#close(conn, CLOSE.INTERNAL_ERROR, "internal error");
+			});
 		};
 		socket.onclose = () => this.#onClose(conn);
 		socket.onerror = () => this.logger?.debug?.(`socket error (${conn.id})`);
@@ -300,8 +362,10 @@ export class WSService {
 	/**
 	 * Connection counts for this instance.
 	 *
-	 * Counts only — never client ids — so it stays safe to expose on an
-	 * unguarded `/stats` route in development.
+	 * Counts only, never client ids — but `namespaces` is keyed by namespace
+	 * name, which in a multi-tenant deployment enumerates the tenants that are
+	 * online. That is why the `/stats` route is mounted only behind `httpAuth`;
+	 * this method itself is meant for in-process use.
 	 */
 	stats(): WSStats {
 		const namespaces: Record<string, number> = {};
@@ -356,6 +420,16 @@ export class WSService {
 
 	// -------------------------------------------------------------- internals
 
+	#originAllowed(origin: string | null, request: Request): boolean {
+		if (!this.#allowedOrigins) return true;
+		if (typeof this.#allowedOrigins === "function") {
+			return this.#allowedOrigins(origin, request);
+		}
+		// Only browsers send Origin, and browsers are the whole point of the
+		// check — a request without one cannot be a hijacked page.
+		return origin === null || this.#allowedOrigins.includes(origin);
+	}
+
 	async #propagate(
 		envelope: WSBroadcastEnvelope,
 		recipients: number,
@@ -391,6 +465,26 @@ export class WSService {
 			return this.#close(conn, CLOSE.PROTOCOL_ERROR, "malformed frame");
 		}
 
+		try {
+			return await this.#dispatch(conn, frame);
+		} catch (e) {
+			// A handler that threw may have left this connection's bookkeeping
+			// half-updated, so the socket goes. 1011 is recoverable: the client
+			// reconnects into clean state, and every other client is unaffected.
+			this.logger?.error?.(`frame handler threw (${conn.id}): ${e}`);
+			this.#send(conn, {
+				type: FRAME.ERROR,
+				error: { code: ERROR_CODE.INTERNAL, message: "internal error" },
+			});
+			return this.#close(conn, CLOSE.INTERNAL_ERROR, "internal error");
+		}
+	}
+
+	/**
+	 * Routes one decoded frame. Everything it touches came off the wire, so
+	 * nothing but `type` may be assumed to have the shape the types promise.
+	 */
+	async #dispatch(conn: Connection, frame: ClientFrame): Promise<void> {
 		if (!frame || typeof frame.type !== "string") {
 			return this.#send(conn, {
 				type: FRAME.ERROR,
@@ -448,24 +542,47 @@ export class WSService {
 		clearTimeout(conn.authTimer);
 		conn.authTimer = undefined;
 
-		if (conn.authed) return; // ignore a repeated handshake
+		// Ignore a repeated handshake — including one that arrives while the
+		// first is still awaiting `verify`, which would otherwise run the hook
+		// twice and answer with two `hello` frames.
+		if (conn.authed || conn.verifying) return;
+
+		// The client's proposals are hints, and an empty or non-string one is
+		// no hint at all — it must not become a registry key.
+		const proposedId = nonEmptyString(frame.clientId);
+		const proposedNamespace = nonEmptyString(frame.namespace);
 
 		let result: AuthResult | null = {};
 		if (this.#verify) {
+			conn.verifying = true;
 			try {
-				result = await this.#verify(frame.payload, conn.request);
+				result = await this.#verify(frame.payload, conn.request, {
+					clientId: proposedId,
+					namespace: proposedNamespace ?? DEFAULT_NAMESPACE,
+				});
 			} catch (e) {
 				this.logger?.debug?.(`verify threw: ${e}`);
 				result = null;
+			} finally {
+				conn.verifying = false;
 			}
+		}
+
+		// The socket may have gone while `verify` was thinking. `#onClose`
+		// has already run, so registering now would create an entry nothing
+		// ever removes — a ghost connection until the idle sweeper reaps it,
+		// or forever with `idleTimeout: 0`.
+		if (conn.closed || conn.socket.readyState !== WebSocket.OPEN) {
+			this.logger?.debug?.("socket closed mid-handshake");
+			return;
 		}
 
 		if (result === null) {
 			return this.#close(conn, CLOSE.AUTH_FAILED, "authentication failed");
 		}
 
-		const id = result.clientId ?? frame.clientId ?? conn.id;
-		const namespace = result.namespace ?? frame.namespace ?? DEFAULT_NAMESPACE;
+		const id = result.clientId ?? proposedId ?? conn.id;
+		const namespace = result.namespace ?? proposedNamespace ?? DEFAULT_NAMESPACE;
 
 		// Same id reconnecting: the newcomer wins, the stale socket goes. This
 		// is what makes a reconnect after a half-open drop actually recover
@@ -493,16 +610,19 @@ export class WSService {
 		});
 	}
 
-	#onSub(
-		conn: Connection,
-		id: string,
-		requests: Array<{ room: string; presence?: boolean }>,
-	): void {
+	#onSub(conn: Connection, id: string, requests: unknown): void {
+		if (!Array.isArray(requests)) {
+			return this.#nack(conn, id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "rooms must be an array",
+			});
+		}
+
 		const syncRooms: string[] = [];
 
-		for (const request of requests ?? []) {
-			const room = request?.room;
-			if (typeof room !== "string" || !room) continue;
+		for (const request of requests as SubRequest[]) {
+			const room = nonEmptyString(request?.room);
+			if (!room) continue;
 
 			const isNew = !conn.rooms.has(room);
 			conn.rooms.set(room, !!request.presence);
@@ -533,9 +653,16 @@ export class WSService {
 		this.#send(conn, { type: FRAME.ACK, id });
 	}
 
-	#onUnsub(conn: Connection, id: string, rooms: string[]): void {
-		for (const room of rooms ?? []) {
-			if (!conn.rooms.delete(room)) continue;
+	#onUnsub(conn: Connection, id: string, rooms: unknown): void {
+		if (!Array.isArray(rooms)) {
+			return this.#nack(conn, id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "rooms must be an array",
+			});
+		}
+
+		for (const room of rooms) {
+			if (typeof room !== "string" || !conn.rooms.delete(room)) continue;
 			this.#indexRemove(room, conn.namespace, conn.id);
 			this.#notifyPresence(room, conn.namespace, PRESENCE.LEAVE, conn.id);
 		}
@@ -546,6 +673,21 @@ export class WSService {
 		conn: Connection,
 		frame: Extract<ClientFrame, { type: typeof FRAME.PUB }>,
 	): Promise<void> {
+		const room = nonEmptyString(frame.room);
+		if (!room) {
+			return this.#nack(conn, frame.id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "missing room",
+			});
+		}
+
+		if (frame.namespace && typeof frame.namespace !== "string") {
+			return this.#nack(conn, frame.id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "namespace must be a string",
+			});
+		}
+
 		// A client may only publish into its own namespace. Accepting the
 		// requested one blindly would make the isolation boundary decorative.
 		const namespace = conn.namespace;
@@ -557,7 +699,7 @@ export class WSService {
 		}
 
 		const message: WSMessage = {
-			room: frame.room,
+			room,
 			namespace,
 			from: conn.id,
 			payload: frame.payload,
@@ -572,6 +714,14 @@ export class WSService {
 		conn: Connection,
 		frame: Extract<ClientFrame, { type: typeof FRAME.BROADCAST }>,
 	): Promise<void> {
+		const room = nonEmptyString(frame.room);
+		if (!room) {
+			return this.#nack(conn, frame.id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "missing room",
+			});
+		}
+
 		const ctx: WSConnectionContext = {
 			clientId: conn.id,
 			namespace: conn.namespace,
@@ -582,7 +732,7 @@ export class WSService {
 		let allowed = false;
 		try {
 			allowed = this.#allowBroadcast
-				? await this.#allowBroadcast(ctx, frame.room)
+				? await this.#allowBroadcast(ctx, room)
 				: false;
 		} catch (e) {
 			this.logger?.debug?.(`allowBroadcast threw: ${e}`);
@@ -597,7 +747,7 @@ export class WSService {
 		}
 
 		const message: WSMessage = {
-			room: frame.room,
+			room,
 			namespace: "*",
 			from: conn.id,
 			payload: frame.payload,
@@ -620,12 +770,22 @@ export class WSService {
 
 		let count = 0;
 		const deliver = (ids: Set<string>, ns: string) => {
+			// The frame differs between recipients only by namespace, so it is
+			// encoded once per namespace instead of once per socket. Receivers
+			// always see the namespace they actually live in, even for a
+			// broadcast that originated outside it.
+			let wire: string | ArrayBufferView | ArrayBuffer;
+			try {
+				wire = this.#encode({ type: FRAME.MSG, ...message, namespace: ns });
+			} catch (e) {
+				// One namespace's encoder failure must not abort the others.
+				this.logger?.debug?.(`encode failed (namespace ${ns}): ${e}`);
+				return;
+			}
 			for (const id of ids) {
 				const conn = this.#connections.get(id);
 				if (!conn) continue;
-				// Receivers always see the namespace they actually live in,
-				// even for a broadcast that originated outside it.
-				this.#send(conn, { type: FRAME.MSG, ...message, namespace: ns });
+				this.#sendEncoded(conn, wire);
 				count++;
 			}
 		};
@@ -694,6 +854,7 @@ export class WSService {
 	}
 
 	#onClose(conn: Connection): void {
+		conn.closed = true;
 		clearTimeout(conn.authTimer);
 		conn.authTimer = undefined;
 		this.#pending.delete(conn);
@@ -742,8 +903,23 @@ export class WSService {
 
 	#send(conn: Connection, frame: ServerFrame): void {
 		if (conn.socket.readyState !== WebSocket.OPEN) return;
+		let wire: string | ArrayBufferView | ArrayBuffer;
 		try {
-			conn.socket.send(this.#encode(frame));
+			wire = this.#encode(frame);
+		} catch (e) {
+			this.logger?.debug?.(`encode failed (${conn.id}): ${e}`);
+			return;
+		}
+		this.#sendEncoded(conn, wire);
+	}
+
+	#sendEncoded(
+		conn: Connection,
+		wire: string | ArrayBufferView | ArrayBuffer,
+	): void {
+		if (conn.socket.readyState !== WebSocket.OPEN) return;
+		try {
+			conn.socket.send(wire);
 		} catch (e) {
 			this.logger?.debug?.(`send failed (${conn.id}): ${e}`);
 		}

@@ -42,6 +42,11 @@ following the `PubSub` / `createPubSub` precedent.
 | `onOutboxDrop`       | `(frames: ClientFrame[]) => void`   | —                  | Called with evicted frames                                                    |
 | `encode` / `decode`  | `WSEncoder` / `WSDecoder`           | JSON               | Must match the server's                                                       |
 
+`pingInterval: 0` disables the client's heartbeat, not the server's reaper: the
+reference server still closes a connection that sent nothing for `idleTimeout`
+(60 s) with `4008`, so a heartbeat-free client reconnects roughly every minute.
+Disable both or neither.
+
 **Returns** `WSClient`
 
 **Example**
@@ -84,10 +89,14 @@ gate, not a prerequisite.
 
 Rejects **only** where retrying cannot help:
 
-- `WSTerminatedError` — a terminal close code
+- `WSTerminatedError` — a terminal close code, or code `4900` when
+  `disconnect()` (or `dispose()`, which disconnects first) is called while this
+  is still pending
 - `WSConnectTimeoutError` — `connectTimeout` elapsed. Retrying continues in the
   background, so this bounds _your await_, not the connection attempt
-- `WSDisposedError` — the client was disposed
+- `WSDisposedError` — called on an already disposed client. A `dispose()`
+  _during_ a pending connect settles it with the `4900` `WSTerminatedError`
+  above, not with this
 
 Ordinary network failure never rejects; that is what the infinite retry is for.
 
@@ -96,6 +105,10 @@ Ordinary network failure never rejects; that is what the infinite retry is for.
 Stops retrying and closes the socket. **Resumable** — handlers, room
 subscriptions and buffered sends all survive, so a later `connect()` picks up
 where it left off.
+
+Emits `close` with code `4900` (`CLOSE.CLIENT_GONE`) and `willReconnect: false`
+when there was a socket to close; nothing when already idle, reconnecting or
+terminated.
 
 ##### `dispose(): void`
 
@@ -162,13 +175,20 @@ Publishes to a room within this client's namespace. Resolves with the recipient
 count once the server acknowledges.
 
 While disconnected the frame is buffered and the promise stays pending until it
-flushes — bounded by `sendTimeout`, never indefinitely.
+flushes — bounded by `sendTimeout`, never indefinitely. A frame already in
+flight when the socket closes rejects there and then with
+`WSConnectionLostError`; it is not resent. After a terminal close nothing is
+buffered at all: the promise rejects immediately with `WSTerminatedError`,
+because only an explicit `connect()` leaves that state.
 
 `namespace` must equal the client's own; the server rejects anything else, so it
 is only useful for asserting the expected one.
 
-**Throws** `WSTimeoutError`, `WSOutboxDropError`, `WSNotConnectedError`,
-`WSRemoteError`, `WSDisposedError`
+A payload `encode` refuses — a `BigInt` is enough for the JSON default — rejects
+with the encoder's own error, unwrapped, and also surfaces as an `error` event.
+
+**Throws** `WSTimeoutError`, `WSConnectionLostError`, `WSOutboxDropError`,
+`WSNotConnectedError`, `WSTerminatedError`, `WSRemoteError`, `WSDisposedError`
 
 ##### `broadcast<T>(room, payload): Promise<WSPublishResult>`
 
@@ -277,6 +297,9 @@ stop delivery to the others.
 `error` means something failed but the client carried on (a decode failure, a
 throwing handler). `terminated` is the only non-retrying exit.
 
+A local `disconnect()` is a `close` too: code `4900`, `willReconnect: false` —
+that pair is how a deliberate teardown is told apart from a lost connection.
+
 ### `WSState`
 
 ```typescript
@@ -319,34 +342,36 @@ Creates a mountable demino app plus the service it is wired to.
 
 **Parameters**
 
-| Name                         | Type                                   | Default                   | Description                                                                    |
-| ---------------------------- | -------------------------------------- | ------------------------- | ------------------------------------------------------------------------------ |
-| `mountPath`                  | `string`                               | `"/ws"`                   | Demino mount path                                                              |
-| `middlewares`                | `DeminoHandler[]`                      | `[]`                      | Applied to all routes                                                          |
-| `options.verify`             | `(payload, req) => AuthResult \| null` | —                         | Return `null` (or throw) to reject with `4001`. Absent means no authentication |
-| `options.allowBroadcast`     | `(ctx, room) => boolean`               | **deny**                  | Gate for cross-namespace broadcast                                             |
-| `options.httpAuth`           | `DeminoHandler`                        | —                         | Guards the HTTP routes. **Without it they are not mounted**                    |
-| `options.deminoOptions`      | `DeminoOptions`                        | —                         | Passed through to `demino()`                                                   |
-| `options.authTimeout`        | `number`                               | `5_000`                   | Deadline for the `auth` frame → `4002`                                         |
-| `options.idleTimeout`        | `number`                               | `60_000`                  | Reap silent connections → `4008`                                               |
-| `options.maxFrameSize`       | `number`                               | `262144`                  | Oversized frames → `4013`                                                      |
-| `options.maxFramesPerSecond` | `number`                               | `100`                     | Rate cap → `4009`                                                              |
-| `options.adapter`            | `WSPubSubAdapter`                      | `WSPubSubLocal`           | Cross-instance fan-out                                                         |
-| `options.logger`             | `Logger \| null`                       | `createClog("ws:server")` | `null` silences                                                                |
-| `options.encode` / `.decode` | `WSEncoder` / `WSDecoder`              | JSON                      | Must match the client's                                                        |
+| Name                         | Type                                              | Default                   | Description                                                                                                                                                                   |
+| ---------------------------- | ------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mountPath`                  | `string`                                          | `"/ws"`                   | Demino mount path                                                                                                                                                             |
+| `middlewares`                | `DeminoHandler[]`                                 | `[]`                      | Applied to all routes                                                                                                                                                         |
+| `options.verify`             | `(payload, req, requested) => AuthResult \| null` | —                         | Return `null` (or throw) to reject with `4001`. Absent means no authentication. `requested` is the identity the client asked for — see [below](#security-namespace-isolation) |
+| `options.allowedOrigins`     | `string[] \| (origin, req) => boolean`            | — (no check)              | Origins allowed to upgrade → `403` — see [below](#security-cross-site-websocket-hijacking)                                                                                    |
+| `options.allowBroadcast`     | `(ctx, room) => boolean`                          | **deny**                  | Gate for cross-namespace broadcast                                                                                                                                            |
+| `options.httpAuth`           | `DeminoHandler`                                   | —                         | Guards the HTTP routes. **Without it they are not mounted**                                                                                                                   |
+| `options.deminoOptions`      | `DeminoOptions`                                   | —                         | Passed through to `demino()`                                                                                                                                                  |
+| `options.authTimeout`        | `number`                                          | `5_000`                   | Deadline for the `auth` frame → `4002`                                                                                                                                        |
+| `options.idleTimeout`        | `number`                                          | `60_000`                  | Reap silent connections → `4008`                                                                                                                                              |
+| `options.maxFrameSize`       | `number`                                          | `262144`                  | Oversized frames → `4013`                                                                                                                                                     |
+| `options.maxFramesPerSecond` | `number`                                          | `100`                     | Rate cap → `4009`                                                                                                                                                             |
+| `options.adapter`            | `WSPubSubAdapter`                                 | `WSPubSubLocal`           | Cross-instance fan-out                                                                                                                                                        |
+| `options.logger`             | `Logger \| null`                                  | `createClog("ws:server")` | `null` silences                                                                                                                                                               |
+| `options.encode` / `.decode` | `WSEncoder` / `WSDecoder`                         | JSON                      | Must match the client's                                                                                                                                                       |
 
 **Returns** `WSApp` — `{ app: Demino, service: WSService }`
 
 **Routes**, relative to `mountPath`:
 
-| Method | Path                          | Returns                     | Notes                                     |
-| ------ | ----------------------------- | --------------------------- | ----------------------------------------- |
-| GET    | `/`                           | 101, or 426 without upgrade | WebSocket upgrade                         |
-| GET    | `/stats`                      | `WSStats`                   | Guarded by `httpAuth` when supplied       |
-| POST   | `/publish/[namespace]/[room]` | `{ ok: true, recipients }`  | Requires `httpAuth`, else **not mounted** |
-| POST   | `/broadcast/[room]`           | `{ ok: true, recipients }`  | Requires `httpAuth`, else **not mounted** |
+| Method | Path                          | Returns                    | Notes                                     |
+| ------ | ----------------------------- | -------------------------- | ----------------------------------------- |
+| GET    | `/`                           | 101, 426 without upgrade   | WebSocket upgrade, `403` on a bad origin  |
+| GET    | `/stats`                      | `WSStats`                  | Requires `httpAuth`, else **not mounted** |
+| POST   | `/publish/[namespace]/[room]` | `{ ok: true, recipients }` | Requires `httpAuth`, else **not mounted** |
+| POST   | `/broadcast/[room]`           | `{ ok: true, recipients }` | Requires `httpAuth`, else **not mounted** |
 
-The POST routes take the JSON request body as the message payload.
+The POST routes take the JSON request body as the message payload; a body that
+is not valid JSON answers `400`.
 
 **Example**
 
@@ -367,6 +392,63 @@ await service.publish("notifications", { text: "deploy finished" }, "org-123");
 Deno.serve(app);
 ```
 
+#### Security: namespace isolation
+
+Namespace is the isolation boundary and `clientId` is the identity peers see in
+`from` — and a claimed id evicts whoever holds it. Both fall back to what the
+client asked for:
+
+```
+assigned by verify  →  requested by the client  →  generated
+```
+
+**In any multi-tenant deployment `verify` must return `namespace` and
+`clientId`.** Return neither and the client's proposals are honoured verbatim,
+so any authenticated user can enter any tenant. The third argument,
+[`WSRequestedIdentity`](#wsrequestedidentity), carries those proposals, so they
+can be validated there rather than duplicated into the auth payload:
+
+```typescript
+createWSApp("/ws", [], {
+	verify: async (payload, req, requested) => {
+		const user = await authenticate((payload as any)?.token);
+		if (!user) return null;
+		// The namespace is checked, not trusted — and assigned either way.
+		if (!user.orgs.includes(requested.namespace)) return null;
+		return { clientId: user.id, namespace: requested.namespace };
+	},
+});
+```
+
+#### Security: cross-site WebSocket hijacking
+
+The upgrade request is an ordinary browser request, so the browser attaches its
+cookies for your origin no matter which site opened the socket. A `verify` that
+authenticates from cookies therefore authenticates the attacker's page too —
+same-origin policy does not apply to WebSockets, and there is no preflight.
+
+`allowedOrigins` closes that, and is **opt-in**: unset, nothing is checked.
+
+```typescript
+createWSApp("/ws", [], {
+	allowedOrigins: ["https://app.example"],
+	verify: (_payload, req) => sessionFromCookie(req),
+});
+```
+
+An unlisted `Origin` is answered `403 Origin not allowed` and never reaches
+`verify`. The array form **permits a missing `Origin`**, because only browsers
+send the header and non-browser clients (the stock Deno client included) send
+none — the check exists to stop browsers. Pass a function instead when that is
+too lax, or when the allowed set is dynamic:
+
+```typescript
+allowedOrigins: (origin, req) => origin !== null && isTenantOrigin(origin),
+```
+
+Token authentication in the `auth` payload is not exposed this way: another
+site's page cannot read your token, only ride your cookies.
+
 ---
 
 ### `WSService`
@@ -378,7 +460,8 @@ Owns every connection, the room index, presence and delivery. Usable standalone
 ##### `handleUpgrade(request): Response`
 
 Upgrades an HTTP request and takes ownership of the socket. Return the 101
-response from your route handler unmodified.
+response from your route handler unmodified. With `allowedOrigins` set, a
+disallowed request is answered `403` instead and nothing is upgraded.
 
 ##### `publish(room, payload, namespace?, from?): Promise<number>`
 
@@ -402,8 +485,10 @@ Instance-local.
 
 ##### `stats(): WSStats`
 
-Counts only, never client ids, so it stays safe to expose unguarded in
-development.
+Counts only, never client ids — but `namespaces` is keyed by namespace name, so
+in a multi-tenant deployment it enumerates the tenants that are online. Hence
+the `/stats` route only exists behind `httpAuth`; this method is for in-process
+use.
 
 ##### `close(): Promise<void>`
 
@@ -557,6 +642,19 @@ What the server's `verify()` hook returns. `null` rejects the connection.
 }
 ```
 
+### `WSRequestedIdentity`
+
+The third argument to `verify()`: what the client proposed in its `auth` frame.
+Hints, not facts — see
+[Security: namespace isolation](#security-namespace-isolation).
+
+```typescript
+{
+	clientId?: string;   // absent unless the frame carried a usable one
+	namespace: string;   // DEFAULT_NAMESPACE when the frame carried none
+}
+```
+
 ### `WSErrorInfo`
 
 ```typescript
@@ -615,6 +713,7 @@ string-matching messages.
 | `WSTerminatedError`     | Terminal close code                             | `code`, `reason` |
 | `WSConnectTimeoutError` | `connectTimeout` elapsed (retrying continues)   |                  |
 | `WSTimeoutError`        | `sendTimeout` elapsed with no acknowledgement   |                  |
+| `WSConnectionLostError` | Socket closed while the frame was in flight     |                  |
 | `WSOutboxDropError`     | Evicted from a full outbox                      |                  |
 | `WSRemoteError`         | Server sent a `nack`                            | `code`           |
 | `WSNotConnectedError`   | Sent while disconnected with `outboxMaxSize: 0` |                  |

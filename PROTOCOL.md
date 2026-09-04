@@ -53,8 +53,9 @@ Ten things the client relies on. Everything else in this document is detail.
 - WebSocket, RFC 6455. Any path — the client is configured with the full URL
   (the default is `/ws` on the page origin). Subprotocols are not used.
 - One frame = one JSON object = one WebSocket text message. No batching, no
-  delimiters. The client's default decoder also accepts binary frames (decoded as
-  UTF-8 text) and the reference server tolerates them too, but send text.
+  delimiters. The client sets `binaryType` to `arraybuffer` and the reference
+  server's sockets already default to it, so a binary frame decodes as UTF-8 JSON
+  by default and a custom decoder receives an `ArrayBuffer` — but send text.
 - `type` is the discriminator. Unknown fields must be ignored. Optional fields are
   simply absent.
 - `payload` is **opaque**. Never inspect, validate or mutate it beyond a size
@@ -149,7 +150,12 @@ or join any namespace.
   callback resolves, so this only ever affects a misbehaving client.
 - Any non-`auth` frame before authentication: reply with an `error` frame, code
   `unauthorized`, and keep the socket open. The stock client never does this.
-- A second `auth` on an authenticated connection is ignored.
+- A second `auth` is ignored — both on an authenticated connection and on one
+  whose first handshake is still in flight, so `verify` runs at most once per
+  socket and at most one `hello` goes out.
+- A socket that closes while `verify` is pending is never registered. The
+  handshake's result is dropped: the close already ran, so nothing would ever
+  remove the entry.
 - A `protocol` mismatch in `hello` only produces a client-side warning, so bump
   the version only for a genuinely breaking change.
 
@@ -206,20 +212,20 @@ them, which is why liveness lives at the application level.
 
 ### 3.5 Closing
 
-| Code | Name              | Sent by | Meaning                                       | Client reaction               |
-| ---- | ----------------- | ------- | --------------------------------------------- | ----------------------------- |
-| 1000 | `NORMAL`          | server  | Normal closure, e.g. restart                  | reconnects                    |
-| 1001 | `GOING_AWAY`      | server  | Shutdown, replaced connection                 | reconnects                    |
-| 1006 | `ABNORMAL`        | —       | No close frame (network drop)                 | reconnects                    |
-| 1011 | `INTERNAL_ERROR`  | server  | Unexpected server-side condition              | reconnects                    |
-| 4001 | `AUTH_FAILED`     | server  | Authentication rejected                       | **terminal** — stops retrying |
-| 4002 | `AUTH_TIMEOUT`    | both    | No `auth` in time / no `hello` in time        | reconnects                    |
-| 4003 | `FORBIDDEN`       | server  | Authenticated but not permitted               | **terminal** — stops retrying |
-| 4008 | `IDLE_TIMEOUT`    | both    | Silent connection reaped / pong deadline      | reconnects                    |
-| 4009 | `RATE_LIMITED`    | server  | Too many frames per second                    | reconnects                    |
-| 4013 | `FRAME_TOO_LARGE` | server  | Frame exceeded the size limit                 | reconnects                    |
-| 4400 | `PROTOCOL_ERROR`  | server  | Malformed frame                               | reconnects                    |
-| 4900 | `CLIENT_GONE`     | client  | Application called `disconnect()`/`dispose()` | n/a — deliberate              |
+| Code | Name              | Sent by | Meaning                                             | Client reaction               |
+| ---- | ----------------- | ------- | --------------------------------------------------- | ----------------------------- |
+| 1000 | `NORMAL`          | server  | Normal closure, e.g. restart                        | reconnects                    |
+| 1001 | `GOING_AWAY`      | server  | Shutdown, replaced connection                       | reconnects                    |
+| 1006 | `ABNORMAL`        | —       | No close frame (network drop)                       | reconnects                    |
+| 1011 | `INTERNAL_ERROR`  | server  | Unexpected server-side condition                    | reconnects                    |
+| 4001 | `AUTH_FAILED`     | server  | Authentication rejected                             | **terminal** — stops retrying |
+| 4002 | `AUTH_TIMEOUT`    | both    | No `auth` in time / no `hello` in time              | reconnects                    |
+| 4003 | `FORBIDDEN`       | server  | Authenticated but not permitted                     | **terminal** — stops retrying |
+| 4008 | `IDLE_TIMEOUT`    | both    | Silent connection reaped / pong deadline            | reconnects                    |
+| 4009 | `RATE_LIMITED`    | server  | Too many frames per second                          | reconnects                    |
+| 4013 | `FRAME_TOO_LARGE` | server  | Frame exceeded the size limit                       | reconnects                    |
+| 4400 | `PROTOCOL_ERROR`  | both    | Malformed frame; client-side, its `auth` hook threw | reconnects                    |
+| 4900 | `CLIENT_GONE`     | client  | Application called `disconnect()`/`dispose()`       | n/a — deliberate              |
 
 Reconnect backoff on the client: 500 ms doubling up to a 30 s ceiling, with
 jitter, plus an immediate retry when the browser reports `online` or the tab
@@ -473,6 +479,13 @@ Reference behaviour for malformed input:
 - Not valid JSON: send `error` `bad_request`, then close with **4400**.
 - Valid JSON without a string `type`, or an unknown `type`: send `error`
   `bad_request`, keep the socket.
+- `sub`/`unsub` whose `rooms` is not an array, or `pub`/`broadcast` without a
+  non-empty string `room`: send `nack` `bad_request`, keep the socket. Malformed
+  entries _inside_ a well-formed `rooms` array are skipped silently.
+- An unexpected failure while handling an otherwise well-formed frame: send
+  `error` `internal`, then close with **1011**. A handler that threw may have
+  left the connection's bookkeeping half-applied; 1011 is recoverable, so the
+  client reconnects into clean state.
 
 ---
 
@@ -753,8 +766,12 @@ class Hub:
     # ----------------------------------------------------------------- rooms
 
     async def _on_sub(self, conn: Conn, frame: dict) -> None:
+        rooms = frame.get("rooms")
+        if not isinstance(rooms, list):
+            await self._nack(conn, frame.get("id"), "bad_request", "rooms must be an array")
+            return
         sync_rooms: list[str] = []
-        for req in frame.get("rooms") or []:
+        for req in rooms:
             room = req.get("room") if isinstance(req, dict) else None
             if not isinstance(room, str) or not room:
                 continue
@@ -787,7 +804,11 @@ class Hub:
         await self._send(conn, {"type": "ack", "id": frame.get("id")})
 
     async def _on_unsub(self, conn: Conn, frame: dict) -> None:
-        for room in frame.get("rooms") or []:
+        rooms = frame.get("rooms")
+        if not isinstance(rooms, list):
+            await self._nack(conn, frame.get("id"), "bad_request", "rooms must be an array")
+            return
+        for room in rooms:
             if not isinstance(room, str) or conn.rooms.pop(room, None) is None:
                 continue
             self._index_remove(room, conn.namespace, conn.id)
@@ -1025,17 +1046,30 @@ The client uses none of this. The reference server mounts, next to the upgrade
 route, a small HTTP API for server-side injection and operations; replicate it
 only if something else in your system needs it.
 
-| Method | Path                          | Behaviour                                                       |
-| ------ | ----------------------------- | --------------------------------------------------------------- |
-| GET    | `/`                           | The upgrade. Without an `Upgrade: websocket` header: **426**    |
-| GET    | `/stats`                      | Counts of connections, pending handshakes, rooms, per namespace |
-| POST   | `/publish/{namespace}/{room}` | JSON body becomes `payload`, delivered with `from: null`        |
-| POST   | `/broadcast/{room}`           | Same, across all namespaces                                     |
+| Method | Path                          | Behaviour                                                                            |
+| ------ | ----------------------------- | ------------------------------------------------------------------------------------ |
+| GET    | `/`                           | The upgrade. Without an `Upgrade: websocket` header: **426**                         |
+| GET    | `/stats`                      | Counts of connections, pending handshakes, rooms, per namespace — authenticated only |
+| POST   | `/publish/{namespace}/{room}` | JSON body becomes `payload`, delivered with `from: null`                             |
+| POST   | `/broadcast/{room}`           | Same, across all namespaces                                                          |
 
-The POST routes respond `{ "ok": true, "recipients": n }` and must sit behind an
-HTTP-level authentication of your own — an unauthenticated "push anything into
-any room" endpoint is a vulnerability, which is why the reference refuses to
-mount them without one.
+The POST routes respond `{ "ok": true, "recipients": n }`, and answer a body
+that is not valid JSON with **400**.
+
+`/stats` and both POST routes must sit behind an HTTP-level authentication of
+your own, which is why the reference mounts none of them without one. An
+unauthenticated "push anything into any room" endpoint is a vulnerability; and
+`/stats` reports counts per namespace, so in a multi-tenant deployment an
+unauthenticated read enumerates the tenants that are online.
+
+The upgrade route is the exception — it is always mounted, since authentication
+happens in the `auth` frame. It does take one optional check: an origin
+allow-list (the reference calls it `allowedOrigins`) answering a disallowed
+`Origin` with **403** before upgrading, so the handshake is never reached. Worth
+having whenever `verify` trusts cookies, because a browser attaches those to a
+cross-site socket too. Keep it opt-in: only browsers send `Origin` at all, so a
+default allow-list would reject every non-browser client, and a _missing_ header
+should stay allowed unless you knowingly demand one.
 
 ---
 
@@ -1381,6 +1415,8 @@ Rooms and messages
 - [ ] `msg` carries `room`, `namespace`, `from`, `payload` (untouched),
       `timestamp` (integer epoch ms)
 - [ ] `pub` with a foreign `namespace` is nacked `forbidden`
+- [ ] `pub` without a `room` and `sub`/`unsub` with a non-array `rooms` are
+      answered `nack` `bad_request` without closing the socket
 - [ ] `broadcast` is nacked `forbidden` unless allowed; when allowed, every
       receiver sees its own namespace
 

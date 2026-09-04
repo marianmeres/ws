@@ -86,6 +86,20 @@ export class WSOutboxDropError extends WSError {
 	}
 }
 
+/**
+ * The socket closed while the frame was in flight.
+ *
+ * Distinct from {@link WSTimeoutError} on purpose: this one means "retry when
+ * connected", that one means "the server is not answering".
+ */
+export class WSConnectionLostError extends WSError {
+	constructor() {
+		super(
+			"The connection closed before the server acknowledged the frame; it was not resent",
+		);
+	}
+}
+
 /** The server rejected the operation with a `nack`. */
 export class WSRemoteError extends WSError {
 	/** Machine-readable code from the server — see `ERROR_CODE`. */

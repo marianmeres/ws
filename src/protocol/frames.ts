@@ -128,6 +128,17 @@ export interface WSPublishResult {
 	recipients: number;
 }
 
+/**
+ * What the client proposed in its `auth` frame. Hints, not facts — they are
+ * whatever the socket sent, so validate them before honouring them.
+ */
+export interface WSRequestedIdentity {
+	/** The claimed client id, when the frame carried a usable one. */
+	clientId?: string;
+	/** The requested namespace, or the default when the frame carried none. */
+	namespace: string;
+}
+
 /** Outcome of the server's `verify()` hook. */
 export interface AuthResult {
 	/** Assign a specific client id. Defaults to a generated one. */

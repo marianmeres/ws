@@ -3,13 +3,23 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import { createWSClient } from "../src/mod.ts";
 import type { WSMessage } from "../src/protocol/frames.ts";
 import {
+	WSConnectionLostError,
 	WSConnectTimeoutError,
 	WSDisposedError,
 	WSNotConnectedError,
 	WSOutboxDropError,
+	WSTerminatedError,
+	WSTimeoutError,
 } from "../src/protocol/errors.ts";
 import type { ClientFrame } from "../src/protocol/frames.ts";
-import { freePort, startServer, startSilentServer, until } from "./_helpers.ts";
+import {
+	freePort,
+	sleep,
+	startNoAckServer,
+	startServer,
+	startSilentServer,
+	until,
+} from "./_helpers.ts";
 
 const client = (url: string, options: Record<string, unknown> = {}) =>
 	createWSClient({ url, logger: null, pingInterval: 0, ...options });
@@ -77,6 +87,127 @@ Deno.test("buffered publishes flush *after* re-subscribe, not before", async () 
 	}
 });
 
+Deno.test("a sub lost to a dropped socket resolves and keeps its room", async () => {
+	const port = freePort();
+	let server = startServer({}, port);
+	// A short deadline on purpose: if the lost `sub` were left to its timeout,
+	// this test would fail in 400ms instead of hanging for the default 30s.
+	const c = client(server.url, {
+		reconnectDelay: 30,
+		reconnectDelayMax: 120,
+		sendTimeout: 400,
+	});
+
+	try {
+		await c.connect();
+
+		// The socket is already on its way out, but the client still reads
+		// "open", so the `sub` goes out and nobody is left to acknowledge it.
+		const stopping = server.stop();
+		const seen: WSMessage[] = [];
+		const subscribed = c.subscribe("chat", (m) => seen.push(m));
+		await stopping;
+
+		// The rejection this used to produce ran subscribe()'s catch, which
+		// detaches the handler — behind the back of a reconnect that had already
+		// re-subscribed the room.
+		await subscribed;
+		assertEquals(c.rooms, ["chat"]);
+
+		server = startServer({}, port);
+		await until(() => c.connected, "client reconnects", 8_000);
+		await until(
+			() => server.service.members("chat").length === 1,
+			"the room is live on the server too",
+		);
+
+		await server.service.publish("chat", { text: "still here" });
+		await until(() => seen.length === 1, "the handler survived");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("an in-flight publish rejects at the close, not at the timeout", async () => {
+	// This server closes the socket instead of acking the `pub`.
+	const noAck = startNoAckServer();
+	const c = client(noAck.url, { sendTimeout: 10_000, reconnectDelay: 10_000 });
+
+	try {
+		await c.connect();
+
+		const started = Date.now();
+		await assertRejects(
+			() => c.publish("chat", { n: 1 }),
+			WSConnectionLostError,
+		);
+		const elapsed = Date.now() - started;
+		assert(
+			elapsed < 2_000,
+			`waited ${elapsed}ms — that is the timeout, not the close`,
+		);
+	} finally {
+		c.dispose();
+		await noAck.stop();
+	}
+});
+
+Deno.test("a publish after a terminal close rejects at once", async () => {
+	const server = startServer({ verify: () => null });
+	const c = client(server.url, { sendTimeout: 10_000 });
+
+	try {
+		await assertRejects(() => c.connect(), WSTerminatedError);
+		assertEquals(c.connectionState, "terminated");
+
+		// Nothing restarts from `terminated`, so buffering this frame would
+		// hand the caller a timeout 10s later instead of the actual reason.
+		const started = Date.now();
+		const error = await assertRejects(
+			() => c.publish("chat", { n: 1 }),
+			WSTerminatedError,
+		);
+		assertEquals(error.code, 4001);
+		const elapsed = Date.now() - started;
+		assert(elapsed < 1_000, `waited ${elapsed}ms for an answer already known`);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a payload that cannot be encoded rejects with the encoder's error", async () => {
+	const server = startServer();
+	const c = client(server.url, { sendTimeout: 10_000 });
+
+	try {
+		await c.connect();
+
+		const errors: Error[] = [];
+		c.on("error", (e) => errors.push(e));
+
+		// The frame never left, so no ack was ever requested — waiting for one
+		// would report a timeout and hide the real cause.
+		const error = await assertRejects(
+			() => c.publish("chat", { big: 10n }),
+			Error,
+		);
+		assert(
+			!(error instanceof WSTimeoutError),
+			`expected the encoder's error, got ${error.constructor.name}`,
+		);
+		assert(
+			/BigInt/i.test(error.message),
+			`message should name the culprit, got "${error.message}"`,
+		);
+		assertEquals(errors.length, 1, "still surfaces as an error event");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
 Deno.test("detects a half-open connection via the pong deadline", async () => {
 	// The server completes the handshake and then answers nothing — no pong,
 	// no close frame. Without an application-level probe the client would sit
@@ -119,6 +250,79 @@ Deno.test("server reaps a connection that stops pinging", async () => {
 
 		assertEquals(closes[0].code, 4008);
 		assert(closes[0].willReconnect, "an idle reap is recoverable, not terminal");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a local disconnect() emits close 4900, willReconnect false", async () => {
+	const server = startServer();
+	const c = client(server.url, { reconnectDelay: 30 });
+
+	try {
+		const closes: Array<{ code: number; reason: string; willReconnect: boolean }> =
+			[];
+		c.on("close", (e) => closes.push(e));
+
+		await c.connect();
+		c.disconnect();
+
+		assertEquals(closes.length, 1, "a closed socket is one close event");
+		assertEquals(closes[0].code, 4900);
+		assertEquals(closes[0].willReconnect, false);
+
+		c.disconnect();
+		assertEquals(closes.length, 1, "nothing to close while idle, nothing to report");
+
+		// The superseded socket's own onclose must not arrive late as a second one.
+		await sleep(150);
+		assertEquals(closes.length, 1);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a stale auth() rejection leaves the newer socket alone", async () => {
+	const server = startServer();
+	let attempt = 0;
+	const c = client(server.url, {
+		reconnectDelay: 30,
+		auth: async () => {
+			attempt++;
+			// The first attempt is still awaiting its token when the socket it
+			// belongs to is superseded; the rest answer at once.
+			if (attempt === 1) {
+				await sleep(300);
+				throw new Error("stale token refresh failed");
+			}
+			return null;
+		},
+	});
+
+	try {
+		const closes: number[] = [];
+		c.on("close", (e) => closes.push(e.code));
+		const errors: Error[] = [];
+		c.on("error", (e) => errors.push(e));
+
+		// disconnect() below rejects this one; nothing else awaits it.
+		c.connect().catch(() => {});
+		await until(
+			() => c.connectionState === "authenticating",
+			"the first socket reaches auth",
+		);
+
+		c.disconnect();
+		await c.connect();
+		assert(c.connected, "the second socket completed its handshake");
+
+		// The stale auth() rejects in here, two generations too late.
+		await sleep(400);
+		assertEquals(c.connectionState, "open", "the newer socket survived");
+		assertEquals(closes, [4900], "only the disconnect() closed anything");
+		assertEquals(errors, [], "a superseded attempt is not the caller's problem");
 	} finally {
 		c.dispose();
 		await server.stop();
@@ -212,6 +416,29 @@ Deno.test("disconnect() is resumable — handlers and rooms survive", async () =
 
 		await server.service.publish("chat", { text: "resumed" });
 		await until(() => seen.length === 1, "the original handler still fires");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("unsub() then dispose() leaves no uncaught rejection", async () => {
+	const server = startServer();
+	const c = client(server.url);
+
+	try {
+		await c.connect();
+		const unsub = await c.subscribe("chat", () => {});
+
+		// The README's canonical sequence. The unsubscriber sends an `unsub` and
+		// drops the promise; dispose() then rejects it with WSDisposedError.
+		// Uncaught, that exits a Deno or Node process.
+		unsub();
+		c.dispose();
+
+		// A checkpoint at which the runtime would report the rejection.
+		await sleep(50);
+		assertEquals(c.rooms, []);
 	} finally {
 		c.dispose();
 		await server.stop();

@@ -26,6 +26,7 @@ import type {
 	WSPublishResult,
 } from "../protocol/frames.ts";
 import {
+	WSConnectionLostError,
 	WSConnectTimeoutError,
 	WSDisposedError,
 	WSError,
@@ -83,7 +84,10 @@ export interface WSEvents {
 	message: WSMessage;
 	/** Membership change in a room subscribed with presence enabled. */
 	presence: WSPresenceEvent;
-	/** Socket closed. `willReconnect` reflects the retry classification. */
+	/**
+	 * Socket closed. `willReconnect` reflects the retry classification, and is
+	 * `false` for the `4900` a local `disconnect()` emits.
+	 */
 	close: { code: number; reason: string; willReconnect: boolean };
 	/** A retry is scheduled; `delay` is the jittered backoff in ms. */
 	reconnecting: { attempt: number; delay: number };
@@ -248,7 +252,12 @@ export class WSClient<TAuth = unknown> {
 	#namespace: string | null = null;
 	#attempt = 0;
 	#lastError: Error | null = null;
-	#intentional = false;
+	/**
+	 * Kept apart from `#lastError` on purpose: a handler that throws after the
+	 * terminal close would overwrite `#lastError` and a send rejected from the
+	 * `terminated` state would then blame the wrong thing.
+	 */
+	#terminalError: WSTerminatedError | null = null;
 
 	#rooms = new RoomRegistry();
 	#outbox: Outbox;
@@ -487,7 +496,6 @@ export class WSClient<TAuth = unknown> {
 			}, this.#connectTimeout);
 		}
 
-		this.#intentional = false;
 		if (this.#state === "idle" || this.#state === "terminated") this.#open();
 
 		return promise;
@@ -499,17 +507,30 @@ export class WSClient<TAuth = unknown> {
 	 * Resumable: handlers, room subscriptions and buffered sends all survive,
 	 * so a later `connect()` picks up exactly where this left off. Use
 	 * {@link dispose} for terminal teardown.
+	 *
+	 * Emits `close` with {@link CLOSE.CLIENT_GONE} and `willReconnect: false`
+	 * when there was a socket to close; nothing when already idle, reconnecting
+	 * or terminated.
 	 */
 	disconnect(): void {
 		if (this.#state === "disposed") return;
 		this.logger?.debug?.("disconnect()");
-		this.#intentional = true;
 		this.#clearTimers();
 		this.#heartbeat.stop();
 		this.#settleConnect(
 			new WSTerminatedError(CLOSE.CLIENT_GONE, "disconnect() called"),
 		);
-		this.#closeSocket(CLOSE.CLIENT_GONE, "client disconnect");
+		const reason = "client disconnect";
+		const closed = this.#socket !== null;
+		this.#closeSocket(CLOSE.CLIENT_GONE, reason);
+		if (closed) {
+			this.#emit("close", {
+				code: CLOSE.CLIENT_GONE,
+				reason,
+				willReconnect: false,
+			});
+		}
+		this.#settleInFlight();
 		this.#setState("idle");
 	}
 
@@ -584,6 +605,10 @@ export class WSClient<TAuth = unknown> {
 					type: FRAME.UNSUB,
 					id: this.#nextId(),
 					rooms: [room],
+				}).catch((e) => {
+					// Not actionable: the handler is already detached locally and
+					// the server drops the room on close anyway.
+					this.logger?.debug?.(`unsub "${room}" unconfirmed: ${e.message}`);
 				});
 			}
 		});
@@ -669,6 +694,8 @@ export class WSClient<TAuth = unknown> {
 	 * @throws {WSTimeoutError} `sendTimeout` elapsed with no acknowledgement
 	 * @throws {WSOutboxDropError} evicted from a full outbox
 	 * @throws {WSNotConnectedError} sent while offline with `outboxMaxSize: 0`
+	 * @throws {WSTerminatedError} sent after a terminal close, which only an
+	 * explicit `connect()` recovers from — rejected at once, not buffered
 	 * @throws {WSRemoteError} the server rejected it with a `nack`
 	 */
 	publish<T = unknown>(
@@ -723,6 +750,12 @@ export class WSClient<TAuth = unknown> {
 	#send(frame: ClientFrame, id: string): Promise<WSPublishResult> {
 		if (this.#autoConnect) this.#ensureStarted();
 
+		// Nothing restarts from `terminated` except an explicit connect(), so
+		// buffering here would only defer the same answer by `sendTimeout`.
+		if (this.#terminalError && this.#state === "terminated") {
+			return Promise.reject(this.#terminalError);
+		}
+
 		const canSendNow = this.connected &&
 			this.#socket?.readyState === WebSocket.OPEN;
 
@@ -731,7 +764,10 @@ export class WSClient<TAuth = unknown> {
 		}
 
 		const promise = this.#outbox.track(id, frame, !canSendNow);
-		if (canSendNow) this.#sendRaw(frame);
+		if (canSendNow) {
+			const error = this.#sendRaw(frame);
+			if (error) this.#outbox.fail(id, error);
+		}
 		return promise;
 	}
 
@@ -745,18 +781,25 @@ export class WSClient<TAuth = unknown> {
 	#sendControl(frame: ClientFrame): Promise<WSPublishResult> {
 		const id = "id" in frame ? frame.id : this.#nextId();
 		const promise = this.#outbox.track(id, frame, false);
-		this.#sendRaw(frame);
+		const error = this.#sendRaw(frame);
+		if (error) this.#outbox.fail(id, error);
 		return promise;
 	}
 
-	#sendRaw(frame: ClientFrame): void {
+	/**
+	 * @returns the error the send failed with — a frame that never left cannot
+	 * be acknowledged, so the caller settles its promise instead of letting it
+	 * wait out `sendTimeout`.
+	 */
+	#sendRaw(frame: ClientFrame): Error | null {
 		const socket = this.#socket;
-		if (!socket || socket.readyState !== WebSocket.OPEN) return;
+		if (!socket || socket.readyState !== WebSocket.OPEN) return null;
 		try {
 			socket.send(this.#encode(frame));
 		} catch (e) {
-			this.#fail(e, "send failed");
+			return this.#fail(e, "send failed");
 		}
+		return null;
 	}
 
 	#open(): void {
@@ -771,7 +814,7 @@ export class WSClient<TAuth = unknown> {
 		}
 		if (!this.#setState("connecting")) return;
 
-		this.#intentional = false;
+		this.#terminalError = null;
 		const generation = ++this.#generation;
 		let socket: WebSocket;
 
@@ -784,6 +827,9 @@ export class WSClient<TAuth = unknown> {
 		}
 
 		this.#socket = socket;
+		// Without this a binary frame arrives as a Blob, which no synchronous
+		// decoder can read — the `WSDecoder` contract promises an `ArrayBuffer`.
+		socket.binaryType = "arraybuffer";
 		this.logger?.debug?.(`connecting to ${this.#url.href}`);
 
 		socket.onopen = () => {
@@ -814,6 +860,13 @@ export class WSClient<TAuth = unknown> {
 		try {
 			payload = (await this.#authFn?.()) ?? null;
 		} catch (e) {
+			// The await yields, so this rejection may belong to a socket that a
+			// later connect() already replaced — closing on it would kill the
+			// healthy socket that took its place.
+			if (generation !== this.#generation) {
+				this.logger?.debug?.("superseded auth attempt failed");
+				return;
+			}
 			this.#fail(e, "auth payload failed");
 			this.#forceClose(CLOSE.PROTOCOL_ERROR, "auth payload failed");
 			return;
@@ -940,7 +993,10 @@ export class WSClient<TAuth = unknown> {
 		const buffered = this.#outbox.drain();
 		if (buffered.length) {
 			this.logger?.debug?.(`flushing ${buffered.length} buffered frame(s)`);
-			for (const frame of buffered) this.#sendRaw(frame);
+			for (const frame of buffered) {
+				const error = this.#sendRaw(frame);
+				if (error && "id" in frame) this.#outbox.fail(frame.id, error);
+			}
 		}
 	}
 
@@ -951,8 +1007,7 @@ export class WSClient<TAuth = unknown> {
 		this.#socket = null;
 
 		const terminal = this.#terminalCodes.includes(code);
-		const willReconnect = !this.#intentional && !terminal &&
-			this.#state !== "disposed";
+		const willReconnect = !terminal && this.#state !== "disposed";
 
 		this.logger?.debug?.(
 			`closed (${code}${reason ? ` ${reason}` : ""}), reconnect=${willReconnect}`,
@@ -963,6 +1018,7 @@ export class WSClient<TAuth = unknown> {
 			this.#setState("terminated");
 			const error = new WSTerminatedError(code, reason);
 			this.#lastError = error;
+			this.#terminalError = error;
 			// Loud on purpose: this is the only path where a client that
 			// otherwise retries forever gives up, and a silent one looks
 			// exactly like a network that never came back.
@@ -973,12 +1029,31 @@ export class WSClient<TAuth = unknown> {
 			return;
 		}
 
+		this.#settleInFlight();
+
 		if (!willReconnect) {
 			this.#setState("idle");
 			return;
 		}
 
 		this.#scheduleReconnect();
+	}
+
+	/**
+	 * Answers the frames that were on the wire when the socket went away.
+	 *
+	 * `sub`/`unsub` resolve: the room registry is authoritative locally and the
+	 * re-subscribe step will establish it on the next connection, which is
+	 * exactly the contract of a `subscribe()` issued while offline — and the
+	 * server forgets its rooms on close anyway. Publishes reject: they were not
+	 * delivered, and at-most-once means they will not be resent.
+	 */
+	#settleInFlight(): void {
+		this.#outbox.settleInFlight((frame) =>
+			frame.type === FRAME.SUB || frame.type === FRAME.UNSUB
+				? null
+				: new WSConnectionLostError()
+		);
 	}
 
 	#scheduleReconnect(): void {
@@ -1129,11 +1204,12 @@ export class WSClient<TAuth = unknown> {
 		this.#bus.publish(event as string, data);
 	}
 
-	#fail(error: unknown, context: string): void {
+	#fail(error: unknown, context: string): Error {
 		const err = error instanceof Error ? error : new WSError(String(error));
 		this.#lastError = err;
 		this.logger?.error?.(`${context}: ${err.message}`);
 		this.#emit("error", err);
+		return err;
 	}
 }
 

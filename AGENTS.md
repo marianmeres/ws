@@ -73,9 +73,24 @@ not registered yet. There is a test that fails if you break it
 **`sub`/`unsub` bypass the outbox.** They are replayed wholesale by the
 re-subscribe step, so buffering them too would apply them twice.
 
+**A control-frame promise the client does not await must carry a `.catch()`.**
+`#sendControl` tracks the frame in the outbox, so its promise rejects on dispose,
+on a terminal close and on the send timeout. An unawaited one — the unsubscriber's
+`unsub`, the `#onHello` re-subscribe — is an uncaught rejection that exits a Deno
+or Node process.
+
+**The server validates every frame field before it uses it, and wraps the whole
+dispatch.** A malformed but parseable frame is a `nack`/`error` `bad_request`
+and the socket stays open; an unexpected throw is `error` `internal` and a 1011
+close. Both paths, including the async one, end in a `.catch()` — a handler that
+throws must never be able to take the process down.
+
 **Every send carries one deadline** spanning queue + flight + ack — not an
 ack-only timeout. Combining acks with infinite retry otherwise produces promises
-that pend forever.
+that pend forever. And a socket close settles in-flight frames at once, rather
+than waiting out a deadline for an answer that can no longer arrive: `sub` and
+`unsub` resolve, everything else rejects with `WSConnectionLostError`. Queued
+frames are untouched — they are still waiting for a connection, not an ack.
 
 **The pong deadline is not restarted by later pings.** It measures time since
 the _oldest_ unanswered ping. Restarting it means any `pingInterval <=
@@ -87,7 +102,13 @@ checks its captured generation. Without it a slow `onclose` from a dead socket
 cancels the reconnect that replaced it.
 
 **Safe defaults are deny.** `allowBroadcast` denies; HTTP injection routes are
-not mounted without `httpAuth`. Do not "helpfully" relax either.
+not mounted without `httpAuth`. Do not "helpfully" relax either. The documented
+exception: `clientId` and `namespace` fall back to what the client asked for
+(assigned → requested → generated), so a multi-tenant `verify` must return both.
+Its third argument carries the client's proposals so they can be validated there
+instead of being duplicated into the auth payload. `allowedOrigins` is the other
+exception — opt-in, because a default allow-list would break every non-browser
+deployment; unset means no check at all.
 
 **Delivery is at-most-once.** Transmitted-but-unacked sends are never resent.
 If that changes, the server needs deduplication first.
@@ -122,7 +143,9 @@ run `deno publish` then the npm build.
 
 ## Before Making Changes
 
-1. `deno task test` — 39 tests, all real sockets against a real server
+1. `deno task test` — 66 tests, mostly real sockets against a real server:
+   `unit`, `integration`, `resilience`, `protocol` (server input hardening,
+   raw sockets) and `codec` (custom encode/decode, binary frames)
 2. `deno lint && deno fmt --check && deno check src/mod.ts src/server.ts src/protocol.ts`
 3. Touched a public signature? `deno doc --lint src/mod.ts src/server.ts
    src/protocol.ts` **and** `deno publish --dry-run --allow-dirty`
@@ -146,6 +169,7 @@ run `deno publish` then the npm build.
 - Presence is scoped to `(room, namespace)`; broadcast crosses namespaces but
   presence does not
 - Node/Bun cannot run the server (`Deno.upgradeWebSocket`)
+- Origin checking is opt-in via `allowedOrigins`; unset means no check
 
 ## Documentation Index
 

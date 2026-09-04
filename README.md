@@ -11,7 +11,7 @@ survives real networks — plus a mountable reference server implementing the sa
 ## Features
 
 - **Reconnects forever** — capped exponential backoff with jitter, plus instant
-  retry when the browser comes back online or the tab regains focus
+  retry when the browser comes back online or the tab becomes visible again
 - **Detects half-open connections** — the failure where the peer vanishes, no
   `onclose` ever fires, and a naive client sits "connected" receiving nothing
 - **Namespaces and rooms** — namespace isolates, rooms are channels within it
@@ -128,10 +128,12 @@ ws.members("room"); // last known membership
 import { createWSApp } from "@marianmeres/ws/server";
 
 const { app, service } = createWSApp("/ws", [], {
-	verify: async (payload, req) => {
+	// `requested` is what the client asked for — hints, never facts.
+	verify: async (payload, req, requested) => {
 		const user = await authenticate(payload?.token);
 		// Returning null closes the socket with a terminal code.
-		return user ? { clientId: user.id, namespace: user.orgId } : null;
+		if (!user || !user.orgs.includes(requested.namespace)) return null;
+		return { clientId: user.id, namespace: requested.namespace };
 	},
 });
 
@@ -141,12 +143,21 @@ await service.publish("notifications", { text: "deploy finished" }, "org-123");
 Deno.serve(app);
 ```
 
+Namespace is the isolation boundary, and it falls back to what the client asked
+for when `verify` returns none — so in a multi-tenant deployment `verify` must
+return `namespace` and `clientId`, validating `requested` rather than trusting
+it.
+
+If `verify` authenticates from cookies, set `allowedOrigins` as well: browsers
+attach cookies to a WebSocket opened from any site, and without an `Origin`
+check that is cross-site WebSocket hijacking.
+
 Mounted routes, relative to the mount path:
 
 | Method | Path                          | Notes                                     |
 | ------ | ----------------------------- | ----------------------------------------- |
 | GET    | `/`                           | WebSocket upgrade                         |
-| GET    | `/stats`                      | Guarded by `httpAuth` when supplied       |
+| GET    | `/stats`                      | Requires `httpAuth`, else **not mounted** |
 | POST   | `/publish/[namespace]/[room]` | Requires `httpAuth`, else **not mounted** |
 | POST   | `/broadcast/[room]`           | Requires `httpAuth`, else **not mounted** |
 
@@ -191,8 +202,9 @@ silent one would be indistinguishable from a network that never recovered.
 
 **Delivery is at-most-once.** A publish that was transmitted but unacknowledged
 when the socket died is _not_ resent — that would risk duplicates, and the
-server has no deduplication. It rejects on `sendTimeout`. At-least-once would
-need server-side replay, which this version does not do.
+server has no deduplication. It rejects immediately with `WSConnectionLostError`
+rather than waiting out `sendTimeout`: the answer is already known at the close.
+At-least-once would need server-side replay, which this version does not do.
 
 **Sends are bounded.** Every publish carries one deadline covering queue, flight
 _and_ acknowledgement. Without it, a publish issued while offline would pend

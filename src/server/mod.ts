@@ -30,6 +30,7 @@ import { WSService, type WSServiceOptions } from "./service.ts";
 
 export * from "./adapters/abstract.ts";
 export * from "./adapters/local.ts";
+export type { WSRequestedIdentity } from "../protocol/frames.ts";
 export {
 	type WSConnectionContext,
 	WSService,
@@ -40,12 +41,14 @@ export {
 /** Configuration for {@link createWSApp}. */
 export interface WSAppOptions extends WSServiceOptions {
 	/**
-	 * Guards `POST /publish` and `POST /broadcast`.
+	 * Guards every HTTP route except the upgrade: `GET /stats`,
+	 * `POST /publish` and `POST /broadcast`.
 	 *
-	 * **Without it those routes are not mounted at all.** They are a separate
+	 * **Without it none of them are mounted at all.** They are a separate
 	 * trust boundary from the WebSocket `verify` hook — mounting an
 	 * unauthenticated "push anything into any room" endpoint by default would
-	 * be a genuine vulnerability, so it has to be a deliberate act.
+	 * be a genuine vulnerability, and `/stats` names every connected namespace,
+	 * so exposing them has to be a deliberate act.
 	 */
 	httpAuth?: DeminoHandler;
 	/**
@@ -69,12 +72,12 @@ export interface WSApp {
  *
  * Routes, relative to `mountPath`:
  *
- * | Method | Path                          | Notes                        |
- * | ------ | ----------------------------- | ---------------------------- |
- * | GET    | `/`                           | WebSocket upgrade            |
- * | GET    | `/stats`                      | Guarded by `httpAuth` if set |
- * | POST   | `/publish/[namespace]/[room]` | Requires `httpAuth`          |
- * | POST   | `/broadcast/[room]`           | Requires `httpAuth`          |
+ * | Method | Path                          | Notes                                 |
+ * | ------ | ----------------------------- | ------------------------------------- |
+ * | GET    | `/`                           | WebSocket upgrade                     |
+ * | GET    | `/stats`                      | Requires `httpAuth`, else not mounted |
+ * | POST   | `/publish/[namespace]/[room]` | Requires `httpAuth`, else not mounted |
+ * | POST   | `/broadcast/[room]`           | Requires `httpAuth`, else not mounted |
  *
  * The returned `service` is the one the app is wired to, so server-side
  * injection and the sockets share a single registry.
@@ -115,12 +118,12 @@ export function createWSApp(
 		return service.handleUpgrade(req);
 	});
 
-	// Public when unguarded (handy in development), protected as soon as an
-	// httpAuth middleware exists. Counts only — never client ids.
-	if (httpAuth) app.get("/stats", httpAuth, () => service.stats());
-	else app.get("/stats", () => service.stats());
-
 	if (httpAuth) {
+		// Counts only, never client ids — but it does name every connected
+		// namespace, which in a multi-tenant deployment enumerates the tenants
+		// that are online. Use `service.stats()` for unguarded in-process reads.
+		app.get("/stats", httpAuth, () => service.stats());
+
 		app.post(
 			"/publish/[namespace]/[room]",
 			httpAuth,
@@ -161,6 +164,8 @@ async function readJson(req: Request): Promise<unknown> {
 	try {
 		return await req.json();
 	} catch {
-		throw new Error("Invalid JSON body");
+		// demino turns a `status` on a thrown error into that response code;
+		// without it a client's malformed body would be reported as a 500.
+		throw Object.assign(new Error("Invalid JSON body"), { status: 400 });
 	}
 }
