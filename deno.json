@@ -23,15 +23,13 @@
 	"imports": {
 		"@marianmeres/clog": "jsr:@marianmeres/clog@^3.21.0",
 		"@marianmeres/demino": "jsr:@marianmeres/demino@^1.17.0",
-		"@marianmeres/design-tokens": "jsr:@marianmeres/design-tokens@^1.13.0",
+		"@marianmeres/design-tokens": "jsr:@marianmeres/design-tokens@^1.20.0",
 		"@marianmeres/npmbuild": "jsr:@marianmeres/npmbuild@^1.16.0",
 		"@marianmeres/pubsub": "jsr:@marianmeres/pubsub@^3.0.0",
 		"@marianmeres/ticker": "jsr:@marianmeres/ticker@^1.17.1",
-		"@marianmeres/uid": "jsr:@marianmeres/uid@^1.1.0",
-		"@marianmeres/vanilla": "jsr:@marianmeres/vanilla@^1.8.0",
+		"@marianmeres/uid": "jsr:@marianmeres/uid@^1.2.0",
+		"@marianmeres/vanilla": "jsr:@marianmeres/vanilla@^1.9.0",
 		"@std/assert": "jsr:@std/assert@^1.0.19",
-		"@std/async": "jsr:@std/async@^1.0.14",
-		"@std/fs": "jsr:@std/fs@^1.0.24",
 		"@std/path": "jsr:@std/path@^1.1.6"
 	},
 	"publish": {

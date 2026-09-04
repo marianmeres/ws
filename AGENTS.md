@@ -149,11 +149,12 @@ run `deno publish` then the npm build.
 
 ## Documentation Index
 
-| Document            | Purpose                                          |
-| ------------------- | ------------------------------------------------ |
-| `README.md`         | Human-facing overview and usage                  |
-| `API.md`            | Complete API reference — every public export     |
-| `example/README.md` | The reference app: what it demonstrates, and how |
+| Document            | Purpose                                                       |
+| ------------------- | ------------------------------------------------------------- |
+| `README.md`         | Human-facing overview and usage                               |
+| `API.md`            | Complete API reference — every public export                  |
+| `PROTOCOL.md`       | Wire protocol spec + Python server, for other implementations |
+| `example/README.md` | The reference app: what it demonstrates, and how              |
 
 `tmp/spec.md` (design spec and decision log) is referenced in some commits but
 is **untracked** — `tmp/*` is gitignored, so it does not exist in a fresh clone.
