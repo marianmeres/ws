@@ -188,6 +188,12 @@ method rather than a flag on `publish()` precisely because crossing an isolation
 boundary deserves its own name and its own server-side check: `allowBroadcast`
 **denies by default**.
 
+**Frame vs message** — a _frame_ is one JSON protocol envelope (`auth`, `sub`,
+`pub`, `msg`, `ack`, …), carried in exactly one WebSocket text message — not an
+RFC 6455 fragment. A _message_ is the application-level object a `msg` frame
+delivers (`room`, `namespace`, `from`, `payload`, `timestamp`) — a `msg` frame
+minus its `type` field _is_ a `WSMessage`, which is what your handlers receive.
+
 ## Behaviour worth knowing
 
 **Reconnect classification.** Everything reconnects except a local

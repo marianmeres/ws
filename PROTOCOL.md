@@ -19,8 +19,8 @@ also published dependency-free as `@marianmeres/ws/protocol`.
 
 Ten things the client relies on. Everything else in this document is detail.
 
-1. Transport is a standard WebSocket. Every message is one UTF-8 **text** frame
-   containing one JSON object with a string `type` field.
+1. Transport is a standard WebSocket. Every **frame** is one JSON object with a
+   string `type` field, sent as one UTF-8 **text** WebSocket message.
 2. The first frame the client sends is `auth`. Reply with `hello` within **10 s**
    or the client drops the socket and retries.
 3. Reject authentication by closing with code **4001**. That, and 4003, are the
@@ -50,12 +50,18 @@ Ten things the client relies on. Everything else in this document is detail.
 
 ## 2. Transport and encoding
 
+**Terminology.** _Frame_ in this document means one JSON protocol envelope,
+carried in exactly one WebSocket text message — not an RFC 6455 fragment.
+_Message_ means the application-level object a `msg` frame delivers (`room`,
+`namespace`, `from`, `payload`, `timestamp`).
+
 - WebSocket, RFC 6455. Any path — the client is configured with the full URL
   (the default is `/ws` on the page origin). Subprotocols are not used.
 - One frame = one JSON object = one WebSocket text message. No batching, no
   delimiters. The client sets `binaryType` to `arraybuffer` and the reference
-  server's sockets already default to it, so a binary frame decodes as UTF-8 JSON
-  by default and a custom decoder receives an `ArrayBuffer` — but send text.
+  server's sockets already default to it, so a binary WebSocket message decodes
+  as UTF-8 JSON by default and a custom decoder receives an `ArrayBuffer` — but
+  send text.
 - `type` is the discriminator. Unknown fields must be ignored. Optional fields are
   simply absent.
 - `payload` is **opaque**. Never inspect, validate or mutate it beyond a size
@@ -216,7 +222,7 @@ them, which is why liveness lives at the application level.
 | ---- | ----------------- | ------- | --------------------------------------------------- | ----------------------------- |
 | 1000 | `NORMAL`          | server  | Normal closure, e.g. restart                        | reconnects                    |
 | 1001 | `GOING_AWAY`      | server  | Shutdown, replaced connection                       | reconnects                    |
-| 1006 | `ABNORMAL`        | —       | No close frame (network drop)                       | reconnects                    |
+| 1006 | `ABNORMAL`        | —       | No close handshake (network drop)                   | reconnects                    |
 | 1011 | `INTERNAL_ERROR`  | server  | Unexpected server-side condition                    | reconnects                    |
 | 4001 | `AUTH_FAILED`     | server  | Authentication rejected                             | **terminal** — stops retrying |
 | 4002 | `AUTH_TIMEOUT`    | both    | No `auth` in time / no `hello` in time              | reconnects                    |
