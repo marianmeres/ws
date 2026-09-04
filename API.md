@@ -42,6 +42,11 @@ following the `PubSub` / `createPubSub` precedent.
 | `onOutboxDrop`       | `(frames: ClientFrame[]) => void`   | —                  | Called with evicted frames                                                    |
 | `encode` / `decode`  | `WSEncoder` / `WSDecoder`           | JSON               | Must match the server's                                                       |
 
+`pingInterval: 0` disables the client's heartbeat, not the server's reaper: the
+reference server still closes a connection that sent nothing for `idleTimeout`
+(60 s) with `4008`, so a heartbeat-free client reconnects roughly every minute.
+Disable both or neither.
+
 **Returns** `WSClient`
 
 **Example**
@@ -84,10 +89,14 @@ gate, not a prerequisite.
 
 Rejects **only** where retrying cannot help:
 
-- `WSTerminatedError` — a terminal close code
+- `WSTerminatedError` — a terminal close code, or code `4900` when
+  `disconnect()` (or `dispose()`, which disconnects first) is called while this
+  is still pending
 - `WSConnectTimeoutError` — `connectTimeout` elapsed. Retrying continues in the
   background, so this bounds _your await_, not the connection attempt
-- `WSDisposedError` — the client was disposed
+- `WSDisposedError` — called on an already disposed client. A `dispose()`
+  _during_ a pending connect settles it with the `4900` `WSTerminatedError`
+  above, not with this
 
 Ordinary network failure never rejects; that is what the infinite retry is for.
 

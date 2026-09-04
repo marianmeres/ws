@@ -11,7 +11,7 @@ survives real networks — plus a mountable reference server implementing the sa
 ## Features
 
 - **Reconnects forever** — capped exponential backoff with jitter, plus instant
-  retry when the browser comes back online or the tab regains focus
+  retry when the browser comes back online or the tab becomes visible again
 - **Detects half-open connections** — the failure where the peer vanishes, no
   `onclose` ever fires, and a naive client sits "connected" receiving nothing
 - **Namespaces and rooms** — namespace isolates, rooms are channels within it

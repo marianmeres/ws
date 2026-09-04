@@ -79,6 +79,12 @@ on a terminal close and on the send timeout. An unawaited one — the unsubscrib
 `unsub`, the `#onHello` re-subscribe — is an uncaught rejection that exits a Deno
 or Node process.
 
+**The server validates every frame field before it uses it, and wraps the whole
+dispatch.** A malformed but parseable frame is a `nack`/`error` `bad_request`
+and the socket stays open; an unexpected throw is `error` `internal` and a 1011
+close. Both paths, including the async one, end in a `.catch()` — a handler that
+throws must never be able to take the process down.
+
 **Every send carries one deadline** spanning queue + flight + ack — not an
 ack-only timeout. Combining acks with infinite retry otherwise produces promises
 that pend forever. And a socket close settles in-flight frames at once, rather
@@ -137,7 +143,9 @@ run `deno publish` then the npm build.
 
 ## Before Making Changes
 
-1. `deno task test` — 39 tests, all real sockets against a real server
+1. `deno task test` — 66 tests, mostly real sockets against a real server:
+   `unit`, `integration`, `resilience`, `protocol` (server input hardening,
+   raw sockets) and `codec` (custom encode/decode, binary frames)
 2. `deno lint && deno fmt --check && deno check src/mod.ts src/server.ts src/protocol.ts`
 3. Touched a public signature? `deno doc --lint src/mod.ts src/server.ts
    src/protocol.ts` **and** `deno publish --dry-run --allow-dirty`
@@ -161,6 +169,7 @@ run `deno publish` then the npm build.
 - Presence is scoped to `(room, namespace)`; broadcast crosses namespaces but
   presence does not
 - Node/Bun cannot run the server (`Deno.upgradeWebSocket`)
+- Origin checking is opt-in via `allowedOrigins`; unset means no check
 
 ## Documentation Index
 

@@ -212,20 +212,20 @@ them, which is why liveness lives at the application level.
 
 ### 3.5 Closing
 
-| Code | Name              | Sent by | Meaning                                       | Client reaction               |
-| ---- | ----------------- | ------- | --------------------------------------------- | ----------------------------- |
-| 1000 | `NORMAL`          | server  | Normal closure, e.g. restart                  | reconnects                    |
-| 1001 | `GOING_AWAY`      | server  | Shutdown, replaced connection                 | reconnects                    |
-| 1006 | `ABNORMAL`        | —       | No close frame (network drop)                 | reconnects                    |
-| 1011 | `INTERNAL_ERROR`  | server  | Unexpected server-side condition              | reconnects                    |
-| 4001 | `AUTH_FAILED`     | server  | Authentication rejected                       | **terminal** — stops retrying |
-| 4002 | `AUTH_TIMEOUT`    | both    | No `auth` in time / no `hello` in time        | reconnects                    |
-| 4003 | `FORBIDDEN`       | server  | Authenticated but not permitted               | **terminal** — stops retrying |
-| 4008 | `IDLE_TIMEOUT`    | both    | Silent connection reaped / pong deadline      | reconnects                    |
-| 4009 | `RATE_LIMITED`    | server  | Too many frames per second                    | reconnects                    |
-| 4013 | `FRAME_TOO_LARGE` | server  | Frame exceeded the size limit                 | reconnects                    |
-| 4400 | `PROTOCOL_ERROR`  | server  | Malformed frame                               | reconnects                    |
-| 4900 | `CLIENT_GONE`     | client  | Application called `disconnect()`/`dispose()` | n/a — deliberate              |
+| Code | Name              | Sent by | Meaning                                             | Client reaction               |
+| ---- | ----------------- | ------- | --------------------------------------------------- | ----------------------------- |
+| 1000 | `NORMAL`          | server  | Normal closure, e.g. restart                        | reconnects                    |
+| 1001 | `GOING_AWAY`      | server  | Shutdown, replaced connection                       | reconnects                    |
+| 1006 | `ABNORMAL`        | —       | No close frame (network drop)                       | reconnects                    |
+| 1011 | `INTERNAL_ERROR`  | server  | Unexpected server-side condition                    | reconnects                    |
+| 4001 | `AUTH_FAILED`     | server  | Authentication rejected                             | **terminal** — stops retrying |
+| 4002 | `AUTH_TIMEOUT`    | both    | No `auth` in time / no `hello` in time              | reconnects                    |
+| 4003 | `FORBIDDEN`       | server  | Authenticated but not permitted                     | **terminal** — stops retrying |
+| 4008 | `IDLE_TIMEOUT`    | both    | Silent connection reaped / pong deadline            | reconnects                    |
+| 4009 | `RATE_LIMITED`    | server  | Too many frames per second                          | reconnects                    |
+| 4013 | `FRAME_TOO_LARGE` | server  | Frame exceeded the size limit                       | reconnects                    |
+| 4400 | `PROTOCOL_ERROR`  | both    | Malformed frame; client-side, its `auth` hook threw | reconnects                    |
+| 4900 | `CLIENT_GONE`     | client  | Application called `disconnect()`/`dispose()`       | n/a — deliberate              |
 
 Reconnect backoff on the client: 500 ms doubling up to a 30 s ceiling, with
 jitter, plus an immediate retry when the browser reports `online` or the tab
@@ -766,8 +766,12 @@ class Hub:
     # ----------------------------------------------------------------- rooms
 
     async def _on_sub(self, conn: Conn, frame: dict) -> None:
+        rooms = frame.get("rooms")
+        if not isinstance(rooms, list):
+            await self._nack(conn, frame.get("id"), "bad_request", "rooms must be an array")
+            return
         sync_rooms: list[str] = []
-        for req in frame.get("rooms") or []:
+        for req in rooms:
             room = req.get("room") if isinstance(req, dict) else None
             if not isinstance(room, str) or not room:
                 continue
@@ -800,7 +804,11 @@ class Hub:
         await self._send(conn, {"type": "ack", "id": frame.get("id")})
 
     async def _on_unsub(self, conn: Conn, frame: dict) -> None:
-        for room in frame.get("rooms") or []:
+        rooms = frame.get("rooms")
+        if not isinstance(rooms, list):
+            await self._nack(conn, frame.get("id"), "bad_request", "rooms must be an array")
+            return
+        for room in rooms:
             if not isinstance(room, str) or conn.rooms.pop(room, None) is None:
                 continue
             self._index_remove(room, conn.namespace, conn.id)
@@ -1038,21 +1046,30 @@ The client uses none of this. The reference server mounts, next to the upgrade
 route, a small HTTP API for server-side injection and operations; replicate it
 only if something else in your system needs it.
 
-| Method | Path                          | Behaviour                                                       |
-| ------ | ----------------------------- | --------------------------------------------------------------- |
-| GET    | `/`                           | The upgrade. Without an `Upgrade: websocket` header: **426**    |
-| GET    | `/stats`                      | Counts of connections, pending handshakes, rooms, per namespace |
-| POST   | `/publish/{namespace}/{room}` | JSON body becomes `payload`, delivered with `from: null`        |
-| POST   | `/broadcast/{room}`           | Same, across all namespaces                                     |
+| Method | Path                          | Behaviour                                                                            |
+| ------ | ----------------------------- | ------------------------------------------------------------------------------------ |
+| GET    | `/`                           | The upgrade. Without an `Upgrade: websocket` header: **426**                         |
+| GET    | `/stats`                      | Counts of connections, pending handshakes, rooms, per namespace — authenticated only |
+| POST   | `/publish/{namespace}/{room}` | JSON body becomes `payload`, delivered with `from: null`                             |
+| POST   | `/broadcast/{room}`           | Same, across all namespaces                                                          |
 
 The POST routes respond `{ "ok": true, "recipients": n }`, and answer a body
 that is not valid JSON with **400**.
 
-Every one of these routes must sit behind an HTTP-level authentication of your
-own, which is why the reference mounts none of them without one. An
+`/stats` and both POST routes must sit behind an HTTP-level authentication of
+your own, which is why the reference mounts none of them without one. An
 unauthenticated "push anything into any room" endpoint is a vulnerability; and
 `/stats` reports counts per namespace, so in a multi-tenant deployment an
 unauthenticated read enumerates the tenants that are online.
+
+The upgrade route is the exception — it is always mounted, since authentication
+happens in the `auth` frame. It does take one optional check: an origin
+allow-list (the reference calls it `allowedOrigins`) answering a disallowed
+`Origin` with **403** before upgrading, so the handshake is never reached. Worth
+having whenever `verify` trusts cookies, because a browser attaches those to a
+cross-site socket too. Keep it opt-in: only browsers send `Origin` at all, so a
+default allow-list would reject every non-browser client, and a _missing_ header
+should stay allowed unless you knowingly demand one.
 
 ---
 
@@ -1398,6 +1415,8 @@ Rooms and messages
 - [ ] `msg` carries `room`, `namespace`, `from`, `payload` (untouched),
       `timestamp` (integer epoch ms)
 - [ ] `pub` with a foreign `namespace` is nacked `forbidden`
+- [ ] `pub` without a `room` and `sub`/`unsub` with a non-array `rooms` are
+      answered `nack` `bad_request` without closing the socket
 - [ ] `broadcast` is nacked `forbidden` unless allowed; when allowed, every
       receiver sees its own namespace
 

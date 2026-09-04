@@ -24,8 +24,8 @@ Verify: deno doc --lint src/mod.ts src/server.ts src/protocol.ts
 Verify: deno publish --dry-run --allow-dirty
 ```
 
-| Status | ID  | Deps                                            | Task                                                                       | Source                            | Commit |
-| ------ | --- | ----------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------- | ------ |
+| Status | ID  | Deps                                            | Task                                                                       | Source                            | Commit  |
+| ------ | --- | ----------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------- | ------- |
 | ✅     | T01 | —                                               | Server: validate frame shapes; never let a handler throw escape the socket | [01](./01-server.md) #1           | d3118e5 |
 | ✅     | T02 | —                                               | Client: catch the unsubscriber's fire-and-forget `unsub`                   | [02](./02-client.md) #1           | 1c22387 |
 | ✅     | T08 | T01                                             | Server: hand `verify` the requested identity; document the isolation rule  | [01](./01-server.md) #2           | a559509 |
@@ -38,8 +38,8 @@ Verify: deno publish --dry-run --allow-dirty
 | ✅     | T10 | —                                               | Server: opt-in `allowedOrigins` check on the upgrade                       | [01](./01-server.md) #4           | bc4dc8b |
 | ✅     | T11 | —                                               | Server: mount `/stats` only behind `httpAuth`; answer bad JSON with 400    | [01](./01-server.md) #5           | 359ca3a |
 | ✅     | T12 | —                                               | Server: encode a fan-out frame once per namespace                          | [01](./01-server.md) #6           | c0f9ee6 |
-| ⬜     | T13 | T01 T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 T12 | Docs: sweep the remaining drift; re-align `PROTOCOL.md` with the code      | [03](./03-docs-and-release.md) #1 | —      |
-| 🔒     | T14 | T13                                             | Release 0.4.0: bump `PROTOCOL.md` version references, run `deno task rpm`  | [03](./03-docs-and-release.md) #2 | —      |
+| ✅     | T13 | T01 T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 T12 | Docs: sweep the remaining drift; re-align `PROTOCOL.md` with the code      | [03](./03-docs-and-release.md) #1 | —       |
+| 🔒     | T14 | T13                                             | Release 0.4.0: bump `PROTOCOL.md` version references, run `deno task rpm`  | [03](./03-docs-and-release.md) #2 | —       |
 
 Row order is execution order, not rank; the ranking is in the overview. T14 is human-only
 by design: publishing is irreversible and outward-facing. When the driver runs dry on it,
@@ -50,6 +50,15 @@ left out are listed under "Deliberately omitted" in the overview, each with its 
 
 ## Decisions log
 
+- **2026-09-04** — The docs sweep edited exactly the nine listed items and nothing else;
+  three of them (`PROTOCOL.md` §7, the `/stats` gating in §10, the control-frame `.catch()`
+  convention in `AGENTS.md`) had already landed inside T01/T02/T11, so only the residue was
+  written. No open question: both questions in the source doc belong to the release (T14)
+  and are already decided. The Python reference gains the same `isinstance(rooms, list)`
+  guard as the TypeScript server — without it a non-array `rooms` raised inside its handler
+  task instead of being nacked. `PROTOCOL.md` §1 was re-read against the final code: none of
+  its ten statements changed, as the plan predicted. The two `0.3.0` version strings are
+  deliberately untouched — they belong to T14. (T13)
 - **2026-09-04** — `#deliverLocal` encodes the `msg` frame once per namespace and hands the
   result to a new `#sendEncoded`; an encoder that throws costs that one namespace its
   delivery, logged at debug, while the other namespaces still go out. No open question: the
