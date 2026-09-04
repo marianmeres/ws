@@ -82,7 +82,13 @@ export interface WSServiceOptions {
 		ctx: WSConnectionContext,
 		room: string,
 	) => boolean | Promise<boolean>;
-	/** Deadline for the client's `auth` frame. Default 5_000. */
+	/**
+	 * Deadline for the client's `auth` frame. Default 5_000.
+	 *
+	 * It bounds the *arrival* of the frame, not the handshake: the timer is
+	 * cleared the moment the frame lands, so a slow `verify` is bounded only by
+	 * the client's own liveness deadline (10 s in the stock client).
+	 */
 	authTimeout?: number;
 	/** Close a connection silent for this long. Default 60_000 (~2 missed pings). */
 	idleTimeout?: number;
@@ -109,6 +115,10 @@ interface Connection {
 	meta: Record<string, unknown>;
 	request: Request;
 	authed: boolean;
+	/** A handshake is in flight — `verify` has been called and has not answered. */
+	verifying: boolean;
+	/** The socket is gone and must never be registered again. */
+	closed: boolean;
 	lastSeen: number;
 	authTimer?: ReturnType<typeof setTimeout>;
 	windowStart: number;
@@ -227,6 +237,8 @@ export class WSService {
 			meta: {},
 			request,
 			authed: false,
+			verifying: false,
+			closed: false,
 			lastSeen: Date.now(),
 			windowStart: Date.now(),
 			windowCount: 0,
@@ -489,7 +501,10 @@ export class WSService {
 		clearTimeout(conn.authTimer);
 		conn.authTimer = undefined;
 
-		if (conn.authed) return; // ignore a repeated handshake
+		// Ignore a repeated handshake — including one that arrives while the
+		// first is still awaiting `verify`, which would otherwise run the hook
+		// twice and answer with two `hello` frames.
+		if (conn.authed || conn.verifying) return;
 
 		// The client's proposals are hints, and an empty or non-string one is
 		// no hint at all — it must not become a registry key.
@@ -498,6 +513,7 @@ export class WSService {
 
 		let result: AuthResult | null = {};
 		if (this.#verify) {
+			conn.verifying = true;
 			try {
 				result = await this.#verify(frame.payload, conn.request, {
 					clientId: proposedId,
@@ -506,7 +522,18 @@ export class WSService {
 			} catch (e) {
 				this.logger?.debug?.(`verify threw: ${e}`);
 				result = null;
+			} finally {
+				conn.verifying = false;
 			}
+		}
+
+		// The socket may have gone while `verify` was thinking. `#onClose`
+		// has already run, so registering now would create an entry nothing
+		// ever removes — a ghost connection until the idle sweeper reaps it,
+		// or forever with `idleTimeout: 0`.
+		if (conn.closed || conn.socket.readyState !== WebSocket.OPEN) {
+			this.logger?.debug?.("socket closed mid-handshake");
+			return;
 		}
 
 		if (result === null) {
@@ -776,6 +803,7 @@ export class WSService {
 	}
 
 	#onClose(conn: Connection): void {
+		conn.closed = true;
 		clearTimeout(conn.authTimer);
 		conn.authTimer = undefined;
 		this.#pending.delete(conn);

@@ -150,7 +150,12 @@ or join any namespace.
   callback resolves, so this only ever affects a misbehaving client.
 - Any non-`auth` frame before authentication: reply with an `error` frame, code
   `unauthorized`, and keep the socket open. The stock client never does this.
-- A second `auth` on an authenticated connection is ignored.
+- A second `auth` is ignored — both on an authenticated connection and on one
+  whose first handshake is still in flight, so `verify` runs at most once per
+  socket and at most one `hello` goes out.
+- A socket that closes while `verify` is pending is never registered. The
+  handshake's result is dropped: the close already ran, so nothing would ever
+  remove the entry.
 - A `protocol` mismatch in `hello` only produces a client-side warning, so bump
   the version only for a genuinely breaking change.
 

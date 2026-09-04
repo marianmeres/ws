@@ -8,9 +8,9 @@
 
 import { assert, assertEquals, assertNotEquals } from "@std/assert";
 
-import { CLOSE, ERROR_CODE } from "../src/protocol/constants.ts";
+import { CLOSE, ERROR_CODE, PROTOCOL_VERSION } from "../src/protocol/constants.ts";
 import type { WSFrame } from "../src/protocol/frames.ts";
-import { rawConnect, startServer } from "./_helpers.ts";
+import { rawConnect, sleep, startServer, until } from "./_helpers.ts";
 
 Deno.test("a non-array `rooms` on sub is a bad_request, not a crash", async () => {
 	const server = startServer();
@@ -162,6 +162,81 @@ Deno.test("auth ignores an unusable clientId or namespace", async () => {
 	} finally {
 		await a.close();
 		await b.close();
+		await server.stop();
+	}
+});
+
+/** A promise plus the handle that settles it, so a test can hold `verify` open. */
+function gate(): { promise: Promise<void>; open: () => void } {
+	let open!: () => void;
+	const promise = new Promise<void>((resolve) => (open = resolve));
+	return { promise, open };
+}
+
+Deno.test("two auth frames run verify once and answer with one hello", async () => {
+	const verifying = gate();
+	let calls = 0;
+	const server = startServer({
+		verify: async () => {
+			calls++;
+			await verifying.promise;
+			return {};
+		},
+	});
+	const a = await rawConnect(server.url);
+
+	try {
+		const auth = { type: "auth", protocol: PROTOCOL_VERSION, payload: null };
+		a.send({ ...auth, id: "a1" });
+		a.send({ ...auth, id: "a2" });
+		// Answered synchronously while `verify` is still pending, so it proves
+		// both auth frames have already been dispatched.
+		a.send({ type: "ping" });
+		await a.waitFor((f) => f.type === "error", "unauthorized error");
+
+		verifying.open();
+		await a.waitFor((f) => f.type === "hello", "hello");
+		await sleep(50);
+
+		assertEquals(calls, 1);
+		assertEquals(a.frames.filter((f) => f.type === "hello").length, 1);
+	} finally {
+		verifying.open();
+		await a.close();
+		await server.stop();
+	}
+});
+
+Deno.test("a socket closed during verify is never registered", async () => {
+	const verifying = gate();
+	let called = false;
+	const server = startServer({
+		// Nothing sweeps, so a ghost entry would be permanent rather than
+		// merely long-lived.
+		idleTimeout: 0,
+		verify: async () => {
+			called = true;
+			await verifying.promise;
+			return {};
+		},
+	});
+	const a = await rawConnect(server.url);
+
+	try {
+		a.send({ type: "auth", id: "a1", protocol: PROTOCOL_VERSION, payload: null });
+		await until(() => called, "verify called");
+
+		await a.close();
+		await until(() => server.service.stats().pending === 0, "server saw the close");
+
+		verifying.open();
+		await sleep(50);
+
+		assertEquals(server.service.stats().connections, 0);
+		assertEquals(server.service.stats().pending, 0);
+	} finally {
+		verifying.open();
+		await a.close();
 		await server.stop();
 	}
 });
