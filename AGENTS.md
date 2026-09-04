@@ -81,7 +81,10 @@ or Node process.
 
 **Every send carries one deadline** spanning queue + flight + ack — not an
 ack-only timeout. Combining acks with infinite retry otherwise produces promises
-that pend forever.
+that pend forever. And a socket close settles in-flight frames at once, rather
+than waiting out a deadline for an answer that can no longer arrive: `sub` and
+`unsub` resolve, everything else rejects with `WSConnectionLostError`. Queued
+frames are untouched — they are still waiting for a connection, not an ack.
 
 **The pong deadline is not restarted by later pings.** It measures time since
 the _oldest_ unanswered ping. Restarting it means any `pingInterval <=

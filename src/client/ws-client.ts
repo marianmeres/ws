@@ -26,6 +26,7 @@ import type {
 	WSPublishResult,
 } from "../protocol/frames.ts";
 import {
+	WSConnectionLostError,
 	WSConnectTimeoutError,
 	WSDisposedError,
 	WSError,
@@ -510,6 +511,7 @@ export class WSClient<TAuth = unknown> {
 			new WSTerminatedError(CLOSE.CLIENT_GONE, "disconnect() called"),
 		);
 		this.#closeSocket(CLOSE.CLIENT_GONE, "client disconnect");
+		this.#settleInFlight();
 		this.#setState("idle");
 	}
 
@@ -977,12 +979,31 @@ export class WSClient<TAuth = unknown> {
 			return;
 		}
 
+		this.#settleInFlight();
+
 		if (!willReconnect) {
 			this.#setState("idle");
 			return;
 		}
 
 		this.#scheduleReconnect();
+	}
+
+	/**
+	 * Answers the frames that were on the wire when the socket went away.
+	 *
+	 * `sub`/`unsub` resolve: the room registry is authoritative locally and the
+	 * re-subscribe step will establish it on the next connection, which is
+	 * exactly the contract of a `subscribe()` issued while offline — and the
+	 * server forgets its rooms on close anyway. Publishes reject: they were not
+	 * delivered, and at-most-once means they will not be resent.
+	 */
+	#settleInFlight(): void {
+		this.#outbox.settleInFlight((frame) =>
+			frame.type === FRAME.SUB || frame.type === FRAME.UNSUB
+				? null
+				: new WSConnectionLostError()
+		);
 	}
 
 	#scheduleReconnect(): void {

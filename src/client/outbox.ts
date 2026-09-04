@@ -135,13 +135,25 @@ export class Outbox {
 	}
 
 	/**
-	 * Rejects only the frames still waiting to be transmitted, leaving
-	 * in-flight ones to their acks or timeouts.
+	 * Settles every already-transmitted frame, leaving the queued ones to wait
+	 * for the next connection.
+	 *
+	 * Used when the socket closes: the ack can no longer arrive, because the
+	 * socket that would have carried it is gone and the next one is a new
+	 * session. Waiting out `sendTimeout` would only delay an answer that is
+	 * already known.
+	 *
+	 * @param decide - per frame: the error to reject with, or `null` to resolve
+	 * it with no recipients
 	 */
-	failQueued(error: Error): void {
-		const ids = this.#queue;
-		this.#queue = [];
-		for (const id of ids) this.fail(id, error);
+	settleInFlight(decide: (frame: ClientFrame) => Error | null): void {
+		for (const [id, entry] of [...this.#pending]) {
+			if (entry.queued) continue;
+			const error = decide(entry.frame);
+			this.#discard(id);
+			if (error) entry.reject(error);
+			else entry.resolve({ recipients: 0 });
+		}
 	}
 
 	#discard(id: string): PendingSend | undefined {

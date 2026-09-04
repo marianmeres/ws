@@ -198,8 +198,9 @@ silent one would be indistinguishable from a network that never recovered.
 
 **Delivery is at-most-once.** A publish that was transmitted but unacknowledged
 when the socket died is _not_ resent — that would risk duplicates, and the
-server has no deduplication. It rejects on `sendTimeout`. At-least-once would
-need server-side replay, which this version does not do.
+server has no deduplication. It rejects immediately with `WSConnectionLostError`
+rather than waiting out `sendTimeout`: the answer is already known at the close.
+At-least-once would need server-side replay, which this version does not do.
 
 **Sends are bounded.** Every publish carries one deadline covering queue, flight
 _and_ acknowledgement. Without it, a publish issued while offline would pend

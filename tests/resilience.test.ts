@@ -3,13 +3,21 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import { createWSClient } from "../src/mod.ts";
 import type { WSMessage } from "../src/protocol/frames.ts";
 import {
+	WSConnectionLostError,
 	WSConnectTimeoutError,
 	WSDisposedError,
 	WSNotConnectedError,
 	WSOutboxDropError,
 } from "../src/protocol/errors.ts";
 import type { ClientFrame } from "../src/protocol/frames.ts";
-import { freePort, sleep, startServer, startSilentServer, until } from "./_helpers.ts";
+import {
+	freePort,
+	sleep,
+	startNoAckServer,
+	startServer,
+	startSilentServer,
+	until,
+} from "./_helpers.ts";
 
 const client = (url: string, options: Record<string, unknown> = {}) =>
 	createWSClient({ url, logger: null, pingInterval: 0, ...options });
@@ -74,6 +82,72 @@ Deno.test("buffered publishes flush *after* re-subscribe, not before", async () 
 	} finally {
 		c.dispose();
 		await server.stop();
+	}
+});
+
+Deno.test("a sub lost to a dropped socket resolves and keeps its room", async () => {
+	const port = freePort();
+	let server = startServer({}, port);
+	// A short deadline on purpose: if the lost `sub` were left to its timeout,
+	// this test would fail in 400ms instead of hanging for the default 30s.
+	const c = client(server.url, {
+		reconnectDelay: 30,
+		reconnectDelayMax: 120,
+		sendTimeout: 400,
+	});
+
+	try {
+		await c.connect();
+
+		// The socket is already on its way out, but the client still reads
+		// "open", so the `sub` goes out and nobody is left to acknowledge it.
+		const stopping = server.stop();
+		const seen: WSMessage[] = [];
+		const subscribed = c.subscribe("chat", (m) => seen.push(m));
+		await stopping;
+
+		// The rejection this used to produce ran subscribe()'s catch, which
+		// detaches the handler — behind the back of a reconnect that had already
+		// re-subscribed the room.
+		await subscribed;
+		assertEquals(c.rooms, ["chat"]);
+
+		server = startServer({}, port);
+		await until(() => c.connected, "client reconnects", 8_000);
+		await until(
+			() => server.service.members("chat").length === 1,
+			"the room is live on the server too",
+		);
+
+		await server.service.publish("chat", { text: "still here" });
+		await until(() => seen.length === 1, "the handler survived");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("an in-flight publish rejects at the close, not at the timeout", async () => {
+	// This server closes the socket instead of acking the `pub`.
+	const noAck = startNoAckServer();
+	const c = client(noAck.url, { sendTimeout: 10_000, reconnectDelay: 10_000 });
+
+	try {
+		await c.connect();
+
+		const started = Date.now();
+		await assertRejects(
+			() => c.publish("chat", { n: 1 }),
+			WSConnectionLostError,
+		);
+		const elapsed = Date.now() - started;
+		assert(
+			elapsed < 2_000,
+			`waited ${elapsed}ms — that is the timeout, not the close`,
+		);
+	} finally {
+		c.dispose();
+		await noAck.stop();
 	}
 });
 

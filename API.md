@@ -162,13 +162,15 @@ Publishes to a room within this client's namespace. Resolves with the recipient
 count once the server acknowledges.
 
 While disconnected the frame is buffered and the promise stays pending until it
-flushes — bounded by `sendTimeout`, never indefinitely.
+flushes — bounded by `sendTimeout`, never indefinitely. A frame already in
+flight when the socket closes rejects there and then with
+`WSConnectionLostError`; it is not resent.
 
 `namespace` must equal the client's own; the server rejects anything else, so it
 is only useful for asserting the expected one.
 
-**Throws** `WSTimeoutError`, `WSOutboxDropError`, `WSNotConnectedError`,
-`WSRemoteError`, `WSDisposedError`
+**Throws** `WSTimeoutError`, `WSConnectionLostError`, `WSOutboxDropError`,
+`WSNotConnectedError`, `WSRemoteError`, `WSDisposedError`
 
 ##### `broadcast<T>(room, payload): Promise<WSPublishResult>`
 
@@ -656,6 +658,7 @@ string-matching messages.
 | `WSTerminatedError`     | Terminal close code                             | `code`, `reason` |
 | `WSConnectTimeoutError` | `connectTimeout` elapsed (retrying continues)   |                  |
 | `WSTimeoutError`        | `sendTimeout` elapsed with no acknowledgement   |                  |
+| `WSConnectionLostError` | Socket closed while the frame was in flight     |                  |
 | `WSOutboxDropError`     | Evicted from a full outbox                      |                  |
 | `WSRemoteError`         | Server sent a `nack`                            | `code`           |
 | `WSNotConnectedError`   | Sent while disconnected with `outboxMaxSize: 0` |                  |

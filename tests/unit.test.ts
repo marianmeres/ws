@@ -4,6 +4,7 @@ import { Outbox } from "../src/client/outbox.ts";
 import { RoomRegistry } from "../src/client/rooms.ts";
 import { Heartbeat } from "../src/client/heartbeat.ts";
 import {
+	WSConnectionLostError,
 	WSDisposedError,
 	WSOutboxDropError,
 	WSTimeoutError,
@@ -109,6 +110,27 @@ Deno.test("outbox — failAll settles everything", async () => {
 	await assertRejects(() => a, WSDisposedError);
 	await assertRejects(() => b, WSDisposedError);
 	assertEquals(outbox.pendingCount, 0);
+});
+
+Deno.test("outbox — settleInFlight answers transmitted frames, spares queued ones", async () => {
+	const outbox = new Outbox({ maxSize: 10, sendTimeout: 5_000 });
+	const queued = outbox.track("q", frame("q"), true);
+	const rejected = outbox.track("r", frame("r"), false);
+	const resolved = outbox.track("s", frame("s"), false);
+
+	outbox.settleInFlight((f) =>
+		(f as { id: string }).id === "s" ? null : new WSConnectionLostError()
+	);
+
+	await assertRejects(() => rejected, WSConnectionLostError);
+	assertEquals((await resolved).recipients, 0);
+
+	// The queued frame is untouched: it still waits for the next connection.
+	assertEquals(outbox.queuedCount, 1);
+	assertEquals(outbox.pendingCount, 1);
+
+	outbox.failAll(new WSDisposedError());
+	await assertRejects(() => queued, WSDisposedError);
 });
 
 Deno.test("heartbeat — a later ping cannot postpone an unanswered one", async () => {
