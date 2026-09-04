@@ -3,10 +3,12 @@ import type { DeminoHandler } from "@marianmeres/demino";
 
 import { createWSClient } from "../src/mod.ts";
 import type {
+	WSEncoder,
 	WSMessage,
 	WSPresenceEvent,
 	WSRequestedIdentity,
 } from "../src/protocol/frames.ts";
+import { FRAME } from "../src/protocol/constants.ts";
 import { WSRemoteError, WSTerminatedError } from "../src/protocol/errors.ts";
 import { startServer, until } from "./_helpers.ts";
 
@@ -131,6 +133,67 @@ Deno.test("broadcast crosses namespaces when allowed", async () => {
 		);
 		// Receivers always see the namespace they actually live in.
 		assertEquals(seenByTwo[0].namespace, "org-2");
+	} finally {
+		one.dispose();
+		two.dispose();
+		await server.stop();
+	}
+});
+
+/** Counts how many times a `msg` frame went through the encoder. */
+function countingEncoder(): { encode: WSEncoder; count: () => number } {
+	let count = 0;
+	return {
+		encode: (frame) => {
+			if (frame.type === FRAME.MSG) count++;
+			return JSON.stringify(frame);
+		},
+		count: () => count,
+	};
+}
+
+Deno.test("a fan-out frame is encoded once, not once per subscriber", async () => {
+	const encoder = countingEncoder();
+	const server = startServer({ encode: encoder.encode });
+	const clients = ["a", "b", "c"].map((id) => client(server.url, { clientId: id }));
+
+	try {
+		const seen: WSMessage[] = [];
+		for (const c of clients) {
+			await c.connect();
+			await c.subscribe("chat", (m) => seen.push(m));
+		}
+
+		const { recipients } = await clients[0].publish("chat", { text: "hi" });
+		assertEquals(recipients, 3);
+		await until(() => seen.length === 3, "all three subscribers receive it");
+		assertEquals(encoder.count(), 1, "one namespace, one encoding");
+	} finally {
+		for (const c of clients) c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a broadcast is encoded once per namespace", async () => {
+	const encoder = countingEncoder();
+	const server = startServer({
+		encode: encoder.encode,
+		allowBroadcast: () => true,
+	});
+	const one = client(server.url, { namespace: "org-1" });
+	const two = client(server.url, { namespace: "org-2" });
+
+	try {
+		const seen: WSMessage[] = [];
+		await one.connect();
+		await two.connect();
+		await one.subscribe("alerts", (m) => seen.push(m));
+		await two.subscribe("alerts", (m) => seen.push(m));
+
+		const { recipients } = await one.broadcast("alerts", { text: "maintenance" });
+		assertEquals(recipients, 2);
+		await until(() => seen.length === 2, "both namespaces receive it");
+		assertEquals(encoder.count(), 2, "two namespaces, two encodings");
 	} finally {
 		one.dispose();
 		two.dispose();

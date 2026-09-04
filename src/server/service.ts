@@ -770,12 +770,22 @@ export class WSService {
 
 		let count = 0;
 		const deliver = (ids: Set<string>, ns: string) => {
+			// The frame differs between recipients only by namespace, so it is
+			// encoded once per namespace instead of once per socket. Receivers
+			// always see the namespace they actually live in, even for a
+			// broadcast that originated outside it.
+			let wire: string | ArrayBufferView | ArrayBuffer;
+			try {
+				wire = this.#encode({ type: FRAME.MSG, ...message, namespace: ns });
+			} catch (e) {
+				// One namespace's encoder failure must not abort the others.
+				this.logger?.debug?.(`encode failed (namespace ${ns}): ${e}`);
+				return;
+			}
 			for (const id of ids) {
 				const conn = this.#connections.get(id);
 				if (!conn) continue;
-				// Receivers always see the namespace they actually live in,
-				// even for a broadcast that originated outside it.
-				this.#send(conn, { type: FRAME.MSG, ...message, namespace: ns });
+				this.#sendEncoded(conn, wire);
 				count++;
 			}
 		};
@@ -893,8 +903,23 @@ export class WSService {
 
 	#send(conn: Connection, frame: ServerFrame): void {
 		if (conn.socket.readyState !== WebSocket.OPEN) return;
+		let wire: string | ArrayBufferView | ArrayBuffer;
 		try {
-			conn.socket.send(this.#encode(frame));
+			wire = this.#encode(frame);
+		} catch (e) {
+			this.logger?.debug?.(`encode failed (${conn.id}): ${e}`);
+			return;
+		}
+		this.#sendEncoded(conn, wire);
+	}
+
+	#sendEncoded(
+		conn: Connection,
+		wire: string | ArrayBufferView | ArrayBuffer,
+	): void {
+		if (conn.socket.readyState !== WebSocket.OPEN) return;
+		try {
+			conn.socket.send(wire);
 		} catch (e) {
 			this.logger?.debug?.(`send failed (${conn.id}): ${e}`);
 		}
