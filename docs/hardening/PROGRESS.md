@@ -26,7 +26,7 @@ Verify: deno publish --dry-run --allow-dirty
 
 | Status | ID  | Deps                                            | Task                                                                       | Source                            | Commit |
 | ------ | --- | ----------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------- | ------ |
-| ⬜     | T01 | —                                               | Server: validate frame shapes; never let a handler throw escape the socket | [01](./01-server.md) #1           | —      |
+| ✅     | T01 | —                                               | Server: validate frame shapes; never let a handler throw escape the socket | [01](./01-server.md) #1           | —      |
 | ⬜     | T02 | —                                               | Client: catch the unsubscriber's fire-and-forget `unsub`                   | [02](./02-client.md) #1           | —      |
 | ⬜     | T08 | T01                                             | Server: hand `verify` the requested identity; document the isolation rule  | [01](./01-server.md) #2           | —      |
 | ⬜     | T03 | T02                                             | Client: settle in-flight frames the moment the socket closes               | [02](./02-client.md) #2           | —      |

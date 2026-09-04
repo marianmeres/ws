@@ -1,5 +1,7 @@
 import { createWSApp, type WSAppOptions } from "../src/server/mod.ts";
 import type { WSService } from "../src/server/mod.ts";
+import { PROTOCOL_VERSION } from "../src/protocol/constants.ts";
+import type { WSErrorInfo } from "../src/protocol/frames.ts";
 
 export interface TestServer {
 	url: string;
@@ -109,4 +111,90 @@ export async function until(
 
 export function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));
+}
+
+/** A frame as it came off the wire, before anything trusts its shape. */
+export interface RawFrame {
+	type: string;
+	id?: string;
+	error?: WSErrorInfo;
+	clientId?: string;
+	namespace?: string;
+	[key: string]: unknown;
+}
+
+/**
+ * A socket without the client library, so a test can send frames the client
+ * would never produce — the only way to reach the server's input validation.
+ */
+export interface RawSocket {
+	/** Every frame received so far, in order. */
+	frames: RawFrame[];
+	/** Set once the socket closed. */
+	closed: { code: number; reason: string } | null;
+	/** Sends anything at all, JSON-encoded. */
+	send(frame: unknown): void;
+	/** Resolves with the first received frame matching `match`. */
+	waitFor(match: (frame: RawFrame) => boolean, message?: string): Promise<RawFrame>;
+	/** Resolves once the socket is closed, with the code and reason. */
+	waitClosed(message?: string): Promise<{ code: number; reason: string }>;
+	/** Completes the handshake and resolves with the `hello` frame. */
+	auth(frame?: Record<string, unknown>): Promise<RawFrame>;
+	close(): Promise<void>;
+}
+
+/** Opens a {@link RawSocket} and resolves once it is connected. */
+export async function rawConnect(url: string): Promise<RawSocket> {
+	const socket = new WebSocket(url);
+	const frames: RawFrame[] = [];
+	let closed: { code: number; reason: string } | null = null;
+
+	socket.onmessage = (event: MessageEvent) => frames.push(JSON.parse(event.data));
+	socket.onclose = (event: CloseEvent) => {
+		closed = { code: event.code, reason: event.reason };
+	};
+
+	await new Promise<void>((resolve, reject) => {
+		socket.onopen = () => resolve();
+		socket.onerror = () => reject(new Error(`raw socket failed to open: ${url}`));
+	});
+
+	const raw: RawSocket = {
+		frames,
+		get closed() {
+			return closed;
+		},
+		send(frame) {
+			socket.send(JSON.stringify(frame));
+		},
+		async waitFor(match, message = "matching frame") {
+			await until(() => frames.some(match), message);
+			const found = frames.find(match);
+			if (!found) throw new Error(`no frame matched: ${message}`);
+			return found;
+		},
+		async waitClosed(message = "socket close") {
+			await until(() => closed !== null, message);
+			if (!closed) throw new Error(`socket did not close: ${message}`);
+			return closed;
+		},
+		auth(frame = {}) {
+			raw.send({
+				type: "auth",
+				id: "auth-1",
+				protocol: PROTOCOL_VERSION,
+				payload: null,
+				...frame,
+			});
+			return raw.waitFor((f) => f.type === "hello", "hello");
+		},
+		async close() {
+			if (closed === null) {
+				socket.close();
+				await until(() => closed !== null, "raw socket close");
+			}
+		},
+	};
+
+	return raw;
 }

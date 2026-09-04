@@ -473,6 +473,13 @@ Reference behaviour for malformed input:
 - Not valid JSON: send `error` `bad_request`, then close with **4400**.
 - Valid JSON without a string `type`, or an unknown `type`: send `error`
   `bad_request`, keep the socket.
+- `sub`/`unsub` whose `rooms` is not an array, or `pub`/`broadcast` without a
+  non-empty string `room`: send `nack` `bad_request`, keep the socket. Malformed
+  entries _inside_ a well-formed `rooms` array are skipped silently.
+- An unexpected failure while handling an otherwise well-formed frame: send
+  `error` `internal`, then close with **1011**. A handler that threw may have
+  left the connection's bookkeeping half-applied; 1011 is recoverable, so the
+  client reconnects into clean state.
 
 ---
 

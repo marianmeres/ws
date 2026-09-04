@@ -20,6 +20,7 @@ import type {
 	ClientFrame,
 	PresenceEventType,
 	ServerFrame,
+	SubRequest,
 	WSDecoder,
 	WSEncoder,
 	WSMessage,
@@ -115,6 +116,11 @@ const DEFAULTS = {
 const defaultEncode: WSEncoder = (frame) => JSON.stringify(frame);
 const defaultDecode: WSDecoder = (raw) =>
 	JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw));
+
+/** The value if it is a usable string, `undefined` otherwise. */
+function nonEmptyString(value: unknown): string | undefined {
+	return typeof value === "string" && value ? value : undefined;
+}
 
 /**
  * Owns every connection, the room index, and message delivery.
@@ -225,7 +231,13 @@ export class WSService {
 		}, this.#options.authTimeout);
 
 		socket.onmessage = (event: MessageEvent) => {
-			void this.#onMessage(conn, event.data);
+			// Last line of defence. `#onMessage` contains its own throws; if one
+			// ever escapes anyway, it must cost this socket and not the process —
+			// an unhandled rejection is fatal in Deno.
+			void this.#onMessage(conn, event.data).catch((e) => {
+				this.logger?.error?.(`unhandled frame error (${conn.id}): ${e}`);
+				this.#close(conn, CLOSE.INTERNAL_ERROR, "internal error");
+			});
 		};
 		socket.onclose = () => this.#onClose(conn);
 		socket.onerror = () => this.logger?.debug?.(`socket error (${conn.id})`);
@@ -391,6 +403,26 @@ export class WSService {
 			return this.#close(conn, CLOSE.PROTOCOL_ERROR, "malformed frame");
 		}
 
+		try {
+			return await this.#dispatch(conn, frame);
+		} catch (e) {
+			// A handler that threw may have left this connection's bookkeeping
+			// half-updated, so the socket goes. 1011 is recoverable: the client
+			// reconnects into clean state, and every other client is unaffected.
+			this.logger?.error?.(`frame handler threw (${conn.id}): ${e}`);
+			this.#send(conn, {
+				type: FRAME.ERROR,
+				error: { code: ERROR_CODE.INTERNAL, message: "internal error" },
+			});
+			return this.#close(conn, CLOSE.INTERNAL_ERROR, "internal error");
+		}
+	}
+
+	/**
+	 * Routes one decoded frame. Everything it touches came off the wire, so
+	 * nothing but `type` may be assumed to have the shape the types promise.
+	 */
+	async #dispatch(conn: Connection, frame: ClientFrame): Promise<void> {
 		if (!frame || typeof frame.type !== "string") {
 			return this.#send(conn, {
 				type: FRAME.ERROR,
@@ -464,8 +496,13 @@ export class WSService {
 			return this.#close(conn, CLOSE.AUTH_FAILED, "authentication failed");
 		}
 
-		const id = result.clientId ?? frame.clientId ?? conn.id;
-		const namespace = result.namespace ?? frame.namespace ?? DEFAULT_NAMESPACE;
+		// The client's proposals are hints, and an empty or non-string one is
+		// no hint at all — it must not become a registry key.
+		const proposedId = nonEmptyString(frame.clientId);
+		const proposedNamespace = nonEmptyString(frame.namespace);
+
+		const id = result.clientId ?? proposedId ?? conn.id;
+		const namespace = result.namespace ?? proposedNamespace ?? DEFAULT_NAMESPACE;
 
 		// Same id reconnecting: the newcomer wins, the stale socket goes. This
 		// is what makes a reconnect after a half-open drop actually recover
@@ -493,16 +530,19 @@ export class WSService {
 		});
 	}
 
-	#onSub(
-		conn: Connection,
-		id: string,
-		requests: Array<{ room: string; presence?: boolean }>,
-	): void {
+	#onSub(conn: Connection, id: string, requests: unknown): void {
+		if (!Array.isArray(requests)) {
+			return this.#nack(conn, id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "rooms must be an array",
+			});
+		}
+
 		const syncRooms: string[] = [];
 
-		for (const request of requests ?? []) {
-			const room = request?.room;
-			if (typeof room !== "string" || !room) continue;
+		for (const request of requests as SubRequest[]) {
+			const room = nonEmptyString(request?.room);
+			if (!room) continue;
 
 			const isNew = !conn.rooms.has(room);
 			conn.rooms.set(room, !!request.presence);
@@ -533,9 +573,16 @@ export class WSService {
 		this.#send(conn, { type: FRAME.ACK, id });
 	}
 
-	#onUnsub(conn: Connection, id: string, rooms: string[]): void {
-		for (const room of rooms ?? []) {
-			if (!conn.rooms.delete(room)) continue;
+	#onUnsub(conn: Connection, id: string, rooms: unknown): void {
+		if (!Array.isArray(rooms)) {
+			return this.#nack(conn, id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "rooms must be an array",
+			});
+		}
+
+		for (const room of rooms) {
+			if (typeof room !== "string" || !conn.rooms.delete(room)) continue;
 			this.#indexRemove(room, conn.namespace, conn.id);
 			this.#notifyPresence(room, conn.namespace, PRESENCE.LEAVE, conn.id);
 		}
@@ -546,6 +593,21 @@ export class WSService {
 		conn: Connection,
 		frame: Extract<ClientFrame, { type: typeof FRAME.PUB }>,
 	): Promise<void> {
+		const room = nonEmptyString(frame.room);
+		if (!room) {
+			return this.#nack(conn, frame.id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "missing room",
+			});
+		}
+
+		if (frame.namespace && typeof frame.namespace !== "string") {
+			return this.#nack(conn, frame.id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "namespace must be a string",
+			});
+		}
+
 		// A client may only publish into its own namespace. Accepting the
 		// requested one blindly would make the isolation boundary decorative.
 		const namespace = conn.namespace;
@@ -557,7 +619,7 @@ export class WSService {
 		}
 
 		const message: WSMessage = {
-			room: frame.room,
+			room,
 			namespace,
 			from: conn.id,
 			payload: frame.payload,
@@ -572,6 +634,14 @@ export class WSService {
 		conn: Connection,
 		frame: Extract<ClientFrame, { type: typeof FRAME.BROADCAST }>,
 	): Promise<void> {
+		const room = nonEmptyString(frame.room);
+		if (!room) {
+			return this.#nack(conn, frame.id, {
+				code: ERROR_CODE.BAD_REQUEST,
+				message: "missing room",
+			});
+		}
+
 		const ctx: WSConnectionContext = {
 			clientId: conn.id,
 			namespace: conn.namespace,
@@ -582,7 +652,7 @@ export class WSService {
 		let allowed = false;
 		try {
 			allowed = this.#allowBroadcast
-				? await this.#allowBroadcast(ctx, frame.room)
+				? await this.#allowBroadcast(ctx, room)
 				: false;
 		} catch (e) {
 			this.logger?.debug?.(`allowBroadcast threw: ${e}`);
@@ -597,7 +667,7 @@ export class WSService {
 		}
 
 		const message: WSMessage = {
-			room: frame.room,
+			room,
 			namespace: "*",
 			from: conn.id,
 			payload: frame.payload,
