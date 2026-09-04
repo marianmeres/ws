@@ -449,3 +449,78 @@ Deno.test("a plain GET on the upgrade route explains itself", async () => {
 		await server.stop();
 	}
 });
+
+/** A handshake request built by hand, so the `Origin` can be chosen freely. */
+function upgradeFetch(url: string, origin?: string): Promise<Response> {
+	const headers: Record<string, string> = {
+		upgrade: "websocket",
+		connection: "Upgrade",
+		"sec-websocket-key": btoa("0123456789abcdef"),
+		"sec-websocket-version": "13",
+	};
+	if (origin !== undefined) headers.origin = origin;
+	return fetch(url, { headers });
+}
+
+Deno.test("an unlisted Origin is refused before verify runs", async () => {
+	let verifyCalls = 0;
+	const server = startServer({
+		allowedOrigins: ["https://app.example"],
+		verify: () => {
+			verifyCalls++;
+			return {};
+		},
+	});
+
+	try {
+		const res = await upgradeFetch(server.httpUrl, "https://evil.example");
+		assertEquals(res.status, 403);
+		assertEquals(await res.text(), "Origin not allowed");
+		assertEquals(verifyCalls, 0);
+
+		const allowed = await upgradeFetch(server.httpUrl, "https://app.example");
+		assertEquals(allowed.status, 101);
+		await allowed.body?.cancel();
+	} finally {
+		await server.stop();
+	}
+});
+
+Deno.test("the array form lets a client that sends no Origin through", async () => {
+	// Only browsers send the header; Deno's own WebSocket sends none.
+	const server = startServer({ allowedOrigins: ["https://app.example"] });
+	const c = client(server.url);
+
+	try {
+		await c.connect();
+		assertEquals(c.connected, true);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("the function form decides on its own", async () => {
+	const seen: (string | null)[] = [];
+	const server = startServer({
+		allowedOrigins: (origin) => {
+			seen.push(origin);
+			return origin === "https://app.example";
+		},
+	});
+
+	try {
+		// Unlike the array form, a missing Origin is not a free pass here.
+		const missing = await upgradeFetch(server.httpUrl);
+		await missing.body?.cancel();
+		assertEquals(missing.status, 403);
+
+		const allowed = await upgradeFetch(server.httpUrl, "https://app.example");
+		assertEquals(allowed.status, 101);
+		await allowed.body?.cancel();
+
+		assertEquals(seen, [null, "https://app.example"]);
+	} finally {
+		await server.stop();
+	}
+});

@@ -338,6 +338,7 @@ Creates a mountable demino app plus the service it is wired to.
 | `mountPath`                  | `string`                                          | `"/ws"`                   | Demino mount path                                                                                                                                                             |
 | `middlewares`                | `DeminoHandler[]`                                 | `[]`                      | Applied to all routes                                                                                                                                                         |
 | `options.verify`             | `(payload, req, requested) => AuthResult \| null` | —                         | Return `null` (or throw) to reject with `4001`. Absent means no authentication. `requested` is the identity the client asked for — see [below](#security-namespace-isolation) |
+| `options.allowedOrigins`     | `string[] \| (origin, req) => boolean`            | — (no check)              | Origins allowed to upgrade → `403` — see [below](#security-cross-site-websocket-hijacking)                                                                                    |
 | `options.allowBroadcast`     | `(ctx, room) => boolean`                          | **deny**                  | Gate for cross-namespace broadcast                                                                                                                                            |
 | `options.httpAuth`           | `DeminoHandler`                                   | —                         | Guards the HTTP routes. **Without it they are not mounted**                                                                                                                   |
 | `options.deminoOptions`      | `DeminoOptions`                                   | —                         | Passed through to `demino()`                                                                                                                                                  |
@@ -353,12 +354,12 @@ Creates a mountable demino app plus the service it is wired to.
 
 **Routes**, relative to `mountPath`:
 
-| Method | Path                          | Returns                     | Notes                                     |
-| ------ | ----------------------------- | --------------------------- | ----------------------------------------- |
-| GET    | `/`                           | 101, or 426 without upgrade | WebSocket upgrade                         |
-| GET    | `/stats`                      | `WSStats`                   | Guarded by `httpAuth` when supplied       |
-| POST   | `/publish/[namespace]/[room]` | `{ ok: true, recipients }`  | Requires `httpAuth`, else **not mounted** |
-| POST   | `/broadcast/[room]`           | `{ ok: true, recipients }`  | Requires `httpAuth`, else **not mounted** |
+| Method | Path                          | Returns                    | Notes                                     |
+| ------ | ----------------------------- | -------------------------- | ----------------------------------------- |
+| GET    | `/`                           | 101, 426 without upgrade   | WebSocket upgrade, `403` on a bad origin  |
+| GET    | `/stats`                      | `WSStats`                  | Guarded by `httpAuth` when supplied       |
+| POST   | `/publish/[namespace]/[room]` | `{ ok: true, recipients }` | Requires `httpAuth`, else **not mounted** |
+| POST   | `/broadcast/[room]`           | `{ ok: true, recipients }` | Requires `httpAuth`, else **not mounted** |
 
 The POST routes take the JSON request body as the message payload.
 
@@ -409,6 +410,35 @@ createWSApp("/ws", [], {
 });
 ```
 
+#### Security: cross-site WebSocket hijacking
+
+The upgrade request is an ordinary browser request, so the browser attaches its
+cookies for your origin no matter which site opened the socket. A `verify` that
+authenticates from cookies therefore authenticates the attacker's page too —
+same-origin policy does not apply to WebSockets, and there is no preflight.
+
+`allowedOrigins` closes that, and is **opt-in**: unset, nothing is checked.
+
+```typescript
+createWSApp("/ws", [], {
+	allowedOrigins: ["https://app.example"],
+	verify: (_payload, req) => sessionFromCookie(req),
+});
+```
+
+An unlisted `Origin` is answered `403 Origin not allowed` and never reaches
+`verify`. The array form **permits a missing `Origin`**, because only browsers
+send the header and non-browser clients (the stock Deno client included) send
+none — the check exists to stop browsers. Pass a function instead when that is
+too lax, or when the allowed set is dynamic:
+
+```typescript
+allowedOrigins: (origin, req) => origin !== null && isTenantOrigin(origin),
+```
+
+Token authentication in the `auth` payload is not exposed this way: another
+site's page cannot read your token, only ride your cookies.
+
 ---
 
 ### `WSService`
@@ -420,7 +450,8 @@ Owns every connection, the room index, presence and delivery. Usable standalone
 ##### `handleUpgrade(request): Response`
 
 Upgrades an HTTP request and takes ownership of the socket. Return the 101
-response from your route handler unmodified.
+response from your route handler unmodified. With `allowedOrigins` set, a
+disallowed request is answered `403` instead and nothing is upgraded.
 
 ##### `publish(room, payload, namespace?, from?): Promise<number>`
 

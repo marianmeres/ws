@@ -73,6 +73,17 @@ export interface WSServiceOptions {
 		requested: WSRequestedIdentity,
 	) => Promise<AuthResult | null> | AuthResult | null;
 	/**
+	 * Origins allowed to open a socket. Unset means no check — safe only when
+	 * `verify` does not rely on cookies, because a cookie-authenticated socket
+	 * with no origin check is the cross-site WebSocket hijacking setup: a page
+	 * on any other site opens one and the browser attaches the cookies.
+	 *
+	 * An array permits a *missing* `Origin` (non-browser clients send none) and
+	 * requires a listed one when present; a function decides on its own. A
+	 * rejected request is answered `403` and never reaches `verify`.
+	 */
+	allowedOrigins?: string[] | ((origin: string | null, request: Request) => boolean);
+	/**
 	 * Gate for cross-namespace broadcast. **Denies by default** — letting any
 	 * client punch through every namespace boundary is not a safe default, and
 	 * keeping `broadcast()` a distinct operation exists precisely so this check
@@ -151,10 +162,17 @@ export class WSService {
 	#options: Required<
 		Omit<
 			WSServiceOptions,
-			"verify" | "allowBroadcast" | "adapter" | "logger" | "encode" | "decode"
+			| "verify"
+			| "allowedOrigins"
+			| "allowBroadcast"
+			| "adapter"
+			| "logger"
+			| "encode"
+			| "decode"
 		>
 	>;
 	#verify: WSServiceOptions["verify"];
+	#allowedOrigins: WSServiceOptions["allowedOrigins"];
 	#allowBroadcast: WSServiceOptions["allowBroadcast"];
 	#adapter: WSPubSubAdapter;
 	#encode: WSEncoder;
@@ -193,6 +211,7 @@ export class WSService {
 				DEFAULTS.maxFramesPerSecond,
 		};
 		this.#verify = options.verify;
+		this.#allowedOrigins = options.allowedOrigins;
 		this.#allowBroadcast = options.allowBroadcast;
 		this.#adapter = options.adapter ?? new WSPubSubLocal();
 		this.#encode = options.encode ?? defaultEncode;
@@ -222,11 +241,21 @@ export class WSService {
 	 *
 	 * Deno-only: backed by `Deno.upgradeWebSocket`.
 	 *
+	 * When {@link WSServiceOptions.allowedOrigins} is set and the request's
+	 * `Origin` is not allowed, nothing is upgraded and a `403` comes back
+	 * instead — `verify` is never reached.
+	 *
 	 * @param request - the upgrade request
-	 * @returns the 101 response to hand straight back to the runtime
+	 * @returns the 101 response to hand straight back to the runtime, or `403`
 	 * @throws {TypeError} when the request is not a valid upgrade
 	 */
 	handleUpgrade(request: Request): Response {
+		const origin = request.headers.get("origin");
+		if (!this.#originAllowed(origin, request)) {
+			this.logger?.debug?.(`upgrade rejected, origin: ${origin}`);
+			return new Response("Origin not allowed", { status: 403 });
+		}
+
 		const { socket, response } = Deno.upgradeWebSocket(request);
 
 		const conn: Connection = {
@@ -388,6 +417,16 @@ export class WSService {
 	}
 
 	// -------------------------------------------------------------- internals
+
+	#originAllowed(origin: string | null, request: Request): boolean {
+		if (!this.#allowedOrigins) return true;
+		if (typeof this.#allowedOrigins === "function") {
+			return this.#allowedOrigins(origin, request);
+		}
+		// Only browsers send Origin, and browsers are the whole point of the
+		// check — a request without one cannot be a hijacked page.
+		return origin === null || this.#allowedOrigins.includes(origin);
+	}
 
 	async #propagate(
 		envelope: WSBroadcastEnvelope,

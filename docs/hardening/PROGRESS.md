@@ -35,7 +35,7 @@ Verify: deno publish --dry-run --allow-dirty
 | ✅     | T05 | —                                               | Client: receive binary frames as `ArrayBuffer`                             | [02](./02-client.md) #4           | —      |
 | ✅     | T06 | —                                               | Client: a stale `auth()` rejection must not close a newer socket           | [02](./02-client.md) #5           | —      |
 | ✅     | T09 | T01                                             | Server: one handshake per socket; no ghost registration                    | [01](./01-server.md) #3           | —      |
-| ⬜     | T10 | —                                               | Server: opt-in `allowedOrigins` check on the upgrade                       | [01](./01-server.md) #4           | —      |
+| ✅     | T10 | —                                               | Server: opt-in `allowedOrigins` check on the upgrade                       | [01](./01-server.md) #4           | —      |
 | ⬜     | T11 | —                                               | Server: mount `/stats` only behind `httpAuth`; answer bad JSON with 400    | [01](./01-server.md) #5           | —      |
 | ⬜     | T12 | —                                               | Server: encode a fan-out frame once per namespace                          | [01](./01-server.md) #6           | —      |
 | ⬜     | T13 | T01 T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 T12 | Docs: sweep the remaining drift; re-align `PROTOCOL.md` with the code      | [03](./03-docs-and-release.md) #1 | —      |
@@ -90,7 +90,10 @@ left out are listed under "Deliberately omitted" in the overview, each with its 
   users. (T08)
 - **2026-09-04** — `allowedOrigins` is opt-in; unset means no check, exactly today's
   behaviour; the array form permits a _missing_ `Origin` and requires a listed one when
-  present — only browsers send the header, and the check exists to stop browsers. (T10)
+  present — only browsers send the header, and the check exists to stop browsers. Verified
+  against the runtime rather than assumed: Deno's own `WebSocket` sends no `Origin`, so the
+  stock client passes through the missing-header branch and the function form is the only
+  way to demand one. (T10)
 - **2026-09-04** — `/stats` follows the POST routes: not mounted without `httpAuth`;
   `service.stats()` remains for in-process use — one rule for the whole HTTP surface
   matches the package's "safe defaults are deny" and is easier to trust than a route whose

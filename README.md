@@ -148,6 +148,10 @@ for when `verify` returns none — so in a multi-tenant deployment `verify` must
 return `namespace` and `clientId`, validating `requested` rather than trusting
 it.
 
+If `verify` authenticates from cookies, set `allowedOrigins` as well: browsers
+attach cookies to a WebSocket opened from any site, and without an `Origin`
+check that is cross-site WebSocket hijacking.
+
 Mounted routes, relative to the mount path:
 
 | Method | Path                          | Notes                                     |

@@ -100,7 +100,9 @@ not mounted without `httpAuth`. Do not "helpfully" relax either. The documented
 exception: `clientId` and `namespace` fall back to what the client asked for
 (assigned → requested → generated), so a multi-tenant `verify` must return both.
 Its third argument carries the client's proposals so they can be validated there
-instead of being duplicated into the auth payload.
+instead of being duplicated into the auth payload. `allowedOrigins` is the other
+exception — opt-in, because a default allow-list would break every non-browser
+deployment; unset means no check at all.
 
 **Delivery is at-most-once.** Transmitted-but-unacked sends are never resent.
 If that changes, the server needs deduplication first.
