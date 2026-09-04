@@ -13,6 +13,12 @@
  * `store.ts`; here we only clone templates and wire them up with
  * `@marianmeres/vanilla`.
  *
+ * The look comes from `@marianmeres/vanilla-ui`'s base style layer (copied to
+ * `public/vui-base.css` by `example/build-styles.ts`): the markup in
+ * `index.html` carries its `.vui-*` classes, and the two places this file
+ * builds or repaints a control — the room buttons and the connection badge —
+ * go through the kit rather than through CSS of their own.
+ *
  * @module
  */
 
@@ -27,6 +33,12 @@ import {
 	refs,
 	type ViewInstance,
 } from "@marianmeres/vanilla";
+// The kit's button primitive: markup plus the `.vui-btn` classes vui-base.css
+// paints, so a button built here and one written in index.html are the same
+// button. (`@marianmeres/vanilla-ui` re-exports all of vanilla too — the kit's
+// runtime `.html` components are the part this bundled client does not use.)
+import { button } from "@marianmeres/vanilla-ui";
+import type { WSConnectionState } from "../../src/mod.ts";
 import {
 	BROADCAST_ROOM,
 	DEFAULT_ROOM,
@@ -104,6 +116,19 @@ interface ChatProps {
 	onLeave: () => void;
 }
 
+/**
+ * Connection state → the semantic role that tints the header badge. `open` is
+ * handled by `connected` instead (the socket can be open while a re-subscribe
+ * is still in flight); the states left out get the plain badge.
+ */
+const STATUS_ROLE: Partial<Record<WSConnectionState, string>> = {
+	connecting: "warning",
+	authenticating: "warning",
+	reconnecting: "warning",
+	terminated: "destructive",
+	disposed: "destructive",
+};
+
 function createChat({ store, onLeave }: ChatProps): ViewInstance {
 	return createView((track) => {
 		const el = fromTemplate("tpl-chat");
@@ -113,14 +138,13 @@ function createChat({ store, onLeave }: ChatProps): ViewInstance {
 		r.you.textContent = store.session.nick;
 		r.workspace.textContent = store.session.workspace;
 
-		// Room buttons, straight off the shared list.
+		// Room buttons, straight off the shared list. `delegate` below does the
+		// listening, so they only need the two data attributes.
 		for (const name of ROOMS) {
-			const button = document.createElement("button");
-			button.type = "button";
-			button.dataset.on = "click:pickRoom";
-			button.dataset.room = name;
-			button.textContent = `#${name}`;
-			r.rooms.appendChild(button);
+			const b = button(`#${name}`, { variant: "ghost" });
+			b.dataset.on = "click:pickRoom";
+			b.dataset.room = name;
+			r.rooms.appendChild(b);
 		}
 
 		track(
@@ -151,7 +175,11 @@ function createChat({ store, onLeave }: ChatProps): ViewInstance {
 		// no polling.
 		track(
 			store.connection.subscribe(({ state, connected, attempt, lastError }) => {
-				r.status.dataset.state = connected ? "open" : state;
+				// One of vui-base.css's five badge roles, or the plain badge.
+				const role = connected ? "success" : STATUS_ROLE[state];
+				r.status.className = `status vui-badge${
+					role ? ` vui-badge--${role}` : ""
+				}`;
 				r.status.textContent = connected
 					? "connected"
 					: attempt > 0

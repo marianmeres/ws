@@ -12,7 +12,7 @@
 		"example": "deno task example:build && deno run -A example/server.ts",
 		"example:build": "deno run -A jsr:@marianmeres/deno-build --root example/client --outdir example/public/dist",
 		"example:watch": "deno run -A jsr:@marianmeres/deno-build --root example/client --outdir example/public/dist --watch --watch-dir src --watch-dir example",
-		"example:theme": "deno run -A example/build-theme.ts",
+		"example:styles": "deno run -A example/build-styles.ts",
 		"npm:build": "deno run -A scripts/build-npm.ts",
 		"npm:publish": "deno run -A scripts/build-npm.ts && cd ./.npm-dist && npm publish --access=public",
 		"release": "deno run -A jsr:@marianmeres/release",
@@ -28,7 +28,8 @@
 		"@marianmeres/pubsub": "jsr:@marianmeres/pubsub@^3.0.0",
 		"@marianmeres/ticker": "jsr:@marianmeres/ticker@^1.17.1",
 		"@marianmeres/uid": "jsr:@marianmeres/uid@^1.2.0",
-		"@marianmeres/vanilla": "jsr:@marianmeres/vanilla@^1.9.0",
+		"@marianmeres/vanilla": "jsr:@marianmeres/vanilla@^1.10.0",
+		"@marianmeres/vanilla-ui": "jsr:@marianmeres/vanilla-ui@^0.5.2",
 		"@std/assert": "jsr:@std/assert@^1.0.19",
 		"@std/path": "jsr:@std/path@^1.1.6"
 	},
@@ -43,8 +44,15 @@
 	"exclude": [
 		"example/public/dist",
 		"example/public/reboot.css",
-		"example/public/theme.css"
+		"example/public/theme.css",
+		"example/public/vui-base.css"
 	],
+	"minimumDependencyAge": {
+		"exclude": [
+			"jsr:@marianmeres/*",
+			"npm:@marianmeres/*"
+		]
+	},
 	"fmt": {
 		"useTabs": true,
 		"lineWidth": 90,

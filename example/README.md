@@ -5,7 +5,9 @@ A complete, standalone app built on `@marianmeres/ws`: a
 written with [`@marianmeres/vanilla`](https://jsr.io/@marianmeres/vanilla) and
 bundled by [`@marianmeres/deno-build`](https://jsr.io/@marianmeres/deno-build).
 Styling is [`@marianmeres/design-tokens`](https://jsr.io/@marianmeres/design-tokens)
-with the Bootstrap Reboot bridge — minimal, but every colour is a token.
+with the Bootstrap Reboot bridge, and the controls come from
+[`@marianmeres/vanilla-ui`](https://jsr.io/@marianmeres/vanilla-ui)'s base style
+layer — minimal, but every colour is a token and no button is hand-rolled.
 
 ```bash
 deno task example        # builds the client bundle, then serves on :8000
@@ -35,26 +37,28 @@ example/
 ├── server.ts          three demino apps: /ws (createWSApp), /api, / (static)
 ├── history.ts         WSPubSubAdapter decorator → in-memory chat history
 ├── shared.ts          the APPLICATION protocol — what goes inside `payload`
-├── build-theme.ts     regenerates public/theme.css from a bundled theme
+├── build-styles.ts    regenerates public/theme.css and public/vui-base.css
 ├── client/
 │   ├── mod.ts         views (login + chat), built with @marianmeres/vanilla
 │   └── store.ts       the WSClient and all reactive state; no DOM
 └── public/
     ├── index.html     templates + one <script type="module">
     ├── app.css        layout, entirely token-driven
-    ├── reboot.css     Bootstrap Reboot (vendored, MIT)
-    ├── theme.css      generated — design tokens + the --bs-* bridge
+    ├── reboot.css     Bootstrap Reboot (vendored, MIT) — @imported into
+    │                  layer(reset) so it sits under the kit, not over it
+    ├── theme.css      generated — design tokens (prefix "vui-") + --bs-* bridge
+    ├── vui-base.css   generated — @marianmeres/vanilla-ui's components/base.css
     └── dist/bundle.js generated — deno task example:build
 ```
 
 ## Tasks
 
-| Task                      | What                                                   |
-| ------------------------- | ------------------------------------------------------ |
-| `deno task example`       | build the bundle, then serve                           |
-| `deno task example:build` | bundle `client/mod.ts` → `public/dist/bundle.js`       |
-| `deno task example:watch` | same, rebuilding on change (run the server separately) |
-| `deno task example:theme` | regenerate `public/theme.css`                          |
+| Task                       | What                                                   |
+| -------------------------- | ------------------------------------------------------ |
+| `deno task example`        | build the bundle, then serve                           |
+| `deno task example:build`  | bundle `client/mod.ts` → `public/dist/bundle.js`       |
+| `deno task example:watch`  | same, rebuilding on change (run the server separately) |
+| `deno task example:styles` | regenerate `theme.css` + `vui-base.css`                |
 
 `PORT` and `WS_EXAMPLE_TOKEN` are read from the environment (defaults `8000`
 and `dev-secret`).
@@ -121,6 +125,28 @@ broadcast to `adapter.publish(envelope)` after local delivery — the one place
 all traffic converges. A real deployment puts Redis or Deno KV there; here a
 decorator records chat lines and delegates the rest. Broadcasts (`namespace:
 null`) belong to no single room and are deliberately not stored.
+
+**The controls are not this example's.** Buttons, inputs, the field stack, the
+badge, the switch, the alert and the focus ring all come from
+[`@marianmeres/vanilla-ui`](https://jsr.io/@marianmeres/vanilla-ui)'s base style
+layer, copied verbatim to `public/vui-base.css` by `build-styles.ts`. The whole
+integration is the token prefix: the layer reads `--vui-color-*`, and that is
+what `generateThemedCss(schema, "vui-")` writes — so one theme file feeds the
+kit, this example's own `app.css` (through the layer's `--vui-surface`-style
+vocabulary) and Bootstrap Reboot's `--bs-*` at once. `app.css` is left with
+layout, and `client/mod.ts` reaches for the kit in the two places it builds or
+repaints a control: `button()` for the room buttons, and the `.vui-badge--*`
+roles for the connection badge.
+
+**Only the style layer, though — not the components.** vanilla-ui's dialog,
+popover, tabs and toast are `.html` files fetched at runtime, whose own
+`import … from "@marianmeres/vanilla"` resolves through the host page's import
+map. This client is a _bundle_, so it already carries vanilla; adding that map
+would put a second copy on the page — the one thing the kit's single-specifier
+setup exists to avoid. A page that wants those components should skip the
+bundler and follow vanilla-ui's own gallery instead. `<link id="vui-base">` is
+deliberately the id `loadStyles()` skips, so nothing here would be loaded twice
+if it ever did.
 
 **Client ids are not nicknames.** `verify` returns `nick#suffix`, with the
 suffix proposed by the tab and validated server-side. Ids are unique by

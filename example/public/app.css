@@ -1,7 +1,17 @@
 /*
- * Example layout. Deliberately plain — every colour is a design token from
- * theme.css, so the whole thing re-skins by regenerating that one file
- * (see example/build-theme.ts) and follows light/dark off `:root.dark`.
+ * Example layout — and ONLY layout. The controls (buttons, inputs, the switch,
+ * the badge, the alert, the focus ring) come from vui-base.css, the base style
+ * layer of @marianmeres/vanilla-ui; this file no longer hand-rolls any of them.
+ *
+ * Colours are read through that layer's VOCABULARY (`--vui-surface`,
+ * `--vui-muted-foreground`, …), which resolves the `--vui-color-*` design
+ * tokens theme.css writes. So the whole thing still re-skins by regenerating
+ * that one file (see example/build-styles.ts) and follows light/dark off
+ * `:root.dark` — and a subtree can now re-point a vocabulary name without
+ * touching a token.
+ *
+ * Everything here is UNLAYERED, so it beats `vui.base` at any specificity: no
+ * `!important`, no specificity arms race.
  */
 
 :root {
@@ -25,61 +35,12 @@ body {
 
 /* ------------------------------------------------------------------ shared */
 
-button {
-	font: inherit;
-	font-size: 0.85rem;
-	padding: 0.4rem 0.8rem;
-	border: 1px solid var(--app-color-border);
-	border-radius: 0.4rem;
-	background: var(--app-color-surface);
-	color: var(--app-color-surface-foreground);
-	cursor: pointer;
-}
-button:hover:not(:disabled) {
-	background: var(--app-color-surface-hover);
-}
-button:disabled {
-	opacity: 0.5;
-	cursor: not-allowed;
-}
-button.primary {
-	border-color: transparent;
-	background: var(--app-color-primary);
-	color: var(--app-color-primary-foreground);
-}
-button.primary:hover:not(:disabled) {
-	background: var(--app-color-primary-hover);
-}
-button.ghost {
-	background: transparent;
-}
-
-input[type="text"],
-input:not([type]) {
-	font: inherit;
-	font-size: 0.9rem;
-	width: 100%;
-	padding: 0.45rem 0.6rem;
-	border: 1px solid var(--app-color-border);
-	border-radius: 0.4rem;
-	background: var(--app-color-input);
-	color: var(--app-color-foreground);
-}
-
-:where(button, input):focus-visible {
-	outline: 2px solid var(--app-color-ring);
-	outline-offset: 2px;
-}
-
-.error {
-	margin: 0;
-	padding: 0.5rem 0.7rem;
-	border: 1px solid var(--app-color-surface-destructive-border);
-	border-radius: 0.4rem;
-	background: var(--app-color-surface-destructive);
-	color: var(--app-color-surface-destructive-foreground);
-	font-size: 0.82rem;
-}
+/*
+ * Nothing for buttons, inputs, the focus ring or the alert: `.vui-btn`,
+ * `.vui-btn--primary`, `.vui-btn--ghost`, `.vui-input`, `.vui-field`,
+ * `.vui-switch`, `.vui-badge` and `.vui-alert--destructive` in index.html are
+ * vui-base.css's, and they read the same design tokens this file does.
+ */
 
 /* ------------------------------------------------------------------- login */
 
@@ -97,25 +58,27 @@ input:not([type]) {
 .login .lead {
 	margin: 0;
 	font-size: 0.85rem;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 }
-.login label {
-	display: grid;
-	gap: 0.3rem;
-	font-size: 0.8rem;
+/* The kit's field stack already spaces label / control / help; the form's own
+   grid gap does the rest, so the field's block margin would only double it. */
+.login .vui-field {
+	margin-block-end: 0;
 }
-.login label > span {
+.login .vui-field > label {
 	font-weight: 600;
 }
-.login small {
-	color: var(--app-color-muted-foreground);
+.login .vui-help {
 	line-height: 1.5;
+}
+.login .vui-alert {
+	font-size: 0.82rem;
 }
 .login .hint {
 	margin: 0;
 	font-size: 0.76rem;
 	line-height: 1.6;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 }
 .login code {
 	font-size: 0.9em;
@@ -146,17 +109,17 @@ input:not([type]) {
 	gap: 1rem;
 	flex-wrap: wrap;
 	padding-bottom: 0.7rem;
-	border-bottom: 1px solid var(--app-color-border);
+	border-bottom: 1px solid var(--vui-border);
 }
 .identity {
 	font-size: 0.9rem;
 }
 .identity .sep {
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 	margin: 0 0.35rem;
 }
 .identity .workspace {
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 }
 .identity .workspace::before {
 	content: "@";
@@ -167,31 +130,13 @@ input:not([type]) {
 	gap: 0.6rem;
 }
 
-/* Connection badge — `data-state` mirrors the client's connection state. */
+/* Connection badge. `.vui-badge` paints it and client/mod.ts swaps the
+   `--success` / `--warning` / `--destructive` modifier; only the typography of
+   a status pill is this example's. */
 .status {
 	font-size: 0.72rem;
 	text-transform: uppercase;
 	letter-spacing: 0.05em;
-	padding: 0.2rem 0.5rem;
-	border-radius: 999px;
-	background: var(--app-color-muted);
-	color: var(--app-color-muted-foreground);
-	white-space: nowrap;
-}
-.status[data-state="open"] {
-	background: var(--app-color-surface-success);
-	color: var(--app-color-surface-success-foreground);
-}
-.status[data-state="reconnecting"],
-.status[data-state="connecting"],
-.status[data-state="authenticating"] {
-	background: var(--app-color-surface-warning);
-	color: var(--app-color-surface-warning-foreground);
-}
-.status[data-state="terminated"],
-.status[data-state="disposed"] {
-	background: var(--app-color-surface-destructive);
-	color: var(--app-color-surface-destructive-foreground);
 }
 
 /* ----------------------------------------------------------------- sidebar */
@@ -207,17 +152,21 @@ input:not([type]) {
 	display: grid;
 	gap: 0.3rem;
 }
+/* The buttons are built by client/mod.ts with vanilla-ui's `button()` helper,
+   ghost variant. Selecting one is not a new paint job — it re-declares the
+   kit's CONTROL CONTEXT on the element, and the base layer's own rule keeps
+   painting every state (hover, active, focus) from there. */
 .rooms button {
+	justify-content: flex-start;
 	text-align: left;
-	border-color: transparent;
-	background: transparent;
-}
-.rooms button:hover:not(:disabled) {
-	background: var(--app-color-muted);
 }
 .rooms button[aria-pressed="true"] {
-	background: var(--app-color-primary);
-	color: var(--app-color-primary-foreground);
+	--vui-control-bg: var(--vui-primary);
+	--vui-control-bg-hover: var(--vui-primary-hover);
+	--vui-control-bg-active: var(--vui-primary-active);
+	--vui-control-foreground: var(--vui-primary-foreground);
+	--vui-control-border: transparent;
+	color: var(--vui-primary-foreground);
 }
 
 .presence {
@@ -230,7 +179,7 @@ input:not([type]) {
 	font-size: 0.7rem;
 	text-transform: uppercase;
 	letter-spacing: 0.06em;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 }
 .presence .count {
 	float: right;
@@ -259,7 +208,7 @@ input:not([type]) {
 }
 .members small {
 	font-size: 0.66rem;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 	overflow: hidden;
 	text-overflow: ellipsis;
 }
@@ -277,9 +226,9 @@ input:not([type]) {
 	flex: 1 1 auto;
 	min-height: 0;
 	position: relative;
-	border: 1px solid var(--app-color-border);
+	border: 1px solid var(--vui-border);
 	border-radius: 0.5rem;
-	background: var(--app-color-surface);
+	background: var(--vui-surface);
 }
 .log {
 	list-style: none;
@@ -299,7 +248,7 @@ input:not([type]) {
 	margin: 0;
 	display: grid;
 	place-content: center;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 	font-size: 0.85rem;
 	pointer-events: none;
 }
@@ -314,15 +263,15 @@ input:not([type]) {
 .entry .author {
 	flex: none;
 	font-weight: 600;
-	color: var(--app-color-accent);
+	color: var(--vui-accent);
 }
 .entry .author::after {
 	content: ":";
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 	font-weight: 400;
 }
 .entry.own .author {
-	color: var(--app-color-primary);
+	color: var(--vui-primary);
 }
 .entry .text {
 	flex: 1 1 auto;
@@ -335,20 +284,20 @@ input:not([type]) {
 	gap: 0.4rem;
 	align-items: baseline;
 	font-size: 0.68rem;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 	font-variant-numeric: tabular-nums;
 }
 /* The publish acknowledgement's recipient count. */
 .entry .ack {
-	color: var(--app-color-success);
+	color: var(--vui-success);
 }
 
 /* Server-injected (from: null) — arrives via POST /ws/publish. */
 .entry[data-kind="system"] {
 	padding: 0.25rem 0.45rem;
-	border-left: 3px solid var(--app-color-accent);
-	background: var(--app-color-surface-accent);
-	color: var(--app-color-surface-accent-foreground);
+	border-left: 3px solid var(--vui-accent);
+	background: var(--vui-color-surface-accent);
+	color: var(--vui-color-surface-accent-foreground);
 	border-radius: 0.25rem;
 }
 .entry[data-kind="system"] .author {
@@ -357,19 +306,19 @@ input:not([type]) {
 /* Local-only lines: presence deltas, buffering notes. */
 .entry[data-kind="notice"] {
 	font-size: 0.76rem;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 	font-style: italic;
 }
 .entry[data-kind="error"] {
 	font-size: 0.78rem;
-	color: var(--app-color-destructive);
+	color: var(--vui-destructive);
 }
 
 .typing {
 	margin: 0;
 	min-height: 1.1rem;
 	font-size: 0.75rem;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 }
 
 .composer {
@@ -385,17 +334,17 @@ input:not([type]) {
 	align-items: center;
 	gap: 0.4rem;
 	font-size: 0.75rem;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 }
 .broadcast em {
 	font-style: normal;
-	color: var(--app-color-foreground);
+	color: var(--vui-foreground);
 }
 
 .room-label {
 	margin: 0;
 	font-size: 0.75rem;
-	color: var(--app-color-muted-foreground);
+	color: var(--vui-muted-foreground);
 }
 
 /* ------------------------------------------------------------------ narrow */
