@@ -36,7 +36,7 @@ Verify: deno publish --dry-run --allow-dirty
 | ✅     | T06 | —                                               | Client: a stale `auth()` rejection must not close a newer socket           | [02](./02-client.md) #5           | —      |
 | ✅     | T09 | T01                                             | Server: one handshake per socket; no ghost registration                    | [01](./01-server.md) #3           | —      |
 | ✅     | T10 | —                                               | Server: opt-in `allowedOrigins` check on the upgrade                       | [01](./01-server.md) #4           | —      |
-| ⬜     | T11 | —                                               | Server: mount `/stats` only behind `httpAuth`; answer bad JSON with 400    | [01](./01-server.md) #5           | —      |
+| ✅     | T11 | —                                               | Server: mount `/stats` only behind `httpAuth`; answer bad JSON with 400    | [01](./01-server.md) #5           | —      |
 | ⬜     | T12 | —                                               | Server: encode a fan-out frame once per namespace                          | [01](./01-server.md) #6           | —      |
 | ⬜     | T13 | T01 T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 T12 | Docs: sweep the remaining drift; re-align `PROTOCOL.md` with the code      | [03](./03-docs-and-release.md) #1 | —      |
 | 🔒     | T14 | T13                                             | Release 0.4.0: bump `PROTOCOL.md` version references, run `deno task rpm`  | [03](./03-docs-and-release.md) #2 | —      |

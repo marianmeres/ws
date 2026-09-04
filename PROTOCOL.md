@@ -1045,10 +1045,14 @@ only if something else in your system needs it.
 | POST   | `/publish/{namespace}/{room}` | JSON body becomes `payload`, delivered with `from: null`        |
 | POST   | `/broadcast/{room}`           | Same, across all namespaces                                     |
 
-The POST routes respond `{ "ok": true, "recipients": n }` and must sit behind an
-HTTP-level authentication of your own — an unauthenticated "push anything into
-any room" endpoint is a vulnerability, which is why the reference refuses to
-mount them without one.
+The POST routes respond `{ "ok": true, "recipients": n }`, and answer a body
+that is not valid JSON with **400**.
+
+Every one of these routes must sit behind an HTTP-level authentication of your
+own, which is why the reference mounts none of them without one. An
+unauthenticated "push anything into any room" endpoint is a vulnerability; and
+`/stats` reports counts per namespace, so in a multi-tenant deployment an
+unauthenticated read enumerates the tenants that are online.
 
 ---
 

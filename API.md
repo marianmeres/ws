@@ -357,11 +357,12 @@ Creates a mountable demino app plus the service it is wired to.
 | Method | Path                          | Returns                    | Notes                                     |
 | ------ | ----------------------------- | -------------------------- | ----------------------------------------- |
 | GET    | `/`                           | 101, 426 without upgrade   | WebSocket upgrade, `403` on a bad origin  |
-| GET    | `/stats`                      | `WSStats`                  | Guarded by `httpAuth` when supplied       |
+| GET    | `/stats`                      | `WSStats`                  | Requires `httpAuth`, else **not mounted** |
 | POST   | `/publish/[namespace]/[room]` | `{ ok: true, recipients }` | Requires `httpAuth`, else **not mounted** |
 | POST   | `/broadcast/[room]`           | `{ ok: true, recipients }` | Requires `httpAuth`, else **not mounted** |
 
-The POST routes take the JSON request body as the message payload.
+The POST routes take the JSON request body as the message payload; a body that
+is not valid JSON answers `400`.
 
 **Example**
 
@@ -475,8 +476,10 @@ Instance-local.
 
 ##### `stats(): WSStats`
 
-Counts only, never client ids, so it stays safe to expose unguarded in
-development.
+Counts only, never client ids — but `namespaces` is keyed by namespace name, so
+in a multi-tenant deployment it enumerates the tenants that are online. Hence
+the `/stats` route only exists behind `httpAuth`; this method is for in-process
+use.
 
 ##### `close(): Promise<void>`
 

@@ -14,6 +14,13 @@ import { startServer, until } from "./_helpers.ts";
 const client = (url: string, options: Record<string, unknown> = {}) =>
 	createWSClient({ url, logger: null, pingInterval: 0, ...options });
 
+/** The HTTP guard the mounted routes exist because of. */
+const adminOnly: DeminoHandler = (req: Request) => {
+	if (req.headers.get("x-key") !== "secret") {
+		return new Response("unauthorized", { status: 401 });
+	}
+};
+
 Deno.test("connect, subscribe, publish, deliver", async () => {
 	const server = startServer();
 	const alice = client(server.url, { clientId: "alice" });
@@ -364,29 +371,44 @@ Deno.test("verify can reject a namespace the client is not entitled to", async (
 	}
 });
 
-Deno.test("HTTP injection routes are absent without httpAuth", async () => {
+Deno.test("HTTP routes are absent without httpAuth", async () => {
 	const server = startServer();
 	try {
 		// Mounting an unauthenticated "push into any room" endpoint by default
-		// would be a real vulnerability.
-		const res = await fetch(`${server.httpUrl}/publish/default/chat`, {
+		// would be a real vulnerability; and /stats names every namespace that
+		// is online, which in a multi-tenant deployment lists the tenants.
+		const injected = await fetch(`${server.httpUrl}/publish/default/chat`, {
 			method: "POST",
 			body: JSON.stringify({ x: 1 }),
 		});
+		await injected.body?.cancel();
+		assertEquals(injected.status, 404);
+
+		const stats = await fetch(`${server.httpUrl}/stats`);
+		await stats.body?.cancel();
+		assertEquals(stats.status, 404);
+	} finally {
+		await server.stop();
+	}
+});
+
+Deno.test("a malformed injection body is the client's mistake, not a 500", async () => {
+	const server = startServer({ httpAuth: adminOnly });
+	try {
+		const res = await fetch(`${server.httpUrl}/publish/default/chat`, {
+			method: "POST",
+			headers: { "x-key": "secret", "content-type": "application/json" },
+			body: "{ not json",
+		});
 		await res.body?.cancel();
-		assertEquals(res.status, 404);
+		assertEquals(res.status, 400);
 	} finally {
 		await server.stop();
 	}
 });
 
 Deno.test("HTTP injection works when guarded", async () => {
-	const httpAuth: DeminoHandler = (req: Request) => {
-		if (req.headers.get("x-key") !== "secret") {
-			return new Response("unauthorized", { status: 401 });
-		}
-	};
-	const server = startServer({ httpAuth, allowBroadcast: () => true });
+	const server = startServer({ httpAuth: adminOnly, allowBroadcast: () => true });
 	const c = client(server.url);
 
 	try {
@@ -418,7 +440,7 @@ Deno.test("HTTP injection works when guarded", async () => {
 });
 
 Deno.test("stats reports connections, rooms and namespaces", async () => {
-	const server = startServer();
+	const server = startServer({ httpAuth: adminOnly });
 	const one = client(server.url, { namespace: "org-1" });
 	const two = client(server.url, { namespace: "org-1" });
 
@@ -427,7 +449,10 @@ Deno.test("stats reports connections, rooms and namespaces", async () => {
 		await two.connect();
 		await one.subscribe("chat", () => {});
 
-		const res = await fetch(`${server.httpUrl}/stats`);
+		const res = await fetch(`${server.httpUrl}/stats`, {
+			headers: { "x-key": "secret" },
+		});
+		assertEquals(res.status, 200);
 		const stats = await res.json();
 		assertEquals(stats.connections, 2);
 		assertEquals(stats.rooms, 1);

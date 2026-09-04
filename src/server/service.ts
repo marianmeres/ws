@@ -362,8 +362,10 @@ export class WSService {
 	/**
 	 * Connection counts for this instance.
 	 *
-	 * Counts only — never client ids — so it stays safe to expose on an
-	 * unguarded `/stats` route in development.
+	 * Counts only, never client ids — but `namespaces` is keyed by namespace
+	 * name, which in a multi-tenant deployment enumerates the tenants that are
+	 * online. That is why the `/stats` route is mounted only behind `httpAuth`;
+	 * this method itself is meant for in-process use.
 	 */
 	stats(): WSStats {
 		const namespaces: Record<string, number> = {};

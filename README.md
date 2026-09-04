@@ -157,7 +157,7 @@ Mounted routes, relative to the mount path:
 | Method | Path                          | Notes                                     |
 | ------ | ----------------------------- | ----------------------------------------- |
 | GET    | `/`                           | WebSocket upgrade                         |
-| GET    | `/stats`                      | Guarded by `httpAuth` when supplied       |
+| GET    | `/stats`                      | Requires `httpAuth`, else **not mounted** |
 | POST   | `/publish/[namespace]/[room]` | Requires `httpAuth`, else **not mounted** |
 | POST   | `/broadcast/[room]`           | Requires `httpAuth`, else **not mounted** |
 
