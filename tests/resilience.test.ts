@@ -284,6 +284,51 @@ Deno.test("a local disconnect() emits close 4900, willReconnect false", async ()
 	}
 });
 
+Deno.test("a stale auth() rejection leaves the newer socket alone", async () => {
+	const server = startServer();
+	let attempt = 0;
+	const c = client(server.url, {
+		reconnectDelay: 30,
+		auth: async () => {
+			attempt++;
+			// The first attempt is still awaiting its token when the socket it
+			// belongs to is superseded; the rest answer at once.
+			if (attempt === 1) {
+				await sleep(300);
+				throw new Error("stale token refresh failed");
+			}
+			return null;
+		},
+	});
+
+	try {
+		const closes: number[] = [];
+		c.on("close", (e) => closes.push(e.code));
+		const errors: Error[] = [];
+		c.on("error", (e) => errors.push(e));
+
+		// disconnect() below rejects this one; nothing else awaits it.
+		c.connect().catch(() => {});
+		await until(
+			() => c.connectionState === "authenticating",
+			"the first socket reaches auth",
+		);
+
+		c.disconnect();
+		await c.connect();
+		assert(c.connected, "the second socket completed its handshake");
+
+		// The stale auth() rejects in here, two generations too late.
+		await sleep(400);
+		assertEquals(c.connectionState, "open", "the newer socket survived");
+		assertEquals(closes, [4900], "only the disconnect() closed anything");
+		assertEquals(errors, [], "a superseded attempt is not the caller's problem");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
 Deno.test("outbox overflow drops the oldest and rejects it", async () => {
 	// Nothing is listening here, so everything queues.
 	const unreachable = `ws://127.0.0.1:${freePort()}/ws`;

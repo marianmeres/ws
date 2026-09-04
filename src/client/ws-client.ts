@@ -860,6 +860,13 @@ export class WSClient<TAuth = unknown> {
 		try {
 			payload = (await this.#authFn?.()) ?? null;
 		} catch (e) {
+			// The await yields, so this rejection may belong to a socket that a
+			// later connect() already replaced — closing on it would kill the
+			// healthy socket that took its place.
+			if (generation !== this.#generation) {
+				this.logger?.debug?.("superseded auth attempt failed");
+				return;
+			}
 			this.#fail(e, "auth payload failed");
 			this.#forceClose(CLOSE.PROTOCOL_ERROR, "auth payload failed");
 			return;

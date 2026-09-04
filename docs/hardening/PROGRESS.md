@@ -33,7 +33,7 @@ Verify: deno publish --dry-run --allow-dirty
 | ✅     | T04 | T03                                             | Client: fail sends fast on terminated state and encode errors              | [02](./02-client.md) #3           | —      |
 | ✅     | T07 | T03                                             | Client: emit `close` on a local `disconnect()`; retire `#intentional`      | [02](./02-client.md) #6           | —      |
 | ✅     | T05 | —                                               | Client: receive binary frames as `ArrayBuffer`                             | [02](./02-client.md) #4           | —      |
-| ⬜     | T06 | —                                               | Client: a stale `auth()` rejection must not close a newer socket           | [02](./02-client.md) #5           | —      |
+| ✅     | T06 | —                                               | Client: a stale `auth()` rejection must not close a newer socket           | [02](./02-client.md) #5           | —      |
 | ⬜     | T09 | T01                                             | Server: one handshake per socket; no ghost registration                    | [01](./01-server.md) #3           | —      |
 | ⬜     | T10 | —                                               | Server: opt-in `allowedOrigins` check on the upgrade                       | [01](./01-server.md) #4           | —      |
 | ⬜     | T11 | —                                               | Server: mount `/stats` only behind `httpAuth`; answer bad JSON with 400    | [01](./01-server.md) #5           | —      |
@@ -50,6 +50,10 @@ left out are listed under "Deliberately omitted" in the overview, each with its 
 
 ## Decisions log
 
+- **2026-09-04** — An `auth()` rejection whose socket has already been superseded is a
+  debug log and nothing else: no `error` event, no close. No open question — the current
+  socket's behaviour (`4400` and a reconnect) is unchanged, and a superseded attempt is
+  not actionable by the caller. (T06)
 - **2026-09-04** — The client sets `socket.binaryType = "arraybuffer"` on every socket it
   opens; `PROTOCOL.md` now says so instead of claiming the default decoder accepts binary
   frames. No open question: the `WSDecoder` contract already promises `string |
