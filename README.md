@@ -6,7 +6,7 @@
 
 A WebSocket client with namespaces, rooms, presence and reconnect that actually
 survives real networks — plus a mountable reference server implementing the same
-protocol.
+[protocol](./PROTOCOL.md).
 
 ## Features
 
@@ -205,6 +205,13 @@ it left off.
 ## API
 
 See [API.md](API.md) for complete API documentation.
+
+## Protocol
+
+The reference server is Deno-only; the protocol is not.
+[PROTOCOL.md](PROTOCOL.md) specifies the wire format frame by frame — with a
+complete Python implementation and a conformance script that drives the real
+client — so a compatible server can be written in any language.
 
 ## License
 
