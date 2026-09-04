@@ -1,0 +1,1023 @@
+/*
+ * @marianmeres/vanilla-ui 0.5.2 — components/base.css, copied verbatim by
+ * example/build-styles.ts. Do not edit by hand; edit the kit and re-run
+ * `deno task example:styles`.
+ */
+/*
+ * vui · base — the kit's shared style layer. NOT a component: no template, no
+ * script, no `data-scope`. One stylesheet, loaded once per document by the
+ * index (`loadStyles()`, called by every `load<Name>()` / `loadAll()`), holding
+ * the things that must exist exactly once if the kit is to look like one kit:
+ *
+ *   1. THE VOCABULARY — every design-tokens variable the kit reads, resolved
+ *      here (and only here) with its canonical system-color fallback. The name
+ *      is the token's name minus `color-`: `--vui-color-surface-foreground`
+ *      becomes `--vui-surface-foreground`. One rule to remember, the same
+ *      spelling as @marianmeres/design-tokens and @marianmeres/stuic, and a
+ *      token's fallback is written once so it can never drift between two
+ *      components (enforced by tests/components.test.ts).
+ *
+ *   2. THE STRUCTURAL TOKENS — radius, shadow, border width, control size,
+ *      transition. Three tiers of radius and shadow (element / button /
+ *      container; resting / overlay / dialog), because a rounded button and a
+ *      rounded card are not the same rounding, and a popover and a modal are
+ *      not the same elevation.
+ *
+ *   3. THE CONTROL PRIMITIVES — buttons, inputs, menu items, summaries, tabs,
+ *      switches, the focus ring. A button is a *style* primitive, not a
+ *      component: it has no behavior, and a factory could not reach the
+ *      `<button value="save">` a consumer writes inside a `<form
+ *      method="dialog">` in a dialog's slot. CSS can. Six ways in:
+ *
+ *        <button class="vui-btn vui-btn--primary">   — anywhere on the page
+ *        <button>                                    — inside any vui component
+ *        <button role="menuitem">                    — a menu item, by its role
+ *        <button role="tab">                         — a tab, by its role
+ *        <input type="checkbox" role="switch">       — a switch, by its role
+ *        <summary>                                   — a disclosure header, by
+ *                                                      its element
+ *
+ *      The second is a zero-specificity default (see "the container hook"
+ *      below), so slot content looks right with no consumer knowledge at all.
+ *      The middle three are keyed on the ARIA roles the popover's menu glue,
+ *      the tabs component's aria wiring and a switch's own semantics need
+ *      anyway — one attribute buys the semantics, the keyboard and the look,
+ *      and no component gives those elements a class of its own. The last needs
+ *      no key at all: inside a vui container a <summary> has exactly one shape
+ *      it can take, so a plain <details> dropped into a dialog body or a
+ *      disclosure panel comes out like the kit's own.
+ *
+ *   4. THE CHROME AND THE HELPERS — a badge, an alert, a card, a table, and the
+ *      three layout classes (`.vui-row`, `.vui-field`, `.vui-menu`). None of
+ *      them is a control: nothing here hovers, focuses or presses, so none of
+ *      them reads the control channel. They are here for the reason the
+ *      controls are — they are markup a consumer writes, which a factory can
+ *      never reach — and they stop where that argument stops. A card is three
+ *      declarations of the container tier; it is not the beginning of a grid
+ *      system. The file ends with one rule that keeps the platform's `hidden`
+ *      hiding, since every `display` above would otherwise beat it.
+ *
+ * CASCADE LAYERS. Everything here is in `vui.base`; every component's `@scope`
+ * block is in `vui.components`. Layered styles lose to unlayered ones whatever
+ * their specificity, so a consumer's own plain `button { … }` beats all of it —
+ * override is free, no `!important`, no specificity arms race. The layer ORDER
+ * is established by the statement below, which is why this file is prepended to
+ * <head> before any component style is adopted.
+ *
+ * THE CONTEXT CHANNEL. Containers do not reach into controls with descendant
+ * selectors (`.vui-dialog__footer button { … }` is the anti-pattern — every new
+ * container has to repeat it and get it right). Instead a container re-declares
+ * `--vui-control-*` on itself and controls inherit it; a button VARIANT is the
+ * same move one element down. The channel carries colors (`-bg`, `-foreground`,
+ * `-bg-hover`, `-bg-active`, `-border`) and sizes (`-min-height`, `-py`, `-px`,
+ * `-size`) alike — a dense toolbar shrinks its controls the way a panel lifts
+ * them. These names are deliberately NOT declared at
+ * `:root`: a `:root` declaration substitutes its `var()`s eagerly, right there,
+ * so a container that re-declared three of the five would inherit a fourth
+ * already baked to the page's colors. Their defaults live in `var()` fallbacks
+ * at the usage sites instead, resolved at the control — the one place every
+ * override above it has already been applied. (The vocabulary, by contrast, IS
+ * at `:root` on purpose: it is the resolve-once layer. Override the vocabulary
+ * name on a subtree, not the raw token.)
+ *
+ * Consumer override: this file is injected as <style id="vui-base">. Put your
+ * own element with that id in the document first (a <link id="vui-base">, say)
+ * and the loader leaves it alone — the same skip-if-present rule vanilla uses
+ * for template ids.
+ */
+@layer vui.base, vui.components;
+
+@layer vui.base {
+	:root {
+		/* ── colors: the vocabulary ───────────────────────────────────────────
+		   name = design-tokens name minus `color-`. One line per token: the
+		   variable, then the system-color fallback that keeps the kit legible on
+		   a page with no theme at all (and following `color-scheme` while it
+		   does). THIS IS THE ONLY PLACE a `--vui-color-*` token is read. */
+
+		/* the page */
+		--vui-background: var(--vui-color-background, Canvas);
+		--vui-foreground: var(--vui-color-foreground, CanvasText);
+
+		/* a surface ON the page: a dialog panel, a card, a control at rest */
+		--vui-surface: var(--vui-color-surface, Canvas);
+		--vui-surface-foreground: var(--vui-color-surface-foreground, CanvasText);
+		--vui-surface-hover: var(
+			--vui-color-surface-hover,
+			color-mix(in srgb, CanvasText 8%, Canvas)
+		);
+		/* one step up: controls sitting ON a surface lift to this so they don't
+		   disappear into it (the dialog panel does exactly that) */
+		--vui-surface-1: var(--vui-color-surface-1, ButtonFace);
+		--vui-surface-1-foreground: var(--vui-color-surface-1-foreground, ButtonText);
+		--vui-surface-1-hover: var(
+			--vui-color-surface-1-hover,
+			color-mix(in srgb, CanvasText 8%, ButtonFace)
+		);
+		--vui-surface-1-active: var(
+			--vui-color-surface-1-active,
+			color-mix(in srgb, CanvasText 16%, ButtonFace)
+		);
+
+		--vui-muted: var(--vui-color-muted, color-mix(in srgb, CanvasText 4%, Canvas));
+		--vui-muted-foreground: var(--vui-color-muted-foreground, GrayText);
+		--vui-border: var(
+			--vui-color-border,
+			color-mix(in srgb, CanvasText 20%, transparent)
+		);
+		--vui-border-hover: var(
+			--vui-color-border-hover,
+			color-mix(in srgb, CanvasText 35%, transparent)
+		);
+		--vui-input: var(--vui-color-input, Field);
+		--vui-input-hover: var(--vui-color-input-hover, Field);
+		--vui-ring: var(--vui-color-ring, Highlight);
+
+		/* ── the five semantic roles ──────────────────────────────────────────
+		   design-tokens gives every one of these a full state set (base, hover,
+		   active, foreground); so does the kit. Each becomes a button variant
+		   further down by re-declaring the control context — nothing else. The
+		   themeless fallbacks are last-ditch legibility, not design: system
+		   pairs where the platform has one (AccentColor, Highlight, Mark), a
+		   mix toward CanvasText where it does not, which darkens in light mode
+		   and lightens in dark. */
+		--vui-primary: var(--vui-color-primary, AccentColor);
+		--vui-primary-foreground: var(--vui-color-primary-foreground, AccentColorText);
+		--vui-primary-hover: var(
+			--vui-color-primary-hover,
+			color-mix(in srgb, CanvasText 12%, AccentColor)
+		);
+		--vui-primary-active: var(
+			--vui-color-primary-active,
+			color-mix(in srgb, CanvasText 24%, AccentColor)
+		);
+		--vui-accent: var(--vui-color-accent, Highlight);
+		--vui-accent-foreground: var(--vui-color-accent-foreground, HighlightText);
+		--vui-accent-hover: var(
+			--vui-color-accent-hover,
+			color-mix(in srgb, CanvasText 12%, Highlight)
+		);
+		--vui-accent-active: var(
+			--vui-color-accent-active,
+			color-mix(in srgb, CanvasText 24%, Highlight)
+		);
+		--vui-destructive: var(
+			--vui-color-destructive,
+			color-mix(in srgb, red 75%, CanvasText)
+		);
+		--vui-destructive-foreground: var(--vui-color-destructive-foreground, white);
+		--vui-destructive-hover: var(
+			--vui-color-destructive-hover,
+			color-mix(in srgb, red 60%, CanvasText)
+		);
+		--vui-destructive-active: var(
+			--vui-color-destructive-active,
+			color-mix(in srgb, red 45%, CanvasText)
+		);
+		--vui-warning: var(--vui-color-warning, Mark);
+		--vui-warning-foreground: var(--vui-color-warning-foreground, MarkText);
+		--vui-warning-hover: var(
+			--vui-color-warning-hover,
+			color-mix(in srgb, CanvasText 12%, Mark)
+		);
+		--vui-warning-active: var(
+			--vui-color-warning-active,
+			color-mix(in srgb, CanvasText 24%, Mark)
+		);
+		--vui-success: var(
+			--vui-color-success,
+			color-mix(in srgb, green 70%, CanvasText)
+		);
+		--vui-success-foreground: var(--vui-color-success-foreground, white);
+		--vui-success-hover: var(
+			--vui-color-success-hover,
+			color-mix(in srgb, green 55%, CanvasText)
+		);
+		--vui-success-active: var(
+			--vui-color-success-active,
+			color-mix(in srgb, green 40%, CanvasText)
+		);
+
+		/* ── structural tokens ────────────────────────────────────────────────
+		   Kit constants, not theme tokens. Three tiers where one size does not
+		   fit: a rounded button and a rounded card are different roundings, a
+		   popover and a modal are different elevations. Override globally
+		   (`:root { --vui-radius-button: 9999px }`) or on any subtree. */
+
+		/* radius: element / button / container */
+		--vui-radius: 0.5rem; /* elements: inputs, badges, list items */
+		--vui-radius-button: 0.5rem; /* buttons — rounder or flatter than the rest */
+		--vui-radius-container: 0.75rem; /* containers: dialogs, cards, popovers */
+
+		/* shadow: resting / overlay / dialog — and the scrim behind a modal */
+		--vui-shadow: 0 1px 2px rgb(0 0 0 / 0.08);
+		--vui-shadow-overlay: 0 8px 24px -12px rgb(0 0 0 / 0.35);
+		--vui-shadow-dialog: 0 12px 32px -16px rgb(0 0 0 / 0.45);
+		--vui-scrim: rgb(0 0 0 / 0.45);
+
+		--vui-border-width: 1px;
+
+		/* (control SIZING is not here: `--vui-control-min-height` / `-py` / `-px`
+		   / `-size` belong to the context channel below, so a dense toolbar can
+		   shrink every control inside it the way a panel lifts them. Defaults sit
+		   in the fallbacks at the usage sites; `:root { --vui-control-min-height:
+		   2.75rem }` still overrides them everywhere.) */
+		--vui-gap: 0.5rem;
+
+		--vui-focus-width: 2px;
+		--vui-focus-offset: 1px;
+
+		/* one duration for every state change in the kit */
+		--vui-transition: 150ms;
+	}
+	@media (prefers-reduced-motion: reduce) {
+		:root {
+			--vui-transition: 0ms;
+		}
+	}
+
+	/*
+	 * THE CONTAINER HOOK — `:where([class^="vui-"], [class*=" vui-"])` is "any
+	 * element carrying a vui- class", i.e. a component root or one of its BEM
+	 * parts. Deliberately NOT `[data-scope]`: that is vanilla's component
+	 * boundary, and the kit has no business styling every vanilla component's
+	 * buttons. Wrapped in :where() so the whole default weighs nothing.
+	 */
+
+	/* ── focus ring: written once, for anything focusable in a vui container ── */
+	:where([class^="vui-"], [class*=" vui-"]) :where(:focus-visible),
+	.vui-btn:focus-visible,
+	.vui-input:focus-visible {
+		outline: var(--vui-focus-width) solid var(--vui-ring);
+		outline-offset: var(--vui-focus-offset);
+	}
+
+	/* ── buttons ─────────────────────────────────────────────────────────────
+	   `all: unset` first: <button>, <a> and <summary> arrive with wildly
+	   different UA styling, and only a full reset makes them one control.
+
+	   Every color AND every size reads the CONTEXT CHANNEL with its default in
+	   the fallback: `var(--vui-control-bg, var(--vui-surface))`. Nothing
+	   declares `--vui-control-*` unless it means to override — a container for
+	   what is inside it, a variant for itself. */
+	.vui-btn,
+	:where([class^="vui-"], [class*=" vui-"]) :where(button, input[type="button"], input[type="submit"], input[type="reset"]) {
+		all: unset;
+		box-sizing: border-box;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.4em;
+		cursor: pointer;
+		user-select: none;
+		text-align: center;
+		white-space: nowrap;
+		line-height: 1.25;
+		/* Two things make a row of controls one height. The explicit line-height
+		   above: a <select> ignores line-height (Chrome keeps it `normal`), so
+		   buttons and inputs must not inherit the page's 1.5 or they come out
+		   4px taller than it. And min-height: without it the shared height is
+		   whatever the font's `normal` happens to be (36.4px here); with it, it
+		   is the kit's number, in one themeable variable. */
+		min-height: var(--vui-control-min-height, 2.5rem);
+		padding: var(--vui-control-py, 0.45rem) var(--vui-control-px, 0.9rem);
+		border: var(--vui-border-width) solid var(--vui-control-border,
+			var(--vui-border));
+		border-radius: var(--vui-radius-button);
+		background: var(--vui-control-bg, var(--vui-surface));
+		color: var(--vui-control-foreground, var(--vui-surface-foreground));
+		transition:
+			background-color var(--vui-transition),
+			color var(--vui-transition),
+			border-color var(--vui-transition);
+
+		&:hover {
+			background: var(--vui-control-bg-hover, var(--vui-surface-hover));
+		}
+		&:active {
+			/* no token by default — a hair of currentColor on top of the hover
+			   color reads as "pressed" on any background; currentColor and the
+			   inner var() both resolve HERE, on the control */
+			background: var(
+				--vui-control-bg-active,
+				color-mix(
+					in srgb,
+					currentColor 12%,
+					var(--vui-control-bg-hover, var(--vui-surface-hover))
+				)
+			);
+		}
+		&:disabled {
+			cursor: not-allowed;
+			opacity: 0.5;
+		}
+	}
+
+	/*
+	 * VARIANTS — the five design-tokens roles. Not a paint job: each one just
+	 * re-declares the control context on itself, so the base rule above keeps
+	 * doing the painting and every state (hover, active, focus, disabled) comes
+	 * out consistent for free. Adding a sixth role is five lines here and one
+	 * entry in ButtonVariant; it needs no new rule and no new selector.
+	 *
+	 * They sit on the element itself, so they beat the container's context —
+	 * a primary button in a dialog footer is primary, not surface-1.
+	 */
+	.vui-btn--primary,
+	.vui-btn--accent,
+	.vui-btn--destructive,
+	.vui-btn--warning,
+	.vui-btn--success {
+		/* a filled control carries its own colour; a border would only muddy it */
+		--vui-control-border: transparent;
+	}
+	.vui-btn--primary {
+		--vui-control-bg: var(--vui-primary);
+		--vui-control-foreground: var(--vui-primary-foreground);
+		--vui-control-bg-hover: var(--vui-primary-hover);
+		--vui-control-bg-active: var(--vui-primary-active);
+	}
+	.vui-btn--accent {
+		--vui-control-bg: var(--vui-accent);
+		--vui-control-foreground: var(--vui-accent-foreground);
+		--vui-control-bg-hover: var(--vui-accent-hover);
+		--vui-control-bg-active: var(--vui-accent-active);
+	}
+	.vui-btn--destructive {
+		--vui-control-bg: var(--vui-destructive);
+		--vui-control-foreground: var(--vui-destructive-foreground);
+		--vui-control-bg-hover: var(--vui-destructive-hover);
+		--vui-control-bg-active: var(--vui-destructive-active);
+	}
+	.vui-btn--warning {
+		--vui-control-bg: var(--vui-warning);
+		--vui-control-foreground: var(--vui-warning-foreground);
+		--vui-control-bg-hover: var(--vui-warning-hover);
+		--vui-control-bg-active: var(--vui-warning-active);
+	}
+	.vui-btn--success {
+		--vui-control-bg: var(--vui-success);
+		--vui-control-foreground: var(--vui-success-foreground);
+		--vui-control-bg-hover: var(--vui-success-hover);
+		--vui-control-bg-active: var(--vui-success-active);
+	}
+
+	/* Ghost is a treatment, not a role: no fill of its own, and it borrows the
+	   CONTAINER's foreground on hover — hence the one explicit `color` here. */
+	.vui-btn--ghost {
+		--vui-control-bg: transparent;
+		--vui-control-bg-hover: color-mix(in srgb, currentColor 10%, transparent);
+		--vui-control-bg-active: color-mix(in srgb, currentColor 18%, transparent);
+		--vui-control-border: transparent;
+		color: var(--vui-muted-foreground);
+
+		&:hover {
+			color: var(--vui-control-foreground, var(--vui-surface-foreground));
+		}
+	}
+	/* square, for a single glyph (the dialog's ✕) — its own size, not the
+	   control minimum */
+	.vui-btn--icon {
+		padding: 0;
+		min-height: 0;
+		width: var(--vui-control-size, 2rem);
+		height: var(--vui-control-size, 2rem);
+		border-radius: 50%;
+		font-size: 1.25rem;
+		line-height: 1;
+	}
+
+	/* ── text inputs, selects, textareas ─────────────────────────────────────
+	   No `all: unset` here on purpose: it would take the <select> arrow and the
+	   checkbox/radio glyphs with it. Paint only. */
+	.vui-input,
+	:where([class^="vui-"], [class*=" vui-"]) :where(input:is([type="text"], [type="email"], [type="password"], [type="search"], [type="url"], [type="tel"], [type="number"], [type="date"], [type="time"], [type="datetime-local"], :not([type])), select, textarea) {
+		font: inherit;
+		line-height: 1.25;
+		box-sizing: border-box;
+		/* same channel, same defaults as the buttons — that IS the alignment */
+		min-height: var(--vui-control-min-height, 2.5rem);
+		padding: var(--vui-control-py, 0.45rem) 0.6rem;
+		border: var(--vui-border-width) solid var(--vui-border);
+		border-radius: var(--vui-radius);
+		background: var(--vui-input);
+		color: var(--vui-foreground);
+		transition:
+			background-color var(--vui-transition),
+			border-color var(--vui-transition);
+
+		&:hover {
+			border-color: var(--vui-border-hover);
+			background: var(--vui-input-hover);
+		}
+	}
+	.vui-select,
+	:where([class^="vui-"], [class*=" vui-"]) :where(select) {
+		cursor: pointer;
+	}
+
+	/* ── checkboxes, radios, ranges ──────────────────────────────────────────
+	   Tinted, never painted. The UA glyph is better than anything the kit would
+	   draw and it is already correct in both color schemes, so the whole job is
+	   one platform property pointed at the theme. (This is the other half of
+	   why the input block above must not `all: unset`: the glyph it would take
+	   with it is the thing being tinted here.) */
+	.vui-check,
+	:where([class^="vui-"], [class*=" vui-"]) :where(input:is([type="checkbox"], [type="radio"], [type="range"]), progress) {
+		accent-color: var(--vui-primary);
+	}
+
+	/* ── switches ────────────────────────────────────────────────────────────
+	   The sixth control, and the third keyed on a role. A checkbox that says
+	   `role="switch"` IS a switch: the platform gives the semantics, the Space
+	   key, `:checked`, the disabled state and form participation, so the kit
+	   only has to draw it — no factory, no JS, no `aria-checked` to keep in
+	   sync. `.vui-switch` is the same look outside a container.
+
+	   The knob moves with `inset-inline-start`, not a translate: the logical
+	   property is direction-aware, so the switch flips itself in RTL and the
+	   transition still animates. Sizes are local so one override reshapes both
+	   halves; the fill is the primary role, because a switch has exactly one
+	   "on" and no variants to speak of. */
+	.vui-switch,
+	:where([class^="vui-"], [class*=" vui-"]) :where(input[type="checkbox"][role="switch"]) {
+		--_track: 2.25rem;
+		--_knob: 0.9rem;
+		--_pad: 0.15rem;
+		appearance: none;
+		box-sizing: border-box;
+		flex: none;
+		position: relative;
+		display: inline-block;
+		inline-size: var(--_track);
+		block-size: calc(var(--_knob) + 2 * var(--_pad) + 2 * var(--vui-border-width));
+		margin: 0;
+		padding: 0;
+		border: var(--vui-border-width) solid var(--vui-border);
+		border-radius: 9999px;
+		/* not `--vui-muted`: a theme is free to put muted a hair off its surface
+		   (zinc does), and an OFF switch nobody can see is worse than no switch.
+		   A mix off the foreground is visibly "off" in both color schemes by
+		   construction, whatever the theme did. */
+		background: color-mix(in srgb, var(--vui-foreground) 15%, transparent);
+		cursor: pointer;
+		transition:
+			background-color var(--vui-transition),
+			border-color var(--vui-transition);
+
+		&::before {
+			content: "";
+			position: absolute;
+			inset-block-start: 50%;
+			inset-inline-start: var(--_pad);
+			inline-size: var(--_knob);
+			block-size: var(--_knob);
+			border-radius: 50%;
+			background: var(--vui-surface);
+			box-shadow: var(--vui-shadow);
+			translate: 0 -50%;
+			transition:
+				inset-inline-start var(--vui-transition),
+				background-color var(--vui-transition);
+		}
+		&:checked {
+			background: var(--vui-primary);
+			border-color: transparent;
+
+			&::before {
+				inset-inline-start: calc(100% - var(--_knob) - var(--_pad));
+				background: var(--vui-primary-foreground);
+			}
+		}
+		&:disabled {
+			cursor: not-allowed;
+			opacity: 0.5;
+		}
+	}
+
+	/* ── menu items ──────────────────────────────────────────────────────────
+	   The third control: an item in a menu (a popover with `role: "menu"`).
+	   Keyed on the ROLE, not a class — whoever writes `role="menuitem"` (which
+	   the keyboard and aria glue need anyway) has asked for a menu item, so
+	   inside a vui container that is all it takes. `.vui-menuitem` is the same
+	   look for markup outside one. The bare form uses :is(), not :where(), on
+	   purpose: it weighs (0,1,0) so that a `<button role="menuitem">` built by
+	   button() — which also carries `.vui-btn` — comes out as the item its role
+	   says it is. Written after the button rules so it wins the tie.
+
+	   At rest an item is transparent on its surface and inherits its
+	   foreground — it does not read `--vui-control-bg`, a menu never fills its
+	   items — but hover and active come from the channel like any control, so
+	   a container that lifts its controls lifts the items' hover with them. */
+	.vui-menuitem,
+	:where([class^="vui-"], [class*=" vui-"]) :is([role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]) {
+		all: unset;
+		box-sizing: border-box;
+		display: flex;
+		align-items: center;
+		gap: 0.6em;
+		width: 100%;
+		cursor: pointer;
+		user-select: none;
+		white-space: nowrap;
+		text-align: start;
+		line-height: 1.25;
+		min-height: var(--vui-control-min-height, 2.25rem);
+		padding: var(--vui-control-py, 0.4rem) var(--vui-control-px, 0.75rem);
+		border-radius: var(--vui-radius);
+		color: inherit;
+		transition: background-color var(--vui-transition);
+
+		&:hover,
+		&:focus-visible {
+			background: var(--vui-control-bg-hover, var(--vui-surface-hover));
+		}
+		/* the one focus ring, drawn inside — an outset ring in a tight list
+		   collides with its neighbours and the popover's edge */
+		&:focus-visible {
+			outline: var(--vui-focus-width) solid var(--vui-ring);
+			outline-offset: calc(-1 * var(--vui-focus-width));
+		}
+		&:active {
+			background: var(
+				--vui-control-bg-active,
+				color-mix(
+					in srgb,
+					currentColor 12%,
+					var(--vui-control-bg-hover, var(--vui-surface-hover))
+				)
+			);
+		}
+		&:disabled,
+		&[aria-disabled="true"] {
+			cursor: not-allowed;
+			opacity: 0.5;
+			background: transparent;
+		}
+		/* a trailing hint — a shortcut in <kbd>, a badge — sits at the far end
+		   (the flex gap is its minimum distance from the label; a page's own
+		   <kbd> look, a Reboot pill say, is left alone) */
+		& > kbd {
+			margin-inline-start: auto;
+			font: inherit;
+			font-size: 0.85em;
+			color: var(--vui-muted-foreground);
+		}
+	}
+	/* the one item modifier: a destructive action reads as colored text and a
+	   tinted hover, never a filled row — `.vui-btn--destructive` on an item
+	   would paint its foreground white on nothing */
+	.vui-menuitem--destructive {
+		color: var(--vui-destructive);
+
+		&:hover,
+		&:focus-visible {
+			background: color-mix(in srgb, var(--vui-destructive) 12%, transparent);
+		}
+	}
+
+	/* ── summaries ───────────────────────────────────────────────────────────
+	   The fourth control: the clickable header of a <details>. Keyed on the
+	   ELEMENT, not a class — a <summary> inside a vui container has exactly one
+	   shape it can take, and (as with the menu item's role) the markup a
+	   consumer already writes says which one. `.vui-summary` is the same look
+	   outside a container.
+
+	   It is a ROW, so it follows the menu item rather than the button: full
+	   width, transparent at rest, hover and active from the context channel,
+	   and the focus ring drawn INSIDE — a container that clips itself to its
+	   radius (components/disclosure.html does) would cut an outset one off.
+	   The UA's marker goes, and a caret drawn from two borders takes its place,
+	   turning with the parent's [open] state. */
+	.vui-summary,
+	:where([class^="vui-"], [class*=" vui-"]) :where(summary) {
+		all: unset;
+		box-sizing: border-box;
+		display: flex;
+		align-items: center;
+		gap: 0.6em;
+		width: 100%;
+		cursor: pointer;
+		user-select: none;
+		list-style: none; /* the UA marker — ours is the ::after below */
+		font-weight: 500;
+		line-height: 1.25;
+		min-height: var(--vui-control-min-height, 2.5rem);
+		padding: var(--vui-control-py, 0.5rem) var(--vui-control-px, 0.9rem);
+		color: inherit;
+		transition: background-color var(--vui-transition);
+
+		/* Safari draws its marker as a pseudo-element, not as a list marker */
+		&::-webkit-details-marker {
+			display: none;
+		}
+		&:hover {
+			background: var(--vui-control-bg-hover, var(--vui-surface-hover));
+		}
+		&:active {
+			background: var(
+				--vui-control-bg-active,
+				color-mix(
+					in srgb,
+					currentColor 12%,
+					var(--vui-control-bg-hover, var(--vui-surface-hover))
+				)
+			);
+		}
+		/* drawn inside, like the menu item's — see above */
+		&:focus-visible {
+			outline: var(--vui-focus-width) solid var(--vui-ring);
+			outline-offset: calc(-1 * var(--vui-focus-width));
+		}
+		/* the caret: a square with two of its borders, rotated — pointing down
+		   when closed, up when open. The translate is optical centering: the
+		   rotated corner hangs below the box one way and above it the other. */
+		&::after {
+			content: "";
+			flex: none;
+			margin-inline-start: auto;
+			width: 0.45em;
+			height: 0.45em;
+			border-inline-end: 2px solid;
+			border-block-end: 2px solid;
+			color: var(--vui-muted-foreground);
+			rotate: 45deg;
+			translate: 0 -0.12em;
+			transition:
+				rotate var(--vui-transition),
+				translate var(--vui-transition);
+		}
+		:where([open]) > &::after {
+			rotate: 225deg;
+			translate: 0 0.12em;
+		}
+	}
+
+	/* ── tabs ────────────────────────────────────────────────────────────────
+	   The fifth control — and the one container that ships beside it, because
+	   the two only make sense together: the strip draws a rail, and a selected
+	   tab's indicator sits ON that rail (that is what the strip drawing it
+	   INSIDE itself is for, below). Split them and every future tab strip has
+	   to line the two up again.
+
+	   Keyed on the ROLES, like the menu item: `role="tablist"` and `role="tab"`
+	   are what the tabs component's aria wiring writes anyway, so they are also
+	   what paints — and components/tabs.html gives its tabs no class at all.
+	   `.vui-tablist` / `.vui-tab` are the same look outside a component: a nav
+	   of <a>s that reads as tabs needs no factory.
+
+	   The strip SCROLLS rather than wraps, so the rail stays one unbroken line
+	   however many tabs there are — which is also why a tab draws its focus
+	   ring INSIDE, like the menu item's and the summary's: an outset ring would
+	   be clipped by that scroll container. */
+	.vui-tablist,
+	:where([class^="vui-"], [class*=" vui-"]) :where([role="tablist"]) {
+		display: flex;
+		align-items: stretch;
+		gap: 0.25rem;
+		overflow-x: auto;
+		overscroll-behavior-x: contain;
+		scrollbar-width: thin;
+		/* The rail, drawn INSIDE the strip — an inset shadow along the bottom
+		   of the padding box, not a border below it. `overflow-x: auto` makes
+		   the strip a scroll container in BOTH axes (the block axis is coerced
+		   from `visible` to `auto`), so anything that reaches past that padding
+		   box is scrollable overflow: a tab pulled down over a border would be
+		   1px of it, and 1px is enough for the strip to grow a vertical
+		   scrollbar and clip the indicator it was reaching with. A shadow is
+		   ink, it stays put while the strip scrolls, and the tab covers it
+		   without leaving the box at all. */
+		box-shadow: inset 0 calc(-1 * var(--vui-border-width)) 0 0 var(--vui-border);
+	}
+	.vui-tablist[aria-orientation="vertical"],
+	:where([class^="vui-"], [class*=" vui-"]) :where([role="tablist"][aria-orientation="vertical"]) {
+		flex-direction: column;
+		overflow-x: visible;
+		/* not a scroll container on either axis, so the rail can be a plain
+		   border and the tab can be pulled over it the obvious way */
+		box-shadow: none;
+		border-inline-end: var(--vui-border-width) solid var(--vui-border);
+	}
+
+	/* `all: unset` first, as with every control here: it is what stops the bare
+	   <button> rule above from filling a tab and boxing it in — the tab rule is
+	   (0,1,0), the bare-button default is (0,0,0), so `unset` wins every
+	   property the tab does not go on to declare. Written after `.vui-btn` for
+	   the same reason the menu item is: at (0,1,0) they tie, and a tab built by
+	   button(label, { role: "tab" }) must come out a tab. */
+	.vui-tab,
+	:where([class^="vui-"], [class*=" vui-"]) :is([role="tab"]) {
+		all: unset;
+		box-sizing: border-box;
+		display: inline-flex;
+		flex: none;
+		align-items: center;
+		justify-content: center;
+		gap: 0.5em;
+		cursor: pointer;
+		user-select: none;
+		white-space: nowrap;
+		/* one weight for every tab: bolding the selected one re-measures the
+		   text and the whole strip shifts under the pointer */
+		font-weight: 500;
+		line-height: 1.25;
+		min-height: var(--vui-control-min-height, 2.5rem);
+		padding: var(--vui-control-py, 0.5rem) var(--vui-control-px, 0.9rem);
+		border-radius: var(--vui-radius) var(--vui-radius) 0 0;
+		/* the indicator, transparent until selected. The strip's rail is drawn
+		   inside the strip (see above), so the bottom 2px of the tab already
+		   sit on it — covering it, and reading as one line and not two, with
+		   nothing to pull and nothing hanging out of the scroll container. */
+		border-block-end: 2px solid transparent;
+		color: var(--vui-muted-foreground);
+		transition:
+			background-color var(--vui-transition),
+			border-color var(--vui-transition),
+			color var(--vui-transition);
+
+		&:hover {
+			background: var(--vui-control-bg-hover, var(--vui-surface-hover));
+			color: var(--vui-control-foreground, var(--vui-surface-foreground));
+		}
+		/* drawn inside, like the menu item's and the summary's — see above */
+		&:focus-visible {
+			outline: var(--vui-focus-width) solid var(--vui-ring);
+			outline-offset: calc(-1 * var(--vui-focus-width));
+		}
+		/* selected is a full-strength label plus the indicator; the foreground
+		   comes off the context channel, so a tab strip inside a lifted surface
+		   reads against that surface and not the page */
+		&[aria-selected="true"] {
+			color: var(--vui-control-foreground, var(--vui-surface-foreground));
+			border-block-end-color: var(--vui-primary);
+		}
+		&:disabled,
+		&[aria-disabled="true"] {
+			cursor: not-allowed;
+			opacity: 0.5;
+			background: transparent;
+		}
+	}
+	/* vertical: the indicator moves to the rail's edge, and a tab becomes a row */
+	.vui-tablist[aria-orientation="vertical"] > :is(.vui-tab, [role="tab"]),
+	:where([class^="vui-"], [class*=" vui-"]) :where([role="tablist"][aria-orientation="vertical"]) > :is([role="tab"], .vui-tab) {
+		justify-content: flex-start;
+		text-align: start;
+		border-radius: var(--vui-radius) 0 0 var(--vui-radius);
+		border-block-end: 0;
+		border-inline-end: 2px solid transparent;
+		margin-inline-end: calc(-1 * var(--vui-border-width));
+
+		&[aria-selected="true"] {
+			border-inline-end-color: var(--vui-primary);
+		}
+	}
+
+	/* ── badges ──────────────────────────────────────────────────────────────
+	   Not a control: nothing here hovers, focuses or presses. So a badge reads
+	   the ROLE vocabulary directly rather than the control channel — a badge
+	   inside a dialog panel must stay the color it was told to be, while every
+	   button around it lifts to surface-1. Same five roles, same names. */
+	.vui-badge {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3em;
+		padding: 0.1rem 0.45rem;
+		border: var(--vui-border-width) solid var(--vui-border);
+		border-radius: var(--vui-radius);
+		background: var(--vui-muted);
+		color: var(--vui-muted-foreground);
+		font-size: 0.8em;
+		font-weight: 600;
+		line-height: 1.6;
+		white-space: nowrap;
+		vertical-align: middle;
+	}
+	.vui-badge--primary,
+	.vui-badge--accent,
+	.vui-badge--destructive,
+	.vui-badge--warning,
+	.vui-badge--success {
+		border-color: transparent;
+	}
+	.vui-badge--primary {
+		background: var(--vui-primary);
+		color: var(--vui-primary-foreground);
+	}
+	.vui-badge--accent {
+		background: var(--vui-accent);
+		color: var(--vui-accent-foreground);
+	}
+	.vui-badge--destructive {
+		background: var(--vui-destructive);
+		color: var(--vui-destructive-foreground);
+	}
+	.vui-badge--warning {
+		background: var(--vui-warning);
+		color: var(--vui-warning-foreground);
+	}
+	.vui-badge--success {
+		background: var(--vui-success);
+		color: var(--vui-success-foreground);
+	}
+
+	/* ── alerts ──────────────────────────────────────────────────────────────
+	   The toast's treatment (see components/toast.html), standing still: a
+	   surface with a 12% wash of the role, its border tinted to match, and the
+	   role at full strength on the icon alone. Same recipe, same numbers, and
+	   for the same reason — a tinted box keeps ONE control context, so a button
+	   or a ✕ inside an alert is the same control it is anywhere else, and the
+	   text stays at surface contrast on every theme with no white-on-amber to
+	   check. A filled box would need its own context per role and could not
+	   carry a ghost button at all. */
+	.vui-alert {
+		display: flex;
+		gap: var(--vui-gap);
+		align-items: flex-start;
+		padding: 0.75rem;
+		border: var(--vui-border-width) solid var(--vui-border);
+		border-radius: var(--vui-radius-container);
+		background: var(--vui-surface);
+		color: var(--vui-surface-foreground);
+
+		& > .vui-alert__icon {
+			flex: none;
+			line-height: 1.5;
+			color: var(--_tint, var(--vui-muted-foreground));
+		}
+		& > .vui-alert__body {
+			flex: 1;
+			min-inline-size: 0;
+		}
+		& .vui-alert__title {
+			font-weight: 600;
+		}
+	}
+	.vui-alert--primary {
+		--_tint: var(--vui-primary);
+	}
+	.vui-alert--accent {
+		--_tint: var(--vui-accent);
+	}
+	.vui-alert--destructive {
+		--_tint: var(--vui-destructive);
+	}
+	.vui-alert--warning {
+		--_tint: var(--vui-warning);
+	}
+	.vui-alert--success {
+		--_tint: var(--vui-success);
+	}
+	.vui-alert:is(.vui-alert--primary, .vui-alert--accent, .vui-alert--destructive, .vui-alert--warning, .vui-alert--success) {
+		background: color-mix(in srgb, var(--_tint) 12%, var(--vui-surface));
+		border-color: color-mix(in srgb, var(--_tint) 35%, transparent);
+	}
+
+	/* ── cards ───────────────────────────────────────────────────────────────
+	   The container tier of the structural tokens, spelled out: the same
+	   surface, container radius and RESTING shadow the dialog panel and the
+	   popover already differ from. A card may lift the controls inside it the
+	   way the dialog panel does — one `--vui-control-bg` — but it does not by
+	   default, because a card on the page is not a panel over one. */
+	.vui-card {
+		padding: 1rem;
+		border: var(--vui-border-width) solid var(--vui-border);
+		border-radius: var(--vui-radius-container);
+		background: var(--vui-surface);
+		color: var(--vui-surface-foreground);
+		box-shadow: var(--vui-shadow);
+	}
+
+	/* ── tables ──────────────────────────────────────────────────────────────
+	   A style, not a component — a <table> is markup a consumer writes, and CSS
+	   reaches it. Rules, a muted header, tabular figures, and a header that
+	   sticks IF an ancestor scrolls (put the table in an `overflow: auto` box
+	   and it works; on the page it is inert). Sorting is behavior and is not
+	   here: it belongs to the page, or to `enhance`, not to a stylesheet. */
+	.vui-table {
+		inline-size: 100%;
+		border-collapse: collapse;
+		font-variant-numeric: tabular-nums;
+
+		& :is(th, td) {
+			padding: var(--vui-control-py, 0.45rem) 0.6rem;
+			text-align: start;
+			border-block-end: var(--vui-border-width) solid var(--vui-border);
+		}
+		& th {
+			font-weight: 600;
+			color: var(--vui-muted-foreground);
+			white-space: nowrap;
+		}
+		& thead th {
+			position: sticky;
+			inset-block-start: 0;
+			z-index: 1;
+			background: var(--vui-surface);
+		}
+		& tbody tr:hover {
+			background: var(--vui-surface-hover);
+		}
+		& tfoot :is(th, td) {
+			border-block-end: 0;
+			border-block-start: var(--vui-border-width) solid var(--vui-border);
+		}
+		/* the one alignment a data table always needs, and the one place a
+		   number column should not be guessed at */
+		& :is(th, td):is(.vui-num) {
+			text-align: end;
+		}
+	}
+	/* zebra is off the FOREGROUND, not `--vui-muted`, for the reason the switch
+	   track is: a stripe that a theme can flatten into its own surface is a
+	   class that silently does nothing. */
+	.vui-table--zebra tbody tr:nth-child(even of :not([hidden])) {
+		background: color-mix(in srgb, var(--vui-foreground) 4%, transparent);
+	}
+
+	/* ── layout helpers the kit's own chrome and its consumers both need ────── */
+	.vui-row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--vui-gap);
+	}
+	.vui-field {
+		display: block;
+		margin-block-end: var(--vui-gap);
+
+		& > label {
+			display: block;
+			margin-block-end: 0.35rem;
+			font-size: 0.925rem;
+			color: var(--vui-muted-foreground);
+		}
+		& > :where(input, select, textarea) {
+			inline-size: 100%;
+		}
+		& > .vui-help {
+			display: block;
+			margin-block-start: 0.35rem;
+			font-size: 0.85rem;
+			color: var(--vui-muted-foreground);
+		}
+	}
+	/* Invalid is `:user-invalid`, not `:invalid` — the platform's own "they have
+	   actually interacted with this" state, so an untouched form does not open
+	   in red. `[data-invalid]` is the same look for a server-side error the
+	   browser knows nothing about; both are the field's, not the control's, so
+	   a component may set the attribute without painting anything. */
+	.vui-field:is([data-invalid], :has(:user-invalid)) {
+		& > label,
+		& > .vui-help {
+			color: var(--vui-destructive);
+		}
+		& > :where(input, select, textarea) {
+			border-color: var(--vui-destructive);
+		}
+	}
+	/* a vertical list of menu items, with its separators. Layout only: the items
+	   paint themselves (by role, above) and the popover it sits in is the
+	   surface — so it works as a popover body and, just as well, inline. */
+	.vui-menu {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		min-width: 10rem;
+		padding: 0.25rem;
+
+		& > hr,
+		& > [role="separator"] {
+			margin: 0.25rem 0;
+			border: 0;
+			border-top: var(--vui-border-width) solid var(--vui-border);
+		}
+	}
+
+	/* ── hidden ──────────────────────────────────────────────────────────────
+	   The platform's own hiding primitive, kept ahead of the kit's `display`.
+	   The UA's `[hidden] { display: none }` loses to ANY author `display` —
+	   origin is decided before specificity — so on its own a `.vui-badge`
+	   (inline-flex), a `.vui-row` (flex) or a bare <button> in one (the default
+	   above) would stay on screen with `hidden` set: `el.hidden = true`, or
+	   vanilla's `data-bind="hidden:…"`, would silently do nothing.
+
+	   Two forms, both off the container hook: the element carrying a vui- class
+	   itself, at (0,3,0) — `:is()`, not `:where()`, so it outranks every
+	   `display` in this file wherever it sits, the two-class `.vui-field >
+	   .vui-help` included — and any descendant of one, at (0,2,0), for the bare
+	   controls. Layered like the rest, not `!important`: a consumer's unlayered
+	   rule may still show a hidden element (a fade-out). Never over
+	   `hidden="until-found"`, which the UA hides with content-visibility so
+	   find-in-page can reveal it (a tabs panel) — the exception every component's
+	   own rule makes too. Those component rules stay, and must: a `display` in
+	   vui.components outranks anything in vui.base whatever its specificity,
+	   because layer order is decided first, so a rule here can never hide a
+	   component's own part. This one is for base's markup wherever it sits — a
+	   badge in a card, a toolbar row, an inline menu, the bare controls inside
+	   them. */
+	:is([class^="vui-"], [class*=" vui-"])[hidden]:not([hidden="until-found"]),
+	:where([class^="vui-"], [class*=" vui-"]) [hidden]:not([hidden="until-found"]) {
+		display: none;
+	}
+}

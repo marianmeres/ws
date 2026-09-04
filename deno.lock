@@ -18,7 +18,8 @@
     "jsr:@marianmeres/store@3": "3.0.1",
     "jsr:@marianmeres/ticker@^1.17.1": "1.17.1",
     "jsr:@marianmeres/uid@^1.2.0": "1.2.0",
-    "jsr:@marianmeres/vanilla@^1.9.0": "1.9.0",
+    "jsr:@marianmeres/vanilla-ui@~0.5.2": "0.5.2",
+    "jsr:@marianmeres/vanilla@^1.10.0": "1.10.0",
     "jsr:@std/assert@0.223": "0.223.0",
     "jsr:@std/assert@^1.0.19": "1.0.19",
     "jsr:@std/bytes@0.223": "0.223.0",
@@ -158,8 +159,14 @@
         "jsr:@marianmeres/random-human-readable"
       ]
     },
-    "@marianmeres/vanilla@1.9.0": {
-      "integrity": "2fa21af4935599e73b7275e6d477c5992e39ebd5a5a01bb8f2d29cadf2976916"
+    "@marianmeres/vanilla@1.10.0": {
+      "integrity": "f0154cb3e38cf9af202586132da75d774a6a4a78e8022b6fdb65820d60a5551e"
+    },
+    "@marianmeres/vanilla-ui@0.5.2": {
+      "integrity": "4e9601a4962b21abcb3d1af0789085d1c0a758ce9dd483152587f8981e4545d0",
+      "dependencies": [
+        "jsr:@marianmeres/vanilla"
+      ]
     },
     "@std/assert@0.223.0": {
       "integrity": "eb8d6d879d76e1cc431205bd346ed4d88dc051c6366365b1af47034b0670be24"
@@ -427,7 +434,8 @@
       "jsr:@marianmeres/pubsub@3",
       "jsr:@marianmeres/ticker@^1.17.1",
       "jsr:@marianmeres/uid@^1.2.0",
-      "jsr:@marianmeres/vanilla@^1.9.0",
+      "jsr:@marianmeres/vanilla-ui@~0.5.2",
+      "jsr:@marianmeres/vanilla@^1.10.0",
       "jsr:@std/assert@^1.0.19",
       "jsr:@std/path@^1.1.6"
     ]
