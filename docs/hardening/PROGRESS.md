@@ -30,7 +30,7 @@ Verify: deno publish --dry-run --allow-dirty
 | ✅     | T02 | —                                               | Client: catch the unsubscriber's fire-and-forget `unsub`                   | [02](./02-client.md) #1           | —      |
 | ✅     | T08 | T01                                             | Server: hand `verify` the requested identity; document the isolation rule  | [01](./01-server.md) #2           | —      |
 | ✅     | T03 | T02                                             | Client: settle in-flight frames the moment the socket closes               | [02](./02-client.md) #2           | —      |
-| ⬜     | T04 | T03                                             | Client: fail sends fast on terminated state and encode errors              | [02](./02-client.md) #3           | —      |
+| ✅     | T04 | T03                                             | Client: fail sends fast on terminated state and encode errors              | [02](./02-client.md) #3           | —      |
 | ⬜     | T07 | T03                                             | Client: emit `close` on a local `disconnect()`; retire `#intentional`      | [02](./02-client.md) #6           | —      |
 | ⬜     | T05 | —                                               | Client: receive binary frames as `ArrayBuffer`                             | [02](./02-client.md) #4           | —      |
 | ⬜     | T06 | —                                               | Client: a stale `auth()` rejection must not close a newer socket           | [02](./02-client.md) #5           | —      |
@@ -50,6 +50,13 @@ left out are listed under "Deliberately omitted" in the overview, each with its 
 
 ## Decisions log
 
+- **2026-09-04** — A send issued in the `terminated` state rejects at once with the
+  `WSTerminatedError` of that close, kept in its own `#terminalError` field so a later
+  handler-thrown `#lastError` cannot mask it; a frame the encoder refuses rejects with the
+  runtime's own error, unwrapped, and still emits `error` — nothing restarts from
+  `terminated` except an explicit `connect()`, and a frame that never left the process
+  cannot be acknowledged, so buffering either one only defers a known answer by
+  `sendTimeout`. `subscribe()` while terminated still registers the room and resolves. (T04)
 - **2026-09-04** — In-flight frames are settled at the moment a socket closes: `sub` and
   `unsub` resolve, `pub` and `broadcast` reject with a new `WSConnectionLostError`; queued
   frames still wait for the reconnect; the terminal path keeps `failAll` — resolving a lost

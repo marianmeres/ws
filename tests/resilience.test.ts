@@ -8,6 +8,8 @@ import {
 	WSDisposedError,
 	WSNotConnectedError,
 	WSOutboxDropError,
+	WSTerminatedError,
+	WSTimeoutError,
 } from "../src/protocol/errors.ts";
 import type { ClientFrame } from "../src/protocol/frames.ts";
 import {
@@ -148,6 +150,61 @@ Deno.test("an in-flight publish rejects at the close, not at the timeout", async
 	} finally {
 		c.dispose();
 		await noAck.stop();
+	}
+});
+
+Deno.test("a publish after a terminal close rejects at once", async () => {
+	const server = startServer({ verify: () => null });
+	const c = client(server.url, { sendTimeout: 10_000 });
+
+	try {
+		await assertRejects(() => c.connect(), WSTerminatedError);
+		assertEquals(c.connectionState, "terminated");
+
+		// Nothing restarts from `terminated`, so buffering this frame would
+		// hand the caller a timeout 10s later instead of the actual reason.
+		const started = Date.now();
+		const error = await assertRejects(
+			() => c.publish("chat", { n: 1 }),
+			WSTerminatedError,
+		);
+		assertEquals(error.code, 4001);
+		const elapsed = Date.now() - started;
+		assert(elapsed < 1_000, `waited ${elapsed}ms for an answer already known`);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a payload that cannot be encoded rejects with the encoder's error", async () => {
+	const server = startServer();
+	const c = client(server.url, { sendTimeout: 10_000 });
+
+	try {
+		await c.connect();
+
+		const errors: Error[] = [];
+		c.on("error", (e) => errors.push(e));
+
+		// The frame never left, so no ack was ever requested — waiting for one
+		// would report a timeout and hide the real cause.
+		const error = await assertRejects(
+			() => c.publish("chat", { big: 10n }),
+			Error,
+		);
+		assert(
+			!(error instanceof WSTimeoutError),
+			`expected the encoder's error, got ${error.constructor.name}`,
+		);
+		assert(
+			/BigInt/i.test(error.message),
+			`message should name the culprit, got "${error.message}"`,
+		);
+		assertEquals(errors.length, 1, "still surfaces as an error event");
+	} finally {
+		c.dispose();
+		await server.stop();
 	}
 });
 

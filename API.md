@@ -164,13 +164,18 @@ count once the server acknowledges.
 While disconnected the frame is buffered and the promise stays pending until it
 flushes — bounded by `sendTimeout`, never indefinitely. A frame already in
 flight when the socket closes rejects there and then with
-`WSConnectionLostError`; it is not resent.
+`WSConnectionLostError`; it is not resent. After a terminal close nothing is
+buffered at all: the promise rejects immediately with `WSTerminatedError`,
+because only an explicit `connect()` leaves that state.
 
 `namespace` must equal the client's own; the server rejects anything else, so it
 is only useful for asserting the expected one.
 
+A payload `encode` refuses — a `BigInt` is enough for the JSON default — rejects
+with the encoder's own error, unwrapped, and also surfaces as an `error` event.
+
 **Throws** `WSTimeoutError`, `WSConnectionLostError`, `WSOutboxDropError`,
-`WSNotConnectedError`, `WSRemoteError`, `WSDisposedError`
+`WSNotConnectedError`, `WSTerminatedError`, `WSRemoteError`, `WSDisposedError`
 
 ##### `broadcast<T>(room, payload): Promise<WSPublishResult>`
 

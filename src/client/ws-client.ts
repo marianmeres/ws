@@ -249,6 +249,12 @@ export class WSClient<TAuth = unknown> {
 	#namespace: string | null = null;
 	#attempt = 0;
 	#lastError: Error | null = null;
+	/**
+	 * Kept apart from `#lastError` on purpose: a handler that throws after the
+	 * terminal close would overwrite `#lastError` and a send rejected from the
+	 * `terminated` state would then blame the wrong thing.
+	 */
+	#terminalError: WSTerminatedError | null = null;
 	#intentional = false;
 
 	#rooms = new RoomRegistry();
@@ -675,6 +681,8 @@ export class WSClient<TAuth = unknown> {
 	 * @throws {WSTimeoutError} `sendTimeout` elapsed with no acknowledgement
 	 * @throws {WSOutboxDropError} evicted from a full outbox
 	 * @throws {WSNotConnectedError} sent while offline with `outboxMaxSize: 0`
+	 * @throws {WSTerminatedError} sent after a terminal close, which only an
+	 * explicit `connect()` recovers from — rejected at once, not buffered
 	 * @throws {WSRemoteError} the server rejected it with a `nack`
 	 */
 	publish<T = unknown>(
@@ -729,6 +737,12 @@ export class WSClient<TAuth = unknown> {
 	#send(frame: ClientFrame, id: string): Promise<WSPublishResult> {
 		if (this.#autoConnect) this.#ensureStarted();
 
+		// Nothing restarts from `terminated` except an explicit connect(), so
+		// buffering here would only defer the same answer by `sendTimeout`.
+		if (this.#terminalError && this.#state === "terminated") {
+			return Promise.reject(this.#terminalError);
+		}
+
 		const canSendNow = this.connected &&
 			this.#socket?.readyState === WebSocket.OPEN;
 
@@ -737,7 +751,10 @@ export class WSClient<TAuth = unknown> {
 		}
 
 		const promise = this.#outbox.track(id, frame, !canSendNow);
-		if (canSendNow) this.#sendRaw(frame);
+		if (canSendNow) {
+			const error = this.#sendRaw(frame);
+			if (error) this.#outbox.fail(id, error);
+		}
 		return promise;
 	}
 
@@ -751,18 +768,25 @@ export class WSClient<TAuth = unknown> {
 	#sendControl(frame: ClientFrame): Promise<WSPublishResult> {
 		const id = "id" in frame ? frame.id : this.#nextId();
 		const promise = this.#outbox.track(id, frame, false);
-		this.#sendRaw(frame);
+		const error = this.#sendRaw(frame);
+		if (error) this.#outbox.fail(id, error);
 		return promise;
 	}
 
-	#sendRaw(frame: ClientFrame): void {
+	/**
+	 * @returns the error the send failed with — a frame that never left cannot
+	 * be acknowledged, so the caller settles its promise instead of letting it
+	 * wait out `sendTimeout`.
+	 */
+	#sendRaw(frame: ClientFrame): Error | null {
 		const socket = this.#socket;
-		if (!socket || socket.readyState !== WebSocket.OPEN) return;
+		if (!socket || socket.readyState !== WebSocket.OPEN) return null;
 		try {
 			socket.send(this.#encode(frame));
 		} catch (e) {
-			this.#fail(e, "send failed");
+			return this.#fail(e, "send failed");
 		}
+		return null;
 	}
 
 	#open(): void {
@@ -778,6 +802,7 @@ export class WSClient<TAuth = unknown> {
 		if (!this.#setState("connecting")) return;
 
 		this.#intentional = false;
+		this.#terminalError = null;
 		const generation = ++this.#generation;
 		let socket: WebSocket;
 
@@ -946,7 +971,10 @@ export class WSClient<TAuth = unknown> {
 		const buffered = this.#outbox.drain();
 		if (buffered.length) {
 			this.logger?.debug?.(`flushing ${buffered.length} buffered frame(s)`);
-			for (const frame of buffered) this.#sendRaw(frame);
+			for (const frame of buffered) {
+				const error = this.#sendRaw(frame);
+				if (error && "id" in frame) this.#outbox.fail(frame.id, error);
+			}
 		}
 	}
 
@@ -969,6 +997,7 @@ export class WSClient<TAuth = unknown> {
 			this.#setState("terminated");
 			const error = new WSTerminatedError(code, reason);
 			this.#lastError = error;
+			this.#terminalError = error;
 			// Loud on purpose: this is the only path where a client that
 			// otherwise retries forever gives up, and a silent one looks
 			// exactly like a network that never came back.
@@ -1154,11 +1183,12 @@ export class WSClient<TAuth = unknown> {
 		this.#bus.publish(event as string, data);
 	}
 
-	#fail(error: unknown, context: string): void {
+	#fail(error: unknown, context: string): Error {
 		const err = error instanceof Error ? error : new WSError(String(error));
 		this.#lastError = err;
 		this.logger?.error?.(`${context}: ${err.message}`);
 		this.#emit("error", err);
+		return err;
 	}
 }
 
