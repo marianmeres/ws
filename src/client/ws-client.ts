@@ -584,6 +584,10 @@ export class WSClient<TAuth = unknown> {
 					type: FRAME.UNSUB,
 					id: this.#nextId(),
 					rooms: [room],
+				}).catch((e) => {
+					// Not actionable: the handler is already detached locally and
+					// the server drops the room on close anyway.
+					this.logger?.debug?.(`unsub "${room}" unconfirmed: ${e.message}`);
 				});
 			}
 		});

@@ -9,7 +9,7 @@ import {
 	WSOutboxDropError,
 } from "../src/protocol/errors.ts";
 import type { ClientFrame } from "../src/protocol/frames.ts";
-import { freePort, startServer, startSilentServer, until } from "./_helpers.ts";
+import { freePort, sleep, startServer, startSilentServer, until } from "./_helpers.ts";
 
 const client = (url: string, options: Record<string, unknown> = {}) =>
 	createWSClient({ url, logger: null, pingInterval: 0, ...options });
@@ -212,6 +212,29 @@ Deno.test("disconnect() is resumable — handlers and rooms survive", async () =
 
 		await server.service.publish("chat", { text: "resumed" });
 		await until(() => seen.length === 1, "the original handler still fires");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("unsub() then dispose() leaves no uncaught rejection", async () => {
+	const server = startServer();
+	const c = client(server.url);
+
+	try {
+		await c.connect();
+		const unsub = await c.subscribe("chat", () => {});
+
+		// The README's canonical sequence. The unsubscriber sends an `unsub` and
+		// drops the promise; dispose() then rejects it with WSDisposedError.
+		// Uncaught, that exits a Deno or Node process.
+		unsub();
+		c.dispose();
+
+		// A checkpoint at which the runtime would report the rejection.
+		await sleep(50);
+		assertEquals(c.rooms, []);
 	} finally {
 		c.dispose();
 		await server.stop();

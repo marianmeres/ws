@@ -73,6 +73,12 @@ not registered yet. There is a test that fails if you break it
 **`sub`/`unsub` bypass the outbox.** They are replayed wholesale by the
 re-subscribe step, so buffering them too would apply them twice.
 
+**A control-frame promise the client does not await must carry a `.catch()`.**
+`#sendControl` tracks the frame in the outbox, so its promise rejects on dispose,
+on a terminal close and on the send timeout. An unawaited one — the unsubscriber's
+`unsub`, the `#onHello` re-subscribe — is an uncaught rejection that exits a Deno
+or Node process.
+
 **Every send carries one deadline** spanning queue + flight + ack — not an
 ack-only timeout. Combining acks with infinite retry otherwise produces promises
 that pend forever.
