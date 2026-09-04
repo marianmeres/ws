@@ -30,6 +30,7 @@ import { WSService, type WSServiceOptions } from "./service.ts";
 
 export * from "./adapters/abstract.ts";
 export * from "./adapters/local.ts";
+export type { WSRequestedIdentity } from "../protocol/frames.ts";
 export {
 	type WSConnectionContext,
 	WSService,

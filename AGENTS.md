@@ -93,7 +93,11 @@ checks its captured generation. Without it a slow `onclose` from a dead socket
 cancels the reconnect that replaced it.
 
 **Safe defaults are deny.** `allowBroadcast` denies; HTTP injection routes are
-not mounted without `httpAuth`. Do not "helpfully" relax either.
+not mounted without `httpAuth`. Do not "helpfully" relax either. The documented
+exception: `clientId` and `namespace` fall back to what the client asked for
+(assigned → requested → generated), so a multi-tenant `verify` must return both.
+Its third argument carries the client's proposals so they can be validated there
+instead of being duplicated into the auth payload.
 
 **Delivery is at-most-once.** Transmitted-but-unacked sends are never resent.
 If that changes, the server needs deduplication first.

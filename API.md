@@ -319,21 +319,21 @@ Creates a mountable demino app plus the service it is wired to.
 
 **Parameters**
 
-| Name                         | Type                                   | Default                   | Description                                                                    |
-| ---------------------------- | -------------------------------------- | ------------------------- | ------------------------------------------------------------------------------ |
-| `mountPath`                  | `string`                               | `"/ws"`                   | Demino mount path                                                              |
-| `middlewares`                | `DeminoHandler[]`                      | `[]`                      | Applied to all routes                                                          |
-| `options.verify`             | `(payload, req) => AuthResult \| null` | —                         | Return `null` (or throw) to reject with `4001`. Absent means no authentication |
-| `options.allowBroadcast`     | `(ctx, room) => boolean`               | **deny**                  | Gate for cross-namespace broadcast                                             |
-| `options.httpAuth`           | `DeminoHandler`                        | —                         | Guards the HTTP routes. **Without it they are not mounted**                    |
-| `options.deminoOptions`      | `DeminoOptions`                        | —                         | Passed through to `demino()`                                                   |
-| `options.authTimeout`        | `number`                               | `5_000`                   | Deadline for the `auth` frame → `4002`                                         |
-| `options.idleTimeout`        | `number`                               | `60_000`                  | Reap silent connections → `4008`                                               |
-| `options.maxFrameSize`       | `number`                               | `262144`                  | Oversized frames → `4013`                                                      |
-| `options.maxFramesPerSecond` | `number`                               | `100`                     | Rate cap → `4009`                                                              |
-| `options.adapter`            | `WSPubSubAdapter`                      | `WSPubSubLocal`           | Cross-instance fan-out                                                         |
-| `options.logger`             | `Logger \| null`                       | `createClog("ws:server")` | `null` silences                                                                |
-| `options.encode` / `.decode` | `WSEncoder` / `WSDecoder`              | JSON                      | Must match the client's                                                        |
+| Name                         | Type                                              | Default                   | Description                                                                                                                                                                   |
+| ---------------------------- | ------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mountPath`                  | `string`                                          | `"/ws"`                   | Demino mount path                                                                                                                                                             |
+| `middlewares`                | `DeminoHandler[]`                                 | `[]`                      | Applied to all routes                                                                                                                                                         |
+| `options.verify`             | `(payload, req, requested) => AuthResult \| null` | —                         | Return `null` (or throw) to reject with `4001`. Absent means no authentication. `requested` is the identity the client asked for — see [below](#security-namespace-isolation) |
+| `options.allowBroadcast`     | `(ctx, room) => boolean`                          | **deny**                  | Gate for cross-namespace broadcast                                                                                                                                            |
+| `options.httpAuth`           | `DeminoHandler`                                   | —                         | Guards the HTTP routes. **Without it they are not mounted**                                                                                                                   |
+| `options.deminoOptions`      | `DeminoOptions`                                   | —                         | Passed through to `demino()`                                                                                                                                                  |
+| `options.authTimeout`        | `number`                                          | `5_000`                   | Deadline for the `auth` frame → `4002`                                                                                                                                        |
+| `options.idleTimeout`        | `number`                                          | `60_000`                  | Reap silent connections → `4008`                                                                                                                                              |
+| `options.maxFrameSize`       | `number`                                          | `262144`                  | Oversized frames → `4013`                                                                                                                                                     |
+| `options.maxFramesPerSecond` | `number`                                          | `100`                     | Rate cap → `4009`                                                                                                                                                             |
+| `options.adapter`            | `WSPubSubAdapter`                                 | `WSPubSubLocal`           | Cross-instance fan-out                                                                                                                                                        |
+| `options.logger`             | `Logger \| null`                                  | `createClog("ws:server")` | `null` silences                                                                                                                                                               |
+| `options.encode` / `.decode` | `WSEncoder` / `WSDecoder`                         | JSON                      | Must match the client's                                                                                                                                                       |
 
 **Returns** `WSApp` — `{ app: Demino, service: WSService }`
 
@@ -365,6 +365,34 @@ const { app, service } = createWSApp("/ws", [], {
 await service.publish("notifications", { text: "deploy finished" }, "org-123");
 
 Deno.serve(app);
+```
+
+#### Security: namespace isolation
+
+Namespace is the isolation boundary and `clientId` is the identity peers see in
+`from` — and a claimed id evicts whoever holds it. Both fall back to what the
+client asked for:
+
+```
+assigned by verify  →  requested by the client  →  generated
+```
+
+**In any multi-tenant deployment `verify` must return `namespace` and
+`clientId`.** Return neither and the client's proposals are honoured verbatim,
+so any authenticated user can enter any tenant. The third argument,
+[`WSRequestedIdentity`](#wsrequestedidentity), carries those proposals, so they
+can be validated there rather than duplicated into the auth payload:
+
+```typescript
+createWSApp("/ws", [], {
+	verify: async (payload, req, requested) => {
+		const user = await authenticate((payload as any)?.token);
+		if (!user) return null;
+		// The namespace is checked, not trusted — and assigned either way.
+		if (!user.orgs.includes(requested.namespace)) return null;
+		return { clientId: user.id, namespace: requested.namespace };
+	},
+});
 ```
 
 ---
@@ -554,6 +582,19 @@ What the server's `verify()` hook returns. `null` rejects the connection.
 	clientId?: string;                // default: generated
 	namespace?: string;               // overrides the client's request
 	meta?: Record<string, unknown>;   // surfaces on WSConnectionContext
+}
+```
+
+### `WSRequestedIdentity`
+
+The third argument to `verify()`: what the client proposed in its `auth` frame.
+Hints, not facts — see
+[Security: namespace isolation](#security-namespace-isolation).
+
+```typescript
+{
+	clientId?: string;   // absent unless the frame carried a usable one
+	namespace: string;   // DEFAULT_NAMESPACE when the frame carried none
 }
 ```
 

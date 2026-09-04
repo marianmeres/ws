@@ -128,10 +128,12 @@ ws.members("room"); // last known membership
 import { createWSApp } from "@marianmeres/ws/server";
 
 const { app, service } = createWSApp("/ws", [], {
-	verify: async (payload, req) => {
+	// `requested` is what the client asked for — hints, never facts.
+	verify: async (payload, req, requested) => {
 		const user = await authenticate(payload?.token);
 		// Returning null closes the socket with a terminal code.
-		return user ? { clientId: user.id, namespace: user.orgId } : null;
+		if (!user || !user.orgs.includes(requested.namespace)) return null;
+		return { clientId: user.id, namespace: requested.namespace };
 	},
 });
 
@@ -140,6 +142,11 @@ await service.publish("notifications", { text: "deploy finished" }, "org-123");
 
 Deno.serve(app);
 ```
+
+Namespace is the isolation boundary, and it falls back to what the client asked
+for when `verify` returns none — so in a multi-tenant deployment `verify` must
+return `namespace` and `clientId`, validating `requested` rather than trusting
+it.
 
 Mounted routes, relative to the mount path:
 

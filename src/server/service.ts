@@ -24,6 +24,7 @@ import type {
 	WSDecoder,
 	WSEncoder,
 	WSMessage,
+	WSRequestedIdentity,
 } from "../protocol/frames.ts";
 import type { WSBroadcastEnvelope, WSPubSubAdapter } from "./adapters/abstract.ts";
 import { WSPubSubLocal } from "./adapters/local.ts";
@@ -58,10 +59,18 @@ export interface WSServiceOptions {
 	 * Authenticates a connection. Return `null` (or throw) to reject with
 	 * {@link CLOSE.AUTH_FAILED}. Omitted entirely means "no authentication",
 	 * which is fine for development and not for anything else.
+	 *
+	 * **Isolation rule.** Namespace is the isolation boundary and `clientId` is
+	 * the identity peers see, yet both fall back to what the client asked for:
+	 * assigned → requested → generated. In any multi-tenant deployment `verify`
+	 * must therefore return `namespace` and `clientId`; otherwise the client's
+	 * proposals are honoured verbatim. `requested` carries those proposals so
+	 * they can be validated here, instead of being duplicated into `payload`.
 	 */
 	verify?: (
 		payload: unknown,
 		request: Request,
+		requested: WSRequestedIdentity,
 	) => Promise<AuthResult | null> | AuthResult | null;
 	/**
 	 * Gate for cross-namespace broadcast. **Denies by default** — letting any
@@ -482,10 +491,18 @@ export class WSService {
 
 		if (conn.authed) return; // ignore a repeated handshake
 
+		// The client's proposals are hints, and an empty or non-string one is
+		// no hint at all — it must not become a registry key.
+		const proposedId = nonEmptyString(frame.clientId);
+		const proposedNamespace = nonEmptyString(frame.namespace);
+
 		let result: AuthResult | null = {};
 		if (this.#verify) {
 			try {
-				result = await this.#verify(frame.payload, conn.request);
+				result = await this.#verify(frame.payload, conn.request, {
+					clientId: proposedId,
+					namespace: proposedNamespace ?? DEFAULT_NAMESPACE,
+				});
 			} catch (e) {
 				this.logger?.debug?.(`verify threw: ${e}`);
 				result = null;
@@ -495,11 +512,6 @@ export class WSService {
 		if (result === null) {
 			return this.#close(conn, CLOSE.AUTH_FAILED, "authentication failed");
 		}
-
-		// The client's proposals are hints, and an empty or non-string one is
-		// no hint at all — it must not become a registry key.
-		const proposedId = nonEmptyString(frame.clientId);
-		const proposedNamespace = nonEmptyString(frame.namespace);
 
 		const id = result.clientId ?? proposedId ?? conn.id;
 		const namespace = result.namespace ?? proposedNamespace ?? DEFAULT_NAMESPACE;

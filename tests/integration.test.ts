@@ -2,7 +2,11 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import type { DeminoHandler } from "@marianmeres/demino";
 
 import { createWSClient } from "../src/mod.ts";
-import type { WSMessage, WSPresenceEvent } from "../src/protocol/frames.ts";
+import type {
+	WSMessage,
+	WSPresenceEvent,
+	WSRequestedIdentity,
+} from "../src/protocol/frames.ts";
 import { WSRemoteError, WSTerminatedError } from "../src/protocol/errors.ts";
 import { startServer, until } from "./_helpers.ts";
 
@@ -305,6 +309,57 @@ Deno.test("verify assigns clientId and namespace", async () => {
 		assertEquals(c.namespace, "assigned-ns");
 	} finally {
 		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("verify sees the identity the client requested", async () => {
+	const seen: WSRequestedIdentity[] = [];
+	const server = startServer({
+		verify: (_payload, _request, requested) => {
+			seen.push(requested);
+			return {};
+		},
+	});
+	const c = client(server.url, { clientId: "alice", namespace: "org-1" });
+
+	try {
+		await c.connect();
+		assertEquals(seen, [{ clientId: "alice", namespace: "org-1" }]);
+		// Unchanged fallback: nothing assigned, so the proposals are honoured.
+		assertEquals(c.clientId, "alice");
+		assertEquals(c.namespace, "org-1");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("verify can reject a namespace the client is not entitled to", async () => {
+	const server = startServer({
+		verify: (payload, _request, requested) => {
+			const org = (payload as { org?: string })?.org;
+			return requested.namespace === org ? {} : null;
+		},
+	});
+	const intruder = client(server.url, {
+		namespace: "org-2",
+		auth: () => ({ org: "org-1" }),
+	});
+	const tenant = client(server.url, {
+		namespace: "org-1",
+		auth: () => ({ org: "org-1" }),
+	});
+
+	try {
+		const error = await assertRejects(() => intruder.connect(), WSTerminatedError);
+		assertEquals(error.code, 4001);
+
+		await tenant.connect();
+		assertEquals(tenant.namespace, "org-1");
+	} finally {
+		intruder.dispose();
+		tenant.dispose();
 		await server.stop();
 	}
 });
