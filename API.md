@@ -97,6 +97,10 @@ Stops retrying and closes the socket. **Resumable** — handlers, room
 subscriptions and buffered sends all survive, so a later `connect()` picks up
 where it left off.
 
+Emits `close` with code `4900` (`CLOSE.CLIENT_GONE`) and `willReconnect: false`
+when there was a socket to close; nothing when already idle, reconnecting or
+terminated.
+
 ##### `dispose(): void`
 
 Terminal teardown: disconnects, then drops every handler, room, timer and
@@ -283,6 +287,9 @@ stop delivery to the others.
 
 `error` means something failed but the client carried on (a decode failure, a
 throwing handler). `terminated` is the only non-retrying exit.
+
+A local `disconnect()` is a `close` too: code `4900`, `willReconnect: false` —
+that pair is how a deliberate teardown is told apart from a lost connection.
 
 ### `WSState`
 

@@ -256,6 +256,34 @@ Deno.test("server reaps a connection that stops pinging", async () => {
 	}
 });
 
+Deno.test("a local disconnect() emits close 4900, willReconnect false", async () => {
+	const server = startServer();
+	const c = client(server.url, { reconnectDelay: 30 });
+
+	try {
+		const closes: Array<{ code: number; reason: string; willReconnect: boolean }> =
+			[];
+		c.on("close", (e) => closes.push(e));
+
+		await c.connect();
+		c.disconnect();
+
+		assertEquals(closes.length, 1, "a closed socket is one close event");
+		assertEquals(closes[0].code, 4900);
+		assertEquals(closes[0].willReconnect, false);
+
+		c.disconnect();
+		assertEquals(closes.length, 1, "nothing to close while idle, nothing to report");
+
+		// The superseded socket's own onclose must not arrive late as a second one.
+		await sleep(150);
+		assertEquals(closes.length, 1);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
 Deno.test("outbox overflow drops the oldest and rejects it", async () => {
 	// Nothing is listening here, so everything queues.
 	const unreachable = `ws://127.0.0.1:${freePort()}/ws`;

@@ -84,7 +84,10 @@ export interface WSEvents {
 	message: WSMessage;
 	/** Membership change in a room subscribed with presence enabled. */
 	presence: WSPresenceEvent;
-	/** Socket closed. `willReconnect` reflects the retry classification. */
+	/**
+	 * Socket closed. `willReconnect` reflects the retry classification, and is
+	 * `false` for the `4900` a local `disconnect()` emits.
+	 */
 	close: { code: number; reason: string; willReconnect: boolean };
 	/** A retry is scheduled; `delay` is the jittered backoff in ms. */
 	reconnecting: { attempt: number; delay: number };
@@ -255,7 +258,6 @@ export class WSClient<TAuth = unknown> {
 	 * `terminated` state would then blame the wrong thing.
 	 */
 	#terminalError: WSTerminatedError | null = null;
-	#intentional = false;
 
 	#rooms = new RoomRegistry();
 	#outbox: Outbox;
@@ -494,7 +496,6 @@ export class WSClient<TAuth = unknown> {
 			}, this.#connectTimeout);
 		}
 
-		this.#intentional = false;
 		if (this.#state === "idle" || this.#state === "terminated") this.#open();
 
 		return promise;
@@ -506,17 +507,29 @@ export class WSClient<TAuth = unknown> {
 	 * Resumable: handlers, room subscriptions and buffered sends all survive,
 	 * so a later `connect()` picks up exactly where this left off. Use
 	 * {@link dispose} for terminal teardown.
+	 *
+	 * Emits `close` with {@link CLOSE.CLIENT_GONE} and `willReconnect: false`
+	 * when there was a socket to close; nothing when already idle, reconnecting
+	 * or terminated.
 	 */
 	disconnect(): void {
 		if (this.#state === "disposed") return;
 		this.logger?.debug?.("disconnect()");
-		this.#intentional = true;
 		this.#clearTimers();
 		this.#heartbeat.stop();
 		this.#settleConnect(
 			new WSTerminatedError(CLOSE.CLIENT_GONE, "disconnect() called"),
 		);
-		this.#closeSocket(CLOSE.CLIENT_GONE, "client disconnect");
+		const reason = "client disconnect";
+		const closed = this.#socket !== null;
+		this.#closeSocket(CLOSE.CLIENT_GONE, reason);
+		if (closed) {
+			this.#emit("close", {
+				code: CLOSE.CLIENT_GONE,
+				reason,
+				willReconnect: false,
+			});
+		}
 		this.#settleInFlight();
 		this.#setState("idle");
 	}
@@ -801,7 +814,6 @@ export class WSClient<TAuth = unknown> {
 		}
 		if (!this.#setState("connecting")) return;
 
-		this.#intentional = false;
 		this.#terminalError = null;
 		const generation = ++this.#generation;
 		let socket: WebSocket;
@@ -985,8 +997,7 @@ export class WSClient<TAuth = unknown> {
 		this.#socket = null;
 
 		const terminal = this.#terminalCodes.includes(code);
-		const willReconnect = !this.#intentional && !terminal &&
-			this.#state !== "disposed";
+		const willReconnect = !terminal && this.#state !== "disposed";
 
 		this.logger?.debug?.(
 			`closed (${code}${reason ? ` ${reason}` : ""}), reconnect=${willReconnect}`,
