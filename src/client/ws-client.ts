@@ -827,6 +827,9 @@ export class WSClient<TAuth = unknown> {
 		}
 
 		this.#socket = socket;
+		// Without this a binary frame arrives as a Blob, which no synchronous
+		// decoder can read — the `WSDecoder` contract promises an `ArrayBuffer`.
+		socket.binaryType = "arraybuffer";
 		this.logger?.debug?.(`connecting to ${this.#url.href}`);
 
 		socket.onopen = () => {

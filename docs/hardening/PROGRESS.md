@@ -32,7 +32,7 @@ Verify: deno publish --dry-run --allow-dirty
 | ✅     | T03 | T02                                             | Client: settle in-flight frames the moment the socket closes               | [02](./02-client.md) #2           | —      |
 | ✅     | T04 | T03                                             | Client: fail sends fast on terminated state and encode errors              | [02](./02-client.md) #3           | —      |
 | ✅     | T07 | T03                                             | Client: emit `close` on a local `disconnect()`; retire `#intentional`      | [02](./02-client.md) #6           | —      |
-| ⬜     | T05 | —                                               | Client: receive binary frames as `ArrayBuffer`                             | [02](./02-client.md) #4           | —      |
+| ✅     | T05 | —                                               | Client: receive binary frames as `ArrayBuffer`                             | [02](./02-client.md) #4           | —      |
 | ⬜     | T06 | —                                               | Client: a stale `auth()` rejection must not close a newer socket           | [02](./02-client.md) #5           | —      |
 | ⬜     | T09 | T01                                             | Server: one handshake per socket; no ghost registration                    | [01](./01-server.md) #3           | —      |
 | ⬜     | T10 | —                                               | Server: opt-in `allowedOrigins` check on the upgrade                       | [01](./01-server.md) #4           | —      |
@@ -50,6 +50,11 @@ left out are listed under "Deliberately omitted" in the overview, each with its 
 
 ## Decisions log
 
+- **2026-09-04** — The client sets `socket.binaryType = "arraybuffer"` on every socket it
+  opens; `PROTOCOL.md` now says so instead of claiming the default decoder accepts binary
+  frames. No open question: the `WSDecoder` contract already promises `string |
+  ArrayBuffer`, so a `Blob` was never a shape anything could handle, and no consumer can
+  have relied on it. (T05)
 - **2026-09-04** — A send issued in the `terminated` state rejects at once with the
   `WSTerminatedError` of that close, kept in its own `#terminalError` field so a later
   handler-thrown `#lastError` cannot mask it; a frame the encoder refuses rejects with the

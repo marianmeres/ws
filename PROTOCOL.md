@@ -53,8 +53,9 @@ Ten things the client relies on. Everything else in this document is detail.
 - WebSocket, RFC 6455. Any path — the client is configured with the full URL
   (the default is `/ws` on the page origin). Subprotocols are not used.
 - One frame = one JSON object = one WebSocket text message. No batching, no
-  delimiters. The client's default decoder also accepts binary frames (decoded as
-  UTF-8 text) and the reference server tolerates them too, but send text.
+  delimiters. The client sets `binaryType` to `arraybuffer` and the reference
+  server's sockets already default to it, so a binary frame decodes as UTF-8 JSON
+  by default and a custom decoder receives an `ArrayBuffer` — but send text.
 - `type` is the discriminator. Unknown fields must be ignored. Optional fields are
   simply absent.
 - `payload` is **opaque**. Never inspect, validate or mutate it beyond a size
