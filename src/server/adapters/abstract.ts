@@ -14,14 +14,17 @@
  * @module
  */
 
-import type { WSMessage } from "../../protocol/frames.ts";
+import type { WSRoomMessage } from "../../protocol/frames.ts";
 
-/** A message crossing the instance boundary. */
+/**
+ * A room message crossing the instance boundary. Direct messages
+ * (`WSService.send()`) are instance-local and never travel through here.
+ */
 export interface WSBroadcastEnvelope {
 	/** Target namespace, or `null` for a cross-namespace broadcast. */
 	namespace: string | null;
 	/** The message as it was delivered locally. */
-	message: WSMessage;
+	message: WSRoomMessage;
 }
 
 /** Propagates messages between server instances. */

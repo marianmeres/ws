@@ -5,11 +5,27 @@ runs only on Deno. This document describes the wire protocol precisely enough to
 implement a compatible server in **any language**, so that the stock client works
 against it unchanged.
 
-Section 9 contains a complete Python implementation. It passes the conformance
-script in Appendix A, which drives the real client against it. Use both as the
-executable half of this specification.
+The protocol has two layers:
 
-Written against `@marianmeres/ws` 0.3.0, **protocol version 1**. The normative
+- **Core — required.** A handshake, messages in both directions (optionally
+  acknowledged, optionally answered with a reply), and a heartbeat. This is a
+  plain data channel between the client and _the server_, and it is all a server
+  has to implement.
+- **Rooms extension — optional.** Namespaces, rooms, publishing between clients,
+  presence and broadcast: the server as a relay. The client sends these frames
+  only when the application calls the rooms API (`subscribe()`, `publish()`,
+  `broadcast()`), so a core-only server never sees them — and if one arrives
+  anyway, it answers `unsupported` and the client fails fast.
+
+**Implementing only the core?** Read sections 1–4, 6–8 and Appendix A; skip 5
+and 9. Section 8 is a complete core server in Python: about 135 lines of code,
+plus the comments explaining them.
+
+Both Python servers (sections 8 and 9) pass the conformance script in Appendix
+A, which drives the real client against them. Use them as the executable half of
+this specification.
+
+Written against `@marianmeres/ws` 0.5.0, **protocol version 2**. The normative
 definitions live in the package's `src/protocol/` (`constants.ts`, `frames.ts`),
 also published dependency-free as `@marianmeres/ws/protocol`.
 
@@ -17,33 +33,46 @@ also published dependency-free as `@marianmeres/ws/protocol`.
 
 ## 1. The short version
 
-Ten things the client relies on. Everything else in this document is detail.
+### Core — every server
+
+Seven rules. Everything else in the core is detail.
 
 1. Transport is a standard WebSocket. Every **frame** is one JSON object with a
    string `type` field, sent as one UTF-8 **text** WebSocket message.
-2. The first frame the client sends is `auth`. Reply with `hello` within **10 s**
-   or the client drops the socket and retries.
+2. The first frame the client sends is `auth`, carrying the application's
+   credentials in `payload`. Reply `{"type": "hello", "protocol": 2}` within
+   **10 s**, or the client drops the socket and retries.
 3. Reject authentication by closing with code **4001**. That, and 4003, are the
    only codes after which the client stops reconnecting. Every other close code
    — including a plain 1000 — makes it reconnect.
-4. Every `sub`, `unsub`, `pub` and `broadcast` carries an `id`. Answer each with
-   exactly one `ack` or `nack` echoing that `id`. The client waits 30 s, then
-   fails the operation.
-5. Answer every `ping` with `pong`. The client pings every 25 s and drops the
-   socket 10 s after an unanswered ping.
-6. A room is scoped by `(room, namespace)`. A `pub` is delivered as a `msg` to
-   every subscriber of that pair — **including the publisher** when it is
-   subscribed itself.
-7. A client may publish only into its own namespace. `broadcast` crosses
-   namespaces and must be denied (`nack`, code `forbidden`) unless you explicitly
-   allow it.
-8. Presence is opt-in per subscription: a `sync` snapshot to the subscriber, then
-   `join`/`leave` deltas to the other presence subscribers of the room.
-9. Handle the frames of one connection strictly in order. Right after `hello` the
-   client re-sends all its subscriptions and then flushes buffered publishes
-   without waiting for the ack — if a `pub` overtakes the `sub`, it lands in a
-   room the server has not registered yet.
-10. When a second connection authenticates with a client id that is already
+4. A client message is `{"type": "msg", "payload": …}`. **Without an `id`** it
+   is fire-and-forget: handle it, send nothing back. **With an `id`** the client
+   is waiting: answer with exactly one `ack` — optionally carrying a reply in
+   `payload` — or one `nack`, echoing the `id`. The client gives up after 30 s.
+5. Send the client a message at any time with `{"type": "msg", "payload": …}`.
+6. Answer every `ping` with `pong`, **promptly — even while a message is still
+   being handled.** The client pings every 25 s and drops the socket 10 s after
+   an unanswered ping.
+7. Any other frame: reply `nack` with code `unsupported` if it carries an `id`,
+   an `error` with the same code if it does not. Never silently ignore a frame
+   with an `id` — the client would wait 30 s for an answer.
+
+### Rooms extension — only if you want rooms
+
+8. `hello` also carries the connection's `clientId` and `namespace`.
+9. A room is scoped by `(room, namespace)`. A `pub` is delivered as a `msg` —
+   with `room`, `namespace`, `from` and `timestamp` — to every subscriber of
+   that pair, **including the publisher** when it is subscribed itself.
+10. A client may publish only into its own namespace. `broadcast` crosses
+    namespaces and must be denied (`nack`, code `forbidden`) unless you
+    explicitly allow it.
+11. Presence is opt-in per subscription: a `sync` snapshot to the subscriber,
+    then `join`/`leave` deltas to the other presence subscribers of the room.
+12. Handle a connection's rooms frames strictly in order. Right after `hello` the
+    client re-sends all its subscriptions and then flushes buffered publishes
+    without waiting for the ack — if a `pub` overtakes the `sub`, it lands in a
+    room the server has not registered yet.
+13. When a second connection authenticates with a client id that is already
     connected, close the old one with 1001 and keep the new one.
 
 ---
@@ -52,8 +81,9 @@ Ten things the client relies on. Everything else in this document is detail.
 
 **Terminology.** _Frame_ in this document means one JSON protocol envelope,
 carried in exactly one WebSocket text message — not an RFC 6455 fragment.
-_Message_ means the application-level object a `msg` frame delivers (`room`,
-`namespace`, `from`, `payload`, `timestamp`).
+_Message_ means the application-level object a `msg` frame carries: its
+`payload`, plus the routing fields `room`, `namespace`, `from` and `timestamp`
+when it was delivered through a room.
 
 - WebSocket, RFC 6455. Any path — the client is configured with the full URL
   (the default is `/ws` on the page origin). Subprotocols are not used.
@@ -65,9 +95,10 @@ _Message_ means the application-level object a `msg` frame delivers (`room`,
 - `type` is the discriminator. Unknown fields must be ignored. Optional fields are
   simply absent.
 - `payload` is **opaque**. Never inspect, validate or mutate it beyond a size
-  limit. Any JSON value is legal, including `null`. The application puts its own
-  protocol inside, and that protocol may have its own `type` field — the two
-  never collide.
+  limit — unless it is addressed to your own application (a client `msg`), in
+  which case it is yours to interpret. Any JSON value is legal, including
+  `null`. The application puts its own protocol inside, and that protocol may
+  have its own `type` field — the two never collide.
 - Correlation ids (`id`) are opaque strings generated by the client (currently
   12 base-36 characters, but never rely on that). Echo them verbatim.
 - Unknown frame types received by the client are logged and ignored, so a server
@@ -75,20 +106,18 @@ _Message_ means the application-level object a `msg` frame delivers (`room`,
 
 ---
 
-## 3. Connection lifecycle
+## 3. The core protocol
 
 ```
 client                                            server
   │── WebSocket upgrade ───────────────────────────▶│
   │◀─ 101 Switching Protocols ─────────────────────│
-  │── auth {payload, namespace, clientId?} ────────▶│  authenticate payload
-  │◀─ hello {clientId, namespace, protocol} ───────│  (or close 4001)
-  │── sub {rooms: [...]} ──────────────────────────▶│  register rooms
-  │◀─ presence {event: "sync"} (per presence room) ─│
-  │◀─ ack {id} ────────────────────────────────────│
-  │── pub {room, payload} ─────────────────────────▶│  deliver to (room, namespace)
-  │◀─ msg {room, namespace, from, payload, ts} ────│  (publisher included)
-  │◀─ ack {id, recipients} ────────────────────────│
+  │── auth {payload} ──────────────────────────────▶│  authenticate payload
+  │◀─ hello {protocol} ────────────────────────────│  (or close 4001)
+  │── msg {payload} ───────────────────────────────▶│  fire-and-forget: handle it
+  │── msg {id, payload} ───────────────────────────▶│  handle it, then answer:
+  │◀─ ack {id, payload?} ──────────────────────────│  (or nack {id, error})
+  │◀─ msg {payload} ───────────────────────────────│  push, whenever you like
   │── ping ────────────────────────────────────────▶│  every 25 s
   │◀─ pong ────────────────────────────────────────│  within 10 s, or the client drops
 ```
@@ -98,23 +127,19 @@ client                                            server
 The client opens the socket and sends `auth` as its very first frame:
 
 ```json
-{
-	"type": "auth",
-	"id": "k3j9x0a1b2c3",
-	"protocol": 1,
-	"payload": { "token": "eyJhbGciOi…" },
-	"clientId": "alice",
-	"namespace": "org-1"
-}
+{ "type": "auth", "protocol": 2, "payload": { "token": "eyJhbGciOi…" } }
 ```
 
 | Field       | Type             | Notes                                                                                                          |
 | ----------- | ---------------- | -------------------------------------------------------------------------------------------------------------- |
-| `id`        | string           | Present, but **not acknowledged** — `hello` is the reply. Do not send an `ack` for it.                         |
-| `protocol`  | number           | Always `1`.                                                                                                    |
+| `protocol`  | number           | `2`. Informational; nothing to negotiate.                                                                      |
 | `payload`   | any              | Whatever the application's `auth()` callback returned; `null` when it has none. This is what you authenticate. |
-| `clientId`  | string, optional | The id the client would like. Sent only when the application configured one.                                   |
-| `namespace` | string           | Requested namespace. Always sent; `"default"` when the application did not choose one.                         |
+| `clientId`  | string, optional | The id the client would like — rooms extension (5.1). Sent only when the application configured one.           |
+| `namespace` | string, optional | The namespace it would like — rooms extension (5.1). Sent only when the application configured one.            |
+
+A core server ignores `clientId` and `namespace`. A protocol-1 client also sends
+an `id` here and always sends `namespace`; ignore both — `auth` is never
+acknowledged, `hello` is the reply.
 
 The server then:
 
@@ -124,83 +149,107 @@ The server then:
    be sent first. Use **4003** (`FORBIDDEN`) for "valid credentials, but not
    allowed here". Both are terminal for the client: it stops retrying, rejects a
    pending `connect()` and emits `terminated`.
-3. On success resolves the identity, evicts a duplicate (3.2), registers the
-   connection and sends:
+3. On success sends:
 
 ```json
-{ "type": "hello", "clientId": "alice", "namespace": "org-1", "protocol": 1 }
+{ "type": "hello", "protocol": 2 }
 ```
 
-Identity resolution, first match wins:
-
-| Field       | 1st                         | 2nd                               | 3rd                     |
-| ----------- | --------------------------- | --------------------------------- | ----------------------- |
-| `clientId`  | assigned by your auth logic | `clientId` from the `auth` frame  | generated by the server |
-| `namespace` | assigned by your auth logic | `namespace` from the `auth` frame | `"default"`             |
-
-The client adopts whatever `hello` says — the server's values win over its own
-request.
-
-**Security.** The client's proposals are hints. In production derive both from
-the verified identity (`clientId` from the user id, `namespace` from the tenant),
-otherwise any client can claim any id — and evict its rightful owner, see 3.2 —
-or join any namespace.
+`protocol` is required. `clientId` and `namespace` belong to the rooms extension
+(5.1): a core server may omit them, and the client then reports `clientId` as
+`null` and `namespace` as whatever it requested (`"default"` if nothing).
 
 **Timing.**
 
 - The client waits **10 s** for `hello` after sending `auth`. Then it closes
   with 4002 and reconnects. If your authentication calls something slow, `hello`
   must still go out within that budget.
-- The reference server gives the client **5 s** to send `auth`, then closes with
+- The reference servers give the client **5 s** to send `auth`, then close with
   4002 (`AUTH_TIMEOUT`). The stock client sends `auth` as soon as its `auth()`
   callback resolves, so this only ever affects a misbehaving client.
 - Any non-`auth` frame before authentication: reply with an `error` frame, code
   `unauthorized`, and keep the socket open. The stock client never does this.
 - A second `auth` is ignored — both on an authenticated connection and on one
-  whose first handshake is still in flight, so `verify` runs at most once per
-  socket and at most one `hello` goes out.
-- A socket that closes while `verify` is pending is never registered. The
-  handshake's result is dropped: the close already ran, so nothing would ever
-  remove the entry.
+  whose first handshake is still in flight — so authentication runs at most once
+  per socket and at most one `hello` goes out.
+- A socket that closes while authentication is pending is never registered.
 - A `protocol` mismatch in `hello` only produces a client-side warning, so bump
   the version only for a genuinely breaking change.
 
-### 3.2 One connection per client id
+**Token refresh** needs nothing from the server: the client calls its `auth()`
+callback again before every reconnect, so each new socket authenticates with a
+fresh payload.
 
-When a connection authenticates with an id that is already registered: close the
-existing connection with **1001** (reason, e.g., `replaced by new connection`),
-remove it from every room — emitting `leave` presence events — and register the
-newcomer. Make sure the old socket's close handler does not remove the _new_
-registration when it eventually fires.
+### 3.2 Messages
 
-Why: after a half-open drop (laptop lid, mobile handover) the client reconnects
-with the same id while the server still believes the old socket is alive.
-Newcomer-wins is what makes that recover instead of accumulating ghosts.
+**Client → server.** What the application's `ws.send(payload)` produces:
 
-Consequence: ids must be unique per connection **by contract**. Two tabs sharing
-an id will evict each other forever, because 1001 is a reconnecting code. The
-usual scheme is `"<user-id>#<per-tab-suffix>"`.
+```json
+{ "type": "msg", "payload": { "op": "typing" } }
+```
 
-### 3.3 Immediately after `hello`, and after every reconnect
+```json
+{ "type": "msg", "id": "k3j9x0a1b2c3", "payload": { "op": "load", "doc": 42 } }
+```
 
-The client does the following, in this order, without waiting in between:
+- **No `id`** — fire-and-forget (`ws.send(payload)`). Handle it and send nothing
+  back. The client considered it done the moment it wrote it to the socket. If
+  handling fails you _may_ report it with an `error` frame (section 6); the
+  client surfaces that as an `error` event, uncorrelated.
+- **With an `id`** — the client is waiting (`ws.send(payload, { ack: true })`).
+  Answer with exactly one of:
 
-1. Sends **one** `sub` frame listing every room it holds, with `presence: true`
-   where a presence handler is attached.
-2. Flushes every `pub` / `broadcast` it buffered while disconnected.
+```json
+{ "type": "ack", "id": "k3j9x0a1b2c3", "payload": { "title": "Doc 42" } }
+```
 
-Server obligation: process the frames of one connection in arrival order, and
-have the rooms from a `sub` registered before you look at the next frame. A
-design that handles frames concurrently (a task per frame) violates this and
-loses the flushed publishes. Sequential per-connection handling is the simplest
-correct choice; the Python implementation does exactly that.
+```json
+{
+	"type": "nack",
+	"id": "k3j9x0a1b2c3",
+	"error": { "code": "not_found", "message": "no such document" }
+}
+```
 
-From the server's point of view a reconnect is a brand-new connection: the client
-runs `auth` again with a freshly produced payload (which is how token refresh
-works), receives `hello`, re-subscribes, and presence subscribers of each room see
-a `leave` for the old socket followed by a `join` for the new one.
+The ack's `payload` is the reply: any JSON value, and the client's `send()`
+resolves with it. Omit it for a bare acknowledgement; the client then resolves
+with `undefined` (while an explicit `null` resolves with `null`). A `nack`
+rejects the client's `send()` with a `WSRemoteError` carrying `error.code` and
+`error.message` unchanged — so besides the standard codes of section 6 you can
+use codes of your own (`not_found`, `invalid_doc`, …) and the application can
+branch on them. `message` is for humans; clients should never parse it.
 
-### 3.4 Heartbeat
+The client waits **30 s** (its `sendTimeout`) for the answer, counted from the
+moment the application called `send()` — so a message buffered while offline
+spends part of that budget in the queue.
+
+**Server → client.** Send a message at any time after `hello`:
+
+```json
+{ "type": "msg", "payload": { "op": "progress", "done": 42 } }
+```
+
+It reaches the application through the client's `message` event. Nothing but
+`payload` is needed. Do not add `room` unless you implement the rooms extension:
+a `msg` carrying `room` is a room delivery (5.4) and is also routed to that
+room's handlers.
+
+**Order.** Frames of one connection arrive in the order they were sent. The
+protocol does not require you to _handle_ messages in that order — replies are
+correlated by `id` — but a data channel is generally expected to behave like
+one, and both Python servers handle a connection's messages one at a time, in
+arrival order. Whatever you choose, never let message handling delay a `pong`
+(3.3).
+
+**Delivery** is at-most-once. The client buffers messages while it is offline
+(up to 100 by default) and flushes them right after the next `hello`, in order,
+without waiting for anything. A message that was already written when the
+socket died is not resent: the client rejects an acknowledged one with
+`WSConnectionLostError`, and cannot even know about a fire-and-forget one. If
+the application needs stronger guarantees, it builds them on top (idempotency
+keys, a resync request after reconnect).
+
+### 3.3 Heartbeat
 
 Client → `{"type":"ping"}` every 25 s by default. Server → `{"type":"pong"}`,
 immediately. Neither carries an id.
@@ -209,12 +258,40 @@ The client counts **any** inbound frame as proof of life, not just `pong`. It
 drops the socket (close 4008, then reconnects) when 10 s pass after a ping with
 no inbound frame at all.
 
+That makes the pong the one thing that must never wait behind application
+work. A server that reads a frame, awaits a 15-second request handler and only
+then reads the next frame answers the ping queued behind it too late: the client
+closes the socket mid-request and the reply is lost. Answer `ping` in the read
+loop and run handlers elsewhere — a task or a per-connection queue, as the
+Python servers do.
+
 On the server, reap connections that have been silent for longer than the
 client's ping interval plus margin. The reference uses **60 s** and closes with
 **4008** (`IDLE_TIMEOUT`). Any inbound frame counts as activity.
 
 Do not substitute WebSocket protocol-level ping/pong: browsers do not expose
 them, which is why liveness lives at the application level.
+
+### 3.4 Unsupported frames
+
+Anything else an authenticated client sends — the rooms frames of section 5 on
+a core-only server, or a frame type from a future protocol version — is
+answered, never ignored:
+
+```json
+{
+	"type": "nack",
+	"id": "p8q2r5s7t9u1",
+	"error": { "code": "unsupported", "message": "not supported here" }
+}
+```
+
+…when it carries a string `id`, and an uncorrelated `error` frame with the same
+code when it does not. Keep the socket open.
+
+This single rule is what makes the rooms extension optional: a `subscribe()`
+against a core-only server rejects at once with `WSRemoteError` code
+`unsupported`, instead of timing out 30 s later.
 
 ### 3.5 Closing
 
@@ -240,9 +317,11 @@ becomes visible again. Expect a fleet to come back within seconds of a restart.
 Graceful shutdown: close every socket with 1001 (or 1000). Clients reconnect,
 which is what a rolling deploy wants.
 
-Whenever a connection closes, for any reason: remove it from every room, send
-`leave` to the presence subscribers of those rooms, and forget it — but only
-drop the registry entry if it still points at this socket (3.2).
+From the server's point of view a reconnect is a brand-new connection: the
+client runs `auth` again with a freshly produced payload, receives `hello`, and
+flushes whatever it buffered meanwhile. Nothing carries over from the previous
+socket; whenever a connection closes, for any reason, forget it (with rooms,
+also 5.2).
 
 ---
 
@@ -250,14 +329,35 @@ drop the registry entry if it still points at this socket (3.2).
 
 ### 4.1 Client → server
 
-| `type`      | Fields                                                | Reply                                      |
-| ----------- | ----------------------------------------------------- | ------------------------------------------ |
-| `auth`      | `id`, `protocol`, `payload`, `clientId?`, `namespace` | `hello`, or close 4001/4003                |
-| `sub`       | `id`, `rooms: [{room, presence?}]`                    | `presence` sync (per presence room), `ack` |
-| `unsub`     | `id`, `rooms: [string]`                               | `ack`                                      |
-| `pub`       | `id`, `room`, `payload`, `namespace?`                 | `ack` with `recipients`, or `nack`         |
-| `broadcast` | `id`, `room`, `payload`                               | `ack` with `recipients`, or `nack`         |
-| `ping`      | —                                                     | `pong`                                     |
+| `type`      | Layer | Fields                                           | Reply                                              |
+| ----------- | ----- | ------------------------------------------------ | -------------------------------------------------- |
+| `auth`      | core  | `protocol`, `payload`, `clientId?`, `namespace?` | `hello`, or close 4001/4003                        |
+| `msg`       | core  | `payload`, `id?`                                 | with `id`: `ack` (with an optional reply) / `nack` |
+| `ping`      | core  | —                                                | `pong`                                             |
+| `sub`       | rooms | `id`, `rooms: [{room, presence?}]`               | `presence` sync (per presence room), `ack`         |
+| `unsub`     | rooms | `id`, `rooms: [string]`                          | `ack`                                              |
+| `pub`       | rooms | `id`, `room`, `payload`, `namespace?`            | `ack` with `recipients`, or `nack`                 |
+| `broadcast` | rooms | `id`, `room`, `payload`                          | `ack` with `recipients`, or `nack`                 |
+
+A core-only server answers every `rooms` frame with `nack` `unsupported` (3.4).
+
+**`auth`** — see 3.1.
+
+```json
+{ "type": "auth", "protocol": 2, "payload": { "token": "…" }, "namespace": "org-1" }
+```
+
+**`msg`** — see 3.2. `id` present only when the client awaits an answer.
+
+```json
+{ "type": "msg", "id": "k3j9x0a1b2c3", "payload": { "op": "load", "doc": 42 } }
+```
+
+**`ping`** — liveness probe, no id.
+
+```json
+{ "type": "ping" }
+```
 
 **`sub`** — join one or more rooms in the connection's namespace. Idempotent:
 re-subscribing an already joined room is legal and is how the client turns
@@ -297,41 +397,45 @@ client only sends it when the application passes one explicitly).
 }
 ```
 
-**`ping`** — liveness probe, no id.
-
-```json
-{ "type": "ping" }
-```
-
 ### 4.2 Server → client
 
-| `type`     | Fields                                                           | What the client does                                               |
-| ---------- | ---------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `hello`    | `clientId`, `namespace`, `protocol`                              | Becomes connected; adopts id and namespace; re-subscribes; flushes |
-| `ack`      | `id`, `recipients?`                                              | Resolves the pending request; missing `recipients` reads as 0      |
-| `nack`     | `id`, `error: {code, message}`                                   | Rejects the pending request with `code` and `message`              |
-| `msg`      | `room`, `namespace`, `from`, `payload`, `timestamp`              | Delivers to the handlers of `room`                                 |
-| `presence` | `event`, `room`, `namespace`, `clientId`, `members`, `timestamp` | Updates cached membership of `room`; calls presence handlers       |
-| `pong`     | —                                                                | Nothing beyond proof of life                                       |
-| `error`    | `error: {code, message}`                                         | Emits an `error` event; the connection stays up                    |
+| `type`     | Layer | Fields                                                              | What the client does                                                   |
+| ---------- | ----- | ------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `hello`    | core  | `protocol`, `clientId?`, `namespace?`                               | Becomes connected; adopts any id and namespace; re-subscribes; flushes |
+| `ack`      | core  | `id`, `payload?`, `recipients?`                                     | Resolves the pending request — with `payload`, or with `recipients`    |
+| `nack`     | core  | `id`, `error: {code, message}`                                      | Rejects the pending request with `code` and `message`                  |
+| `msg`      | core  | `payload`; with rooms also `room`, `namespace`, `from`, `timestamp` | Emits a `message` event; with `room`, also calls that room's handlers  |
+| `pong`     | core  | —                                                                   | Nothing beyond proof of life                                           |
+| `error`    | core  | `error: {code, message}`                                            | Emits an `error` event; the connection stays up                        |
+| `presence` | rooms | `event`, `room`, `namespace`, `clientId`, `members`, `timestamp`    | Updates cached membership of `room`; calls presence handlers           |
 
 An `ack`/`nack` for an unknown `id` is ignored. Unknown frame types are ignored.
 
-**`hello`** — all three fields required.
+**`hello`** — `protocol` required; `clientId` and `namespace` required by the
+rooms extension, optional otherwise.
 
 ```json
-{ "type": "hello", "clientId": "alice", "namespace": "org-1", "protocol": 1 }
+{ "type": "hello", "protocol": 2 }
 ```
 
-**`ack`** — `recipients` is an integer ≥ 0 and belongs on `pub`/`broadcast` acks
-only; omit it on `sub`/`unsub` acks.
+```json
+{ "type": "hello", "protocol": 2, "clientId": "alice", "namespace": "org-1" }
+```
+
+**`ack`** — echoes the request's `id`. On a `msg` ack, `payload` is the optional
+reply. On a `pub`/`broadcast` ack, `recipients` is an integer ≥ 0. Omit both on
+`sub`/`unsub` acks.
+
+```json
+{ "type": "ack", "id": "k3j9x0a1b2c3", "payload": { "title": "Doc 42" } }
+```
 
 ```json
 { "type": "ack", "id": "b3c5d7e9f1g2", "recipients": 2 }
 ```
 
-**`nack`** — `error.code` is one of the codes in section 7; `error.message` is
-free-form text for humans and is never parsed.
+**`nack`** — `error.code` is one of the codes in section 6 or, for a `msg`, one
+of your own; `error.message` is free-form text for humans and is never parsed.
 
 ```json
 {
@@ -341,11 +445,20 @@ free-form text for humans and is never parsed.
 }
 ```
 
-**`msg`** — a delivered message. Everything except `type` is handed to the
-application as-is, so the field names are the API. The client routes by `room`
-alone: it must be exactly the string the client subscribed with. `from` is the
-publisher's client id, or `null` for a message injected by server-side code.
-`timestamp` is the server clock, integer epoch milliseconds.
+**`msg`** — a message for the application. Everything except `type` is handed to
+it as-is, so the field names are the API.
+
+A direct message (core) carries only `payload`:
+
+```json
+{ "type": "msg", "payload": { "op": "progress", "done": 42 } }
+```
+
+A room delivery (rooms extension) carries the routing fields too. The client
+routes it by `room` alone, which must be exactly the string the client
+subscribed with. `from` is the publisher's client id, or `null` for a message
+injected by server-side code. `timestamp` is the server clock, integer epoch
+milliseconds.
 
 ```json
 {
@@ -386,7 +499,75 @@ membership of `(room, namespace)` _after_ the event.
 
 ---
 
-## 5. Rooms, namespaces and publishing
+## 5. The rooms extension
+
+Everything in this section is optional. Skip it if the application only talks
+to the server.
+
+### 5.1 Identity
+
+With rooms, `hello` carries the connection's identity:
+
+```json
+{ "type": "hello", "protocol": 2, "clientId": "alice", "namespace": "org-1" }
+```
+
+Resolve it from the `auth` frame, first match wins:
+
+| Field       | 1st                         | 2nd                               | 3rd                     |
+| ----------- | --------------------------- | --------------------------------- | ----------------------- |
+| `clientId`  | assigned by your auth logic | `clientId` from the `auth` frame  | generated by the server |
+| `namespace` | assigned by your auth logic | `namespace` from the `auth` frame | `"default"`             |
+
+The client adopts whatever `hello` says — the server's values win over its own
+request.
+
+**Security.** The client's proposals are hints. In production derive both from
+the verified identity (`clientId` from the user id, `namespace` from the tenant),
+otherwise any client can claim any id — and evict its rightful owner, see 5.2 —
+or join any namespace.
+
+### 5.2 One connection per client id
+
+When a connection authenticates with an id that is already registered: close the
+existing connection with **1001** (reason, e.g., `replaced by new connection`),
+remove it from every room — emitting `leave` presence events — and register the
+newcomer. Make sure the old socket's close handler does not remove the _new_
+registration when it eventually fires.
+
+Why: after a half-open drop (laptop lid, mobile handover) the client reconnects
+with the same id while the server still believes the old socket is alive.
+Newcomer-wins is what makes that recover instead of accumulating ghosts.
+
+Consequence: ids must be unique per connection **by contract**. Two tabs sharing
+an id will evict each other forever, because 1001 is a reconnecting code. The
+usual scheme is `"<user-id>#<per-tab-suffix>"`.
+
+Whenever a connection closes, for any reason: remove it from every room, send
+`leave` to the presence subscribers of those rooms, and forget it — but only
+drop the registry entry if it still points at this socket.
+
+### 5.3 Subscriptions, and the order after every reconnect
+
+Immediately after `hello`, the client does the following, in this order, without
+waiting in between:
+
+1. Sends **one** `sub` frame listing every room it holds, with `presence: true`
+   where a presence handler is attached.
+2. Flushes everything it buffered while disconnected — `pub`, `broadcast` and
+   `msg` frames alike.
+
+Server obligation: process the rooms frames of one connection in arrival order,
+and have the rooms from a `sub` registered before you look at the next frame. A
+design that handles frames concurrently (a task per frame) violates this and
+loses the flushed publishes. Handling `sub`/`unsub`/`pub`/`broadcast` inline in
+the read loop is the simplest correct choice; the Python reference does that,
+and queues only `msg` frames for its message worker.
+
+A reconnect is a brand-new connection: presence subscribers of each room see a
+`leave` for the old socket followed by a `join` for the new one.
+
+### 5.4 Rooms, namespaces and publishing
 
 Keep an index `(room, namespace) → set of client ids`. Rooms exist implicitly —
 there is no creation step and no listing.
@@ -416,7 +597,8 @@ only sockets on the instance that handled the frame.
 
 **Server-side injection.** Your own code can push into rooms with the same `msg`
 frame and `from: null`. That is how applications tell server pushes from peer
-traffic. Nothing else distinguishes them.
+traffic in a room. (A direct message, 3.2, is the other way to reach a client:
+one connection, no room.)
 
 **Broadcast.** Deliver to `(room, ns)` for _every_ namespace `ns` that has
 subscribers to `room`. Each receiver sees `namespace` = **its own** namespace,
@@ -425,15 +607,12 @@ by default: reply `nack` with code `forbidden` and message such as
 `broadcast not permitted` unless your policy allows this sender into this room.
 On success, `ack` with `recipients` counted across all namespaces.
 
-**Delivery guarantee** is at-most-once. The server keeps no history and never
-replays; a message that was in flight when a socket died is gone, and the client
-will not resend it (it fails the publish after 30 s). If the application needs a
-backlog, that is an application-level concern (an HTTP history endpoint, for
-instance) — not part of this protocol.
+**Delivery guarantee** is at-most-once, as in the core. The server keeps no
+history and never replays. If the application needs a backlog, that is an
+application-level concern (an HTTP history endpoint, for instance) — not part of
+this protocol.
 
----
-
-## 6. Presence
+### 5.5 Presence
 
 Presence is per subscription, not per room: each connection declares in its
 `sub` whether it wants to be _told_ about membership. Membership itself counts
@@ -465,39 +644,46 @@ instead. Presence never crosses namespaces, even though broadcast does.
 
 ---
 
-## 7. Errors
+## 6. Errors
 
 Two shapes, one rule: `nack` answers a specific request (it carries the `id`),
 `error` is uncorrelated. Neither closes the connection on the client side; a
 `nack` surfaces to the application as a rejected promise carrying `code`, an
-`error` frame as an event.
+`error` frame as an `error` event.
 
-| `code`         | Use it for                                                                      |
-| -------------- | ------------------------------------------------------------------------------- |
-| `unauthorized` | Any non-`auth` frame before the handshake completed                             |
-| `forbidden`    | Publishing into a foreign namespace; a denied broadcast                         |
-| `bad_request`  | Malformed or nonsensical frame (missing `type`, unknown `type`, missing `room`) |
-| `rate_limited` | Frame rate cap exceeded                                                         |
-| `internal`     | Unexpected server-side failure                                                  |
+| `code`         | Layer | Use it for                                                                     |
+| -------------- | ----- | ------------------------------------------------------------------------------ |
+| `unauthorized` | core  | Any non-`auth` frame before the handshake completed                            |
+| `bad_request`  | core  | Malformed frame: missing `type`; with rooms, missing `room`, non-array `rooms` |
+| `unsupported`  | core  | A frame type this server does not implement (3.4)                              |
+| `rate_limited` | core  | Frame rate cap exceeded                                                        |
+| `internal`     | core  | Unexpected server-side failure — never with the exception's text               |
+| `forbidden`    | rooms | Publishing into a foreign namespace; a denied broadcast                        |
+| _your own_     | core  | Refusing a client `msg` for an application reason (`not_found`, …)             |
 
 Reference behaviour for malformed input:
 
 - Not valid JSON: send `error` `bad_request`, then close with **4400**.
-- Valid JSON without a string `type`, or an unknown `type`: send `error`
+- Valid JSON that is not an object, or has no string `type`: send `error`
   `bad_request`, keep the socket.
+- An unknown `type`: `unsupported`, as in 3.4. Keep the socket.
+- A `msg` whose `id` is not a non-empty string: treat it as fire-and-forget.
+- Your message handler fails: answer `internal` — `nack` when the `msg` had an
+  `id`, `error` when not — and keep the socket. It is an application failure,
+  not a broken connection. Log the details; do not send them.
 - `sub`/`unsub` whose `rooms` is not an array, or `pub`/`broadcast` without a
   non-empty string `room`: send `nack` `bad_request`, keep the socket. Malformed
   entries _inside_ a well-formed `rooms` array are skipped silently.
-- An unexpected failure while handling an otherwise well-formed frame: send
-  `error` `internal`, then close with **1011**. A handler that threw may have
-  left the connection's bookkeeping half-applied; 1011 is recoverable, so the
+- An unexpected failure in the server's own frame handling (not the
+  application's handler): send `error` `internal`, then close with **1011**. The
+  connection's bookkeeping may be half-applied; 1011 is recoverable, so the
   client reconnects into clean state.
 
 ---
 
-## 8. Limits
+## 7. Limits
 
-These are the reference server's values. Implementing them is recommended, not
+These are the reference servers' values. Implementing them is recommended, not
 required; if you do, reuse the close codes. All of them are recoverable, so the
 client reconnects.
 
@@ -508,29 +694,425 @@ client reconnects.
 | Frame size          | 256 KiB   | 4013 `FRAME_TOO_LARGE` |
 | Frames per second   | 100       | 4009 `RATE_LIMITED`    |
 
+The core server in section 8 implements the first two and leaves frame size to
+the `websockets` library (`max_size`, 1 MiB by default, closing with 1009 —
+also recoverable).
+
 ---
 
-## 9. Reference implementation (Python)
+## 8. Python: a core server
 
-A complete server on top of the [`websockets`](https://websockets.readthedocs.io/)
-library. Python 3.10+, `pip install "websockets>=13"`. The protocol logic is in
-the `Hub` class and does not depend on the framework — to use it under
-FastAPI/Starlette, aiohttp or anything else, replace the three socket calls it
-makes (`recv`, `send`, `close`) with your framework's equivalents.
+Everything a server needs when the application talks to the server and has no
+use for rooms. Built on the [`websockets`](https://websockets.readthedocs.io/)
+library, Python 3.10+. The protocol logic (`CoreServer`, `Client` and the wire
+helpers) does not depend on the framework — to use it under FastAPI/Starlette,
+aiohttp or anything else, replace the three socket calls it makes (`recv`,
+`send`, `close`) with your framework's equivalents.
 
 ```bash
 pip install "websockets>=13"
-python ws_server.py                                   # ws://127.0.0.1:8765/ws
-WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2 python ws_server.py   # timeouts the conformance script expects
+python ws_core_server.py                                    # ws://127.0.0.1:8765/ws
+WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2 python ws_core_server.py  # timeouts Appendix A expects
 ```
 
-It was verified against the real client (`@marianmeres/ws` 0.3.0) with the
-script in Appendix A: all 11 checks pass, on `websockets` 17.1 with deprecation
-warnings promoted to errors.
+Your application supplies two functions — everything below the "example app"
+line is a stand-in for them:
+
+- `authenticate(payload)` — receives what the client's `auth()` option returned;
+  returns the user (anything but `None`) or `None` to reject the connection.
+- `on_message(client, payload)` — called for every `ws.send(payload)`. Its return
+  value is the reply the client receives when it sent with `{ ack: true }`
+  (`None` means "no reply"). Raise `Reject(code, message)` to refuse the message
+  with your own error code. Call `client.push(payload)` — now or any time later —
+  to send the client a message of your own.
+
+On the client side, that is all used like this:
+
+```typescript
+const ws = createWSClient({ url: "ws://127.0.0.1:8765/ws", auth: () => ({ token }) });
+
+ws.on("message", (msg) => console.log("pushed:", msg.payload));
+
+ws.send({ op: "push", data: 1 }); // fire-and-forget
+const reply = await ws.send({ op: "echo", n: 1 }, { ack: true }); // { op: "echo", n: 1 }
+```
+
+It was verified against the real client (`@marianmeres/ws` 0.5.0) with the
+script in Appendix A: all 10 core checks pass, on `websockets` 17.1 and Python
+3.11 with deprecation warnings promoted to errors.
 
 ```python
 """
-Reference server for the @marianmeres/ws wire protocol, version 1.
+Core server for the @marianmeres/ws wire protocol, version 2.
+
+This is everything a server needs to be compatible with the stock client when
+the application talks to the server itself and has no use for rooms:
+
+    client -> server          server -> client
+    ----------------          ----------------
+    auth   (first frame)      hello             or close 4001 to reject
+    ping                      pong              answered at once, never queued
+    msg    {payload}          -                 fire-and-forget: handled, no reply
+    msg    {payload, id}      ack {id, payload} ...or nack {id, error}
+    -                         msg {payload}     a push, at any time: client.push()
+    anything else             nack / error      code "unsupported"
+
+Rooms, namespaces, presence and broadcast belong to an optional extension. A
+client that never calls subscribe(), publish() or broadcast() never sends one
+of those frames; one that does gets an immediate "unsupported" from here
+instead of a 30 s timeout.
+
+The protocol logic does not depend on the framework; `websockets` only supplies
+the socket. To run it elsewhere (FastAPI/Starlette, aiohttp, ...) replace the
+three socket calls it makes: `recv`, `send` and `close`.
+
+    pip install "websockets>=13"        # Python 3.10+
+    python ws_core_server.py            # ws://127.0.0.1:8765/ws
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Optional
+
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
+
+log = logging.getLogger("ws")
+
+PROTOCOL_VERSION = 2
+
+# Close codes. The client stops reconnecting after 4001 and 4003, and only
+# after those: every other code, a plain 1000 included, makes it come back.
+CLOSE_AUTH_FAILED = 4001  # bad credentials                 -> client gives up
+CLOSE_AUTH_TIMEOUT = 4002  # no `auth` frame in time         -> client retries
+CLOSE_FORBIDDEN = 4003  # valid credentials, not allowed    -> client gives up
+CLOSE_IDLE_TIMEOUT = 4008  # silent connection reaped        -> client retries
+CLOSE_PROTOCOL_ERROR = 4400  # frame is not JSON             -> client retries
+
+
+class Reject(Exception):
+    """Raise from your message handler to refuse a message on purpose.
+
+    The client's `send(payload, { ack: true })` then rejects with a
+    `WSRemoteError` whose `code` and `message` are exactly these. Any *other*
+    exception is logged here and reported to the client as `internal`, without
+    its text — a stack trace is not something to hand to a browser.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(eq=False)  # identity equality: every Client is a distinct connection
+class Client:
+    """One authenticated connection."""
+
+    ws: ServerConnection
+    user: Any  # whatever your `authenticate` returned
+    # Messages waiting for the handler, in arrival order. See `_work`.
+    inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
+
+    async def push(self, payload: Any) -> bool:
+        """Sends `payload` to this client; it arrives through the client's
+        `message` event. Returns False when the connection is already gone.
+
+        Callable at any time, from anywhere: inside your handler, from a
+        background task, after the handler returned.
+        """
+        return await _send(self.ws, {"type": "msg", "payload": payload})
+
+
+# Returns the authenticated user (anything but None), or None to reject.
+Authenticate = Callable[[Any], Awaitable[Any]]
+# Returns the reply for an acknowledged message; None means "no reply".
+OnMessage = Callable[[Client, Any], Awaitable[Any]]
+
+
+class CoreServer:
+    """The protocol, minus everything that is optional."""
+
+    def __init__(
+        self,
+        *,
+        authenticate: Authenticate,
+        on_message: OnMessage,
+        auth_timeout: float = 5.0,
+        idle_timeout: float = 60.0,
+    ) -> None:
+        self.authenticate = authenticate
+        self.on_message = on_message
+        # How long a fresh socket may take to send `auth`.
+        self.auth_timeout = auth_timeout
+        # How long an authenticated socket may stay silent. The client pings
+        # every 25 s, so 60 s means "missed two pings": the connection is dead.
+        self.idle_timeout = idle_timeout
+        # Live, authenticated connections — iterate it to push to everyone.
+        self.clients: set[Client] = set()
+        # Strong references to running workers; asyncio keeps only weak ones.
+        self._workers: set[asyncio.Task] = set()
+
+    async def handler(self, ws: ServerConnection) -> None:
+        """Owns one socket for its whole life. Pass it to `serve()`.
+
+        Reads frames strictly in order. Everything here is quick — a `ping` in
+        particular must never wait behind your handler, or the client, which
+        drops a connection 10 s after an unanswered ping, reconnects in the
+        middle of a slow request. Messages are therefore only *queued* here
+        and handled by a separate worker (`_work`).
+        """
+        client: Optional[Client] = None
+        try:
+            while True:
+                # Before the handshake the deadline is the auth deadline;
+                # after it, the idle deadline.
+                timeout = self.idle_timeout if client else self.auth_timeout
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout)
+                except asyncio.TimeoutError:
+                    if client:
+                        await ws.close(CLOSE_IDLE_TIMEOUT, "idle timeout")
+                    else:
+                        await ws.close(CLOSE_AUTH_TIMEOUT, "auth timeout")
+                    return
+
+                try:
+                    frame = json.loads(raw)
+                except ValueError:
+                    # Almost always a codec mismatch; nothing sensible follows.
+                    await _error(ws, "bad_request", "malformed frame")
+                    await ws.close(CLOSE_PROTOCOL_ERROR, "malformed frame")
+                    return
+                if not isinstance(frame, dict):
+                    await _error(ws, "bad_request", "frame must be a JSON object")
+                    continue
+                kind = frame.get("type")
+
+                if kind == "auth":
+                    if client is None:  # a repeated `auth` is ignored
+                        client = await self._handshake(ws, frame)
+                        if client is None:
+                            return  # rejected, socket closed
+                    continue
+
+                if client is None:
+                    # The stock client never does this; tell whoever did.
+                    await _error(ws, "unauthorized", "not authenticated")
+                elif kind == "ping":
+                    await _send(ws, {"type": "pong"})
+                elif kind == "msg":
+                    client.inbox.put_nowait(frame)
+                else:
+                    # sub, unsub, pub, broadcast — or anything newer. Answering
+                    # (instead of ignoring) is what lets the client fail fast.
+                    await _refuse(ws, frame.get("id"), "unsupported", "not supported here")
+        except ConnectionClosed:
+            pass
+        finally:
+            if client is not None:
+                self.clients.discard(client)
+                # Let the worker finish what was already read, then stop. A
+                # message the server received gets handled even if its sender
+                # is gone; only the reply has nowhere to go.
+                client.inbox.put_nowait(None)
+
+    async def _handshake(self, ws: ServerConnection, frame: dict) -> Optional[Client]:
+        """Authenticates the `auth` frame and answers `hello`.
+
+        Returns None when the socket was closed instead.
+        """
+        # `payload` is whatever the client's `auth()` option returned — a
+        # token, typically. The client runs it again on every reconnect, which
+        # is all that token refresh needs.
+        try:
+            user = await self.authenticate(frame.get("payload"))
+        except Exception:
+            log.exception("authenticate failed")
+            user = None
+        if user is None:
+            # Terminal: the client stops retrying and reports why. Nothing
+            # needs to be sent before the close.
+            await ws.close(CLOSE_AUTH_FAILED, "authentication failed")
+            return None
+
+        client = Client(ws=ws, user=user)
+        self.clients.add(client)
+        worker = asyncio.create_task(self._work(client))
+        self._workers.add(worker)
+        worker.add_done_callback(self._workers.discard)
+
+        # Must go out within 10 s of the `auth` frame, or the client gives up
+        # on this socket and reconnects. `clientId` and `namespace` are part
+        # of the rooms extension and not needed here.
+        await _send(ws, {"type": "hello", "protocol": PROTOCOL_VERSION})
+        return client
+
+    async def _work(self, client: Client) -> None:
+        """Runs `on_message` for one connection's messages: one at a time, in
+        arrival order.
+
+        Sequential per connection because that is what a data channel is
+        expected to be: message 2 is not processed before message 1 is done.
+        Replies are correlated by `id`, so the protocol does not require it —
+        to handle a connection's messages concurrently, replace the `await`
+        below with a task per message.
+        """
+        while (frame := await client.inbox.get()) is not None:
+            # Only a non-empty string id asks for an answer. Anything else is
+            # fire-and-forget — and could not be correlated anyway.
+            frame_id = frame.get("id")
+            if not isinstance(frame_id, str) or not frame_id:
+                frame_id = None
+            try:
+                reply = await self.on_message(client, frame.get("payload"))
+                if frame_id is None:
+                    continue
+                ack = {"type": "ack", "id": frame_id}
+                if reply is not None:
+                    ack["payload"] = reply
+                # Encoded here, inside the try: a reply json cannot encode
+                # must still produce an answer, or the client waits 30 s.
+                wire = json.dumps(ack)
+            except Reject as e:
+                await _refuse(client.ws, frame_id, e.code, e.message)
+            except Exception:
+                log.exception("on_message failed")
+                await _refuse(client.ws, frame_id, "internal", "internal error")
+            else:
+                await _send_raw(client.ws, wire)
+
+
+# ---------------------------------------------------------------- wire helpers
+
+
+async def _send(ws: ServerConnection, frame: dict) -> bool:
+    """Sends one frame as one JSON text message. False if the socket is gone."""
+    return await _send_raw(ws, json.dumps(frame))
+
+
+async def _send_raw(ws: ServerConnection, wire: str) -> bool:
+    try:
+        await ws.send(wire)
+        return True
+    except ConnectionClosed:
+        return False
+
+
+async def _error(ws: ServerConnection, code: str, message: str) -> None:
+    """An uncorrelated error: the client emits it as an `error` event."""
+    await _send(ws, {"type": "error", "error": {"code": code, "message": message}})
+
+
+async def _refuse(ws: ServerConnection, frame_id: Any, code: str, message: str) -> None:
+    """Answers a frame the server will not act on: a `nack` when the client is
+    waiting for this frame (it carried an id), an `error` when nobody is."""
+    if isinstance(frame_id, str) and frame_id:
+        error = {"code": code, "message": message}
+        await _send(ws, {"type": "nack", "id": frame_id, "error": error})
+    else:
+        await _error(ws, code, message)
+
+
+# ----------------------------------------------------------------- example app
+#
+# Everything below is application code: replace it with yours. The contract
+# matches the conformance script in Appendix A.
+
+
+async def authenticate(payload: Any) -> Any:
+    """Checks the client's `auth()` payload. Return None to reject (4001)."""
+    if isinstance(payload, dict) and payload.get("token") == "dev-secret":
+        return {"name": payload.get("user", "anonymous")}
+    return None
+
+
+async def on_message(client: Client, payload: Any) -> Any:
+    """Handles one `ws.send(payload)`. The return value is the reply the
+    client receives when it sent with `{ ack: true }`; it is discarded for a
+    fire-and-forget send."""
+    op = payload.get("op") if isinstance(payload, dict) else None
+    if op == "echo":
+        return payload
+    if op == "push":
+        # A reply and a push are different things: the reply answers this
+        # message, a push can go out at any time — here, right away.
+        await client.push(payload.get("data"))
+        return None
+    raise Reject("unknown_op", f"unknown op: {op!r}")
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    server = CoreServer(
+        authenticate=authenticate,
+        on_message=on_message,
+        auth_timeout=float(os.environ.get("WS_AUTH_TIMEOUT", 5)),
+        idle_timeout=float(os.environ.get("WS_IDLE_TIMEOUT", 60)),
+    )
+    port = int(os.environ.get("WS_PORT", 8765))
+    async with serve(server.handler, "127.0.0.1", port) as ws_server:
+        print(f"listening on ws://127.0.0.1:{port}/ws", flush=True)
+        await ws_server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Notes on the design choices, in the order they matter:
+
+- **The read loop only reads.** `ping` is answered inline; `msg` frames are
+  queued for a per-connection worker. However slow your handler, the pong goes
+  out on time — otherwise the client would drop the connection 10 s into a slow
+  request and the reply would be lost (3.3).
+- **One worker per connection, messages handled one at a time.** Message 2 is
+  not processed before message 1 is done, which is what a data channel is
+  expected to do. To handle one connection's messages concurrently, start a task
+  per message in `_work` instead of awaiting the handler — replies are
+  correlated by `id`, so the protocol allows it.
+- **The worker outlives its socket, briefly.** On disconnect it still finishes
+  the messages already received — a message the server read gets handled even if
+  the reply has nowhere to go — and then stops.
+- **`asyncio.wait_for(recv, timeout)` doubles as the auth timer and the idle
+  timer.** No sweeper task, no bookkeeping of "last seen".
+- **Errors never leak.** A `Reject` is the only way an error text reaches the
+  client; any other exception is logged and answered `internal`.
+- **No registry.** `server.clients` is the set of live connections — iterate it
+  to push to everyone. Keep your own `user → client` map in `authenticate` /
+  `on_message` if you need to push to a particular user; a real deployment with
+  several instances needs a shared bus for that (Redis pub/sub or similar).
+
+---
+
+## 9. Python: the full reference, with rooms
+
+A complete server — the core plus the rooms extension — on the same library.
+The protocol logic is in the `Hub` class and, as above, does not depend on the
+framework beyond `recv`, `send` and `close`.
+
+```bash
+pip install "websockets>=13"
+python ws_server.py                                       # ws://127.0.0.1:8765/ws
+WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2 python ws_server.py   # timeouts Appendix A expects
+```
+
+It was verified against the real client (`@marianmeres/ws` 0.5.0) with the
+script in Appendix A and `WS_ROOMS=1`: all 16 checks pass, on `websockets` 17.1
+and Python 3.11 with deprecation warnings promoted to errors.
+
+```python
+"""
+Reference server for the @marianmeres/ws wire protocol, version 2: the core
+(messages between client and server) plus the rooms extension (namespaces,
+rooms, presence, broadcast).
+
+Need only the core? The core server in section 8 is a third of the size.
 
 The protocol logic lives in `Hub` and does not depend on the framework; the
 `websockets` library only supplies the socket. Python 3.10+.
@@ -543,6 +1125,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import time
@@ -552,7 +1135,9 @@ from typing import Any, Awaitable, Callable, Optional
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
-PROTOCOL_VERSION = 1
+log = logging.getLogger("ws")
+
+PROTOCOL_VERSION = 2
 DEFAULT_NAMESPACE = "default"
 
 # Close codes. 4xxx is the application range (RFC 6455). The client treats
@@ -569,6 +1154,20 @@ CLOSE_PROTOCOL_ERROR = 4400
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+class Reject(Exception):
+    """Raise from `on_message` to refuse a message with your own error code.
+
+    The client's `send(payload, { ack: true })` rejects with a `WSRemoteError`
+    carrying exactly this `code` and `message`. Any other exception is logged
+    and reported as `internal`, without its text.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 @dataclass
@@ -590,19 +1189,33 @@ class Conn:
     authed: bool = False
     window_start: float = 0.0
     window_count: int = 0
+    # Messages (`msg` frames) waiting for `on_message`, in arrival order.
+    inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
+
+    async def push(self, payload: Any) -> bool:
+        """Direct message to this client (core): no room, arrives through the
+        client's `message` event. False when the socket is already gone."""
+        try:
+            await self.ws.send(json.dumps({"type": "msg", "payload": payload}))
+            return True
+        except ConnectionClosed:
+            return False
 
 
 Verify = Callable[[Any, ServerConnection], Awaitable[Optional[AuthResult]]]
 AllowBroadcast = Callable[[Conn, str], Awaitable[bool]]
+# Returns the reply for an acknowledged message; None means "no reply".
+OnMessage = Callable[[Conn, Any], Awaitable[Any]]
 
 
 class Hub:
-    """Connection registry, room index, presence and delivery."""
+    """Connection registry, direct messages, room index, presence and delivery."""
 
     def __init__(
         self,
         *,
         verify: Optional[Verify] = None,  # None accepts everyone: development only
+        on_message: Optional[OnMessage] = None,  # None refuses every `msg`: unsupported
         allow_broadcast: Optional[AllowBroadcast] = None,  # None denies: the safe default
         auth_timeout: float = 5.0,
         idle_timeout: float = 60.0,
@@ -610,6 +1223,7 @@ class Hub:
         max_frames_per_second: int = 100,
     ) -> None:
         self.verify = verify
+        self.on_message = on_message
         self.allow_broadcast = allow_broadcast
         self.auth_timeout = auth_timeout
         self.idle_timeout = idle_timeout
@@ -620,6 +1234,12 @@ class Hub:
         self._tasks: set[asyncio.Task] = set()
 
     # ---------------------------------------------------------- application API
+
+    async def send(self, client_id: str, payload: Any) -> bool:
+        """Direct message to one client by id — see `Conn.push`. False when
+        that client is not connected."""
+        conn = self.conns.get(client_id)
+        return await conn.push(payload) if conn is not None else False
 
     async def publish(
         self,
@@ -708,6 +1328,11 @@ class Hub:
         kind = frame["type"]
         if kind == "ping":
             await self._send(conn, {"type": "pong"})
+        elif kind == "msg":
+            # Queued, not handled inline: a slow `on_message` must not hold up
+            # the pong (the client drops a socket 10 s after an unanswered
+            # ping) nor the room frames that follow. See `_work`.
+            conn.inbox.put_nowait(frame)
         elif kind == "sub":
             await self._on_sub(conn, frame)
         elif kind == "unsub":
@@ -717,7 +1342,9 @@ class Hub:
         elif kind == "broadcast":
             await self._on_broadcast(conn, frame)
         else:
-            await self._error(conn, "bad_request", "unknown frame type")
+            # Possibly a valid frame from a newer protocol. Answering it lets
+            # the client fail fast instead of waiting out its send timeout.
+            await self._refuse(conn, frame.get("id"), "unsupported", "unsupported frame type")
 
     # ------------------------------------------------------------- handshake
 
@@ -757,6 +1384,9 @@ class Hub:
         conn.meta = result.meta
         conn.authed = True
         self.conns[client_id] = conn
+        worker = asyncio.get_running_loop().create_task(self._work(conn))
+        self._tasks.add(worker)
+        worker.add_done_callback(self._tasks.discard)
 
         await self._send(
             conn,
@@ -768,6 +1398,38 @@ class Hub:
             },
         )
         return True
+
+    # --------------------------------------------------------------- messages
+
+    async def _work(self, conn: Conn) -> None:
+        """Runs `on_message` for one connection's messages: one at a time, in
+        arrival order. Ends when `_drop` enqueues None, after finishing what
+        was already received."""
+        while (frame := await conn.inbox.get()) is not None:
+            frame_id = frame.get("id")
+            if not isinstance(frame_id, str) or not frame_id:
+                frame_id = None  # fire-and-forget: nobody is waiting for an answer
+            if self.on_message is None:
+                await self._refuse(conn, frame_id, "unsupported", "this server accepts no messages")
+                continue
+            try:
+                reply = await self.on_message(conn, frame.get("payload"))
+                if frame_id is None:
+                    continue
+                ack = {"type": "ack", "id": frame_id}
+                if reply is not None:
+                    ack["payload"] = reply
+                wire = json.dumps(ack)  # inside the try: an unencodable reply is `internal`
+            except Reject as e:
+                await self._refuse(conn, frame_id, e.code, e.message)
+            except Exception:
+                log.exception("on_message failed")
+                await self._refuse(conn, frame_id, "internal", "internal error")
+            else:
+                try:
+                    await conn.ws.send(wire)
+                except ConnectionClosed:
+                    pass
 
     # ----------------------------------------------------------------- rooms
 
@@ -930,6 +1592,9 @@ class Hub:
         # a replaced connection must not evict its replacement.
         if self.conns.get(conn.id) is conn:
             del self.conns[conn.id]
+        # Stops the message worker once it has handled what was received.
+        # Harmless when repeated, or when no worker was ever started.
+        conn.inbox.put_nowait(None)
         rooms = list(conn.rooms)
         conn.rooms.clear()
         for room in rooms:
@@ -982,6 +1647,14 @@ class Hub:
             conn, {"type": "nack", "id": id_, "error": {"code": code, "message": message}}
         )
 
+    async def _refuse(self, conn: Conn, id_: Any, code: str, message: str) -> None:
+        """`nack` when the frame carried a usable id (someone is waiting),
+        an uncorrelated `error` when it did not."""
+        if isinstance(id_, str) and id_:
+            await self._nack(conn, id_, code, message)
+        else:
+            await self._error(conn, code, message)
+
 
 # ------------------------------------------------------------------ example app
 
@@ -1000,14 +1673,28 @@ async def verify(payload: Any, ws: ServerConnection) -> Optional[AuthResult]:
     return AuthResult(meta={"user": payload.get("user")})
 
 
+async def on_message(conn: Conn, payload: Any) -> Any:
+    """Handles one `ws.send(payload)`. The return value is the reply for a send
+    with `{ ack: true }`. Same contract as the core server's example."""
+    op = payload.get("op") if isinstance(payload, dict) else None
+    if op == "echo":
+        return payload
+    if op == "push":
+        await conn.push(payload.get("data"))
+        return None
+    raise Reject("unknown_op", f"unknown op: {op!r}")
+
+
 async def allow_broadcast(conn: Conn, room: str) -> bool:
     """Broadcast crosses namespaces, so it is denied unless you say otherwise."""
     return room == "announcements"
 
 
 async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     hub = Hub(
         verify=verify,
+        on_message=on_message,
         allow_broadcast=allow_broadcast,
         auth_timeout=float(os.environ.get("WS_AUTH_TIMEOUT", 5)),
         idle_timeout=float(os.environ.get("WS_IDLE_TIMEOUT", 60)),
@@ -1024,9 +1711,13 @@ if __name__ == "__main__":
 
 Notes on the design choices, in the order they matter:
 
-- **One `recv` loop per connection, every frame fully handled before the next is
-  read.** This is what guarantees rule 9 (a `sub` is registered before the
-  `pub` that follows it) with no extra machinery.
+- **One `recv` loop per connection, every rooms frame fully handled before the
+  next is read.** This is what guarantees rule 12 (a `sub` is registered before
+  the `pub` that follows it) with no extra machinery.
+- **`msg` frames are the exception** — queued for a per-connection worker, as in
+  the core server, so that a slow `on_message` delays neither pongs nor room
+  traffic. Messages stay ordered among themselves; their order relative to room
+  frames is not preserved, and nothing depends on it.
 - **`asyncio.wait_for(recv, timeout)` doubles as the auth timer and the idle
   timer.** No sweeper task, no bookkeeping of "last seen".
 - **`_close` never awaits the closing handshake.** It runs inside _another_
@@ -1072,10 +1763,10 @@ The upgrade route is the exception — it is always mounted, since authenticatio
 happens in the `auth` frame. It does take one optional check: an origin
 allow-list (the reference calls it `allowedOrigins`) answering a disallowed
 `Origin` with **403** before upgrading, so the handshake is never reached. Worth
-having whenever `verify` trusts cookies, because a browser attaches those to a
-cross-site socket too. Keep it opt-in: only browsers send `Origin` at all, so a
-default allow-list would reject every non-browser client, and a _missing_ header
-should stay allowed unless you knowingly demand one.
+having whenever authentication trusts cookies, because a browser attaches those
+to a cross-site socket too. Keep it opt-in: only browsers send `Origin` at all,
+so a default allow-list would reject every non-browser client, and a _missing_
+header should stay allowed unless you knowingly demand one.
 
 ---
 
@@ -1084,34 +1775,52 @@ should stay allowed unless you knowingly demand one.
 Drives the real client against your server. Requires [Deno](https://deno.com)
 and network access to fetch the client from JSR; nothing to install.
 
-It expects the server to accept the auth payload `{ "token": "dev-secret" }`,
-reject other tokens with 4001, and allow broadcast only into `announcements` —
-the policy in the Python example. Two checks need short server timeouts (auth
-1 s, idle 2 s); the Python example reads them from `WS_AUTH_TIMEOUT` and
+It expects the server to accept the auth payload `{ "token": "dev-secret" }`
+and reject other tokens with 4001, and to answer messages the way both Python
+examples do: `{ "op": "echo" }` replies with the payload, `{ "op": "push",
+"data": … }` pushes `data` back as a direct message, anything else is refused
+with code `unknown_op`. Two checks need short server timeouts (auth 1 s, idle
+2 s); the Python examples read them from `WS_AUTH_TIMEOUT` and
 `WS_IDLE_TIMEOUT`.
 
+Core checks always run. With `WS_ROOMS=1` the rooms checks run as well — they
+also expect broadcast to be allowed into `announcements` only, the policy in the
+section 9 example. Without it the script instead checks that rooms are refused
+as `unsupported`.
+
 ```bash
-WS_URL=ws://127.0.0.1:8765/ws deno run -A conformance.ts
+WS_URL=ws://127.0.0.1:8765/ws deno run -A conformance.ts              # core server
+WS_URL=ws://127.0.0.1:8765/ws WS_ROOMS=1 deno run -A conformance.ts   # with rooms
 ```
 
 ```typescript
 /**
- * Conformance check: drives the real @marianmeres/ws client against
- * whatever server listens at WS_URL. Expects the server to accept
- * { token: "dev-secret" }, reject other tokens with 4001, and allow broadcast
- * only into "announcements". Some checks need short server timeouts:
- * WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2.
+ * Conformance check: drives the real @marianmeres/ws client against whatever
+ * server listens at WS_URL.
+ *
+ * Core checks always run. Rooms checks run with WS_ROOMS=1; without it, the
+ * script instead checks that rooms are refused as "unsupported".
+ *
+ * The server must accept the auth payload { token: "dev-secret" } and reject
+ * any other with 4001, and answer messages like the Python examples do:
+ * { op: "echo" } replies with the payload, { op: "push", data } pushes `data`
+ * back as a direct message, anything else is refused with code "unknown_op".
+ * With rooms, broadcast must be allowed into "announcements" only.
+ *
+ * Two checks need short server timeouts: WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2.
  */
 import {
 	createWSClient,
 	type WSMessage,
 	type WSPresenceEvent,
 	WSRemoteError,
+	type WSRoomMessage,
 	WSTerminatedError,
-} from "jsr:@marianmeres/ws@^0.3.0";
+} from "jsr:@marianmeres/ws@^0.5.0";
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@^1";
 
 const URL = Deno.env.get("WS_URL") ?? "ws://127.0.0.1:8765/ws";
+const ROOMS = Deno.env.get("WS_ROOMS") === "1";
 const auth = () => ({ token: "dev-secret", user: "smoke" });
 const client = (o: Record<string, unknown> = {}) =>
 	createWSClient({ url: URL, logger: null, pingInterval: 0, auth, ...o });
@@ -1136,155 +1845,94 @@ async function test(name: string, fn: () => Promise<void>) {
 	}
 }
 
-await test("handshake: hello carries clientId, namespace, protocol", async () => {
-	const a = client({ clientId: "alice" });
-	const b = client({ namespace: "org-2" });
+/** A socket without the client library, for frames the client never sends. */
+async function raw() {
+	const ws = new WebSocket(URL);
+	const frames: Record<string, unknown>[] = [];
+	const closed = new Promise<CloseEvent>((r) => ws.onclose = r);
+	ws.onmessage = (e) => frames.push(JSON.parse(e.data));
+	await new Promise((r) => ws.onopen = r);
+	return { ws, frames, closed, send: (f: unknown) => ws.send(JSON.stringify(f)) };
+}
+
+// ------------------------------------------------------------------ core
+
+await test("core: pre-auth frame -> error unauthorized; hello; bad json -> 4400", async () => {
+	const r = await raw();
+	r.send({ type: "ping" });
+	await until(() => r.frames.length === 1, "error frame");
+	assertEquals(r.frames[0].type, "error");
+	assertEquals((r.frames[0].error as Record<string, unknown>).code, "unauthorized");
+	r.send({ type: "auth", protocol: 2, payload: auth() });
+	await until(() => r.frames.length === 2, "hello");
+	assertEquals(r.frames[1].type, "hello");
+	assertEquals(r.frames[1].protocol, 2);
+	r.send({ type: "ping" });
+	await until(() => r.frames.length === 3, "pong");
+	assertEquals(r.frames[2], { type: "pong" });
+	r.ws.send("not json");
+	const ev = await r.closed;
+	assertEquals(ev.code, 4400);
+	assertEquals(r.frames[3].type, "error");
+});
+
+await test("core: send with ack resolves with the server's reply", async () => {
+	const c = client();
 	try {
-		await a.connect();
-		await b.connect();
-		assertEquals(a.clientId, "alice");
-		assertEquals(a.namespace, "default");
-		assert(typeof b.clientId === "string" && b.clientId.length > 0, "generated id");
-		assertEquals(b.namespace, "org-2");
+		const reply = await c.send({ op: "echo", n: 1 }, { ack: true });
+		assertEquals(reply, { op: "echo", n: 1 });
 	} finally {
-		a.dispose();
-		b.dispose();
+		c.dispose();
 	}
 });
 
-await test("presence sync/join/leave, publish echo + recipients, timestamp", async () => {
-	const alice = client({ clientId: "alice" });
-	const bob = client({ clientId: "bob" });
+await test("core: fire-and-forget send; the push arrives as a direct message", async () => {
+	const c = client();
 	try {
-		await alice.connect();
-		const aliceEv: WSPresenceEvent[] = [];
-		const aliceMsgs: WSMessage[] = [];
-		await alice.subscribe("room", (m) => aliceMsgs.push(m), {
-			presence: (e) => aliceEv.push(e),
-		});
-		await until(() => aliceEv.length === 1, "alice sync");
-		assertEquals(aliceEv[0].event, "sync");
-		assertEquals(aliceEv[0].clientId, null);
-		assertEquals(aliceEv[0].members, ["alice"]);
-		assertEquals(aliceEv[0].namespace, "default");
-
-		await bob.connect();
-		const bobEv: WSPresenceEvent[] = [];
-		const bobMsgs: WSMessage[] = [];
-		await bob.subscribe("room", (m) => bobMsgs.push(m), {
-			presence: (e) => bobEv.push(e),
-		});
-		await until(() => bobEv.length === 1, "bob sync");
-		assertEquals(bobEv[0].members.sort(), ["alice", "bob"]);
-		await until(() => aliceEv.length === 2, "alice sees join");
-		assertEquals(aliceEv[1].event, "join");
-		assertEquals(aliceEv[1].clientId, "bob");
-		assertEquals(alice.members("room").sort(), ["alice", "bob"]);
-
-		const { recipients } = await bob.publish("room", { text: "hi" });
-		assertEquals(recipients, 2, "sender is echoed too");
-		await until(() => aliceMsgs.length === 1 && bobMsgs.length === 1, "delivery");
-		assertEquals(aliceMsgs[0].payload, { text: "hi" });
-		assertEquals(aliceMsgs[0].room, "room");
-		assertEquals(aliceMsgs[0].namespace, "default");
-		assertEquals(aliceMsgs[0].from, "bob");
-		assert(Number.isInteger(aliceMsgs[0].timestamp) && aliceMsgs[0].timestamp > 1e12);
-		assertEquals(bobMsgs[0].from, "bob");
-
-		// presence upgrade: re-sub with presence on an already joined room
-		const pEv: WSPresenceEvent[] = [];
-		await alice.subscribe("plain", () => {});
-		await alice.subscribe("plain", () => {}, { presence: (e) => pEv.push(e) });
-		await until(() => pEv.length === 1, "sync after presence upgrade");
-		assertEquals(pEv[0].members, ["alice"]);
-
-		bob.dispose();
-		await until(() => aliceEv.length === 3, "alice sees leave");
-		assertEquals(aliceEv[2].event, "leave");
-		assertEquals(aliceEv[2].clientId, "bob");
-		assertEquals(aliceEv[2].members, ["alice"]);
+		const got: WSMessage[] = [];
+		c.on("message", (m) => got.push(m));
+		assertEquals(await c.send({ op: "push", data: { hello: "there" } }), undefined);
+		await until(() => got.length === 1, "pushed message");
+		assertEquals(got[0].payload, { hello: "there" });
+		assertEquals(got[0].room, undefined, "a direct message has no room");
 	} finally {
-		alice.dispose();
-		bob.dispose();
+		c.dispose();
 	}
 });
 
-await test("explicit unsub sends leave and stops delivery", async () => {
-	const a = client({ clientId: "alice" });
-	const b = client({ clientId: "bob" });
+await test("core: a refused message rejects with the server's code; socket stays", async () => {
+	const c = client();
 	try {
-		await a.connect();
-		await b.connect();
-		const bEv: WSPresenceEvent[] = [];
-		await b.subscribe("u", () => {}, { presence: (e) => bEv.push(e) });
-		const aMsgs: WSMessage[] = [];
-		await a.subscribe("u", (m) => aMsgs.push(m));
-		await until(() => bEv.length === 2, "bob sees alice join");
-		await a.unsubscribe("u");
-		await until(() => bEv.length === 3, "bob sees alice leave");
-		assertEquals(bEv[2].event, "leave");
-		assertEquals(bEv[2].clientId, "alice");
-		assertEquals(bEv[2].members, ["bob"]);
-		const { recipients } = await b.publish("u", 1);
-		assertEquals(recipients, 1);
-		await sleep(200);
-		assertEquals(aMsgs.length, 0);
-	} finally {
-		a.dispose();
-		b.dispose();
-	}
-});
-
-await test("namespaces isolate; foreign namespace publish is nacked forbidden", async () => {
-	const a = client({ clientId: "alice" });
-	const c = client({ clientId: "carol", namespace: "org-2" });
-	try {
-		await a.connect();
-		await c.connect();
-		const cMsgs: WSMessage[] = [];
-		await c.subscribe("room", (m) => cMsgs.push(m));
-		await a.subscribe("room", () => {});
-		const { recipients } = await a.publish("room", { x: 1 });
-		assertEquals(recipients, 1);
-		await sleep(200);
-		assertEquals(cMsgs.length, 0);
 		const err = await assertRejects(
-			() => a.publish("room", 1, "org-2"),
+			() => c.send({ op: "nope" }, { ack: true }),
 			WSRemoteError,
 		);
-		assertEquals(err.code, "forbidden");
+		assertEquals(err.code, "unknown_op");
+		assert(c.connected);
+		assertEquals(await c.send({ op: "echo" }, { ack: true }), { op: "echo" });
 	} finally {
-		a.dispose();
 		c.dispose();
 	}
 });
 
-await test("broadcast: denied by default, crosses namespaces when allowed", async () => {
-	const a = client({ clientId: "alice" });
-	const c = client({ clientId: "carol", namespace: "org-2" });
-	try {
-		await a.connect();
-		await c.connect();
-		const err = await assertRejects(() => a.broadcast("room", 1), WSRemoteError);
-		assertEquals(err.code, "forbidden");
-
-		const cMsgs: WSMessage[] = [];
-		const aMsgs: WSMessage[] = [];
-		await c.subscribe("announcements", (m) => cMsgs.push(m));
-		await a.subscribe("announcements", (m) => aMsgs.push(m));
-		const { recipients } = await a.broadcast("announcements", { text: "all" });
-		assertEquals(recipients, 2);
-		await until(() => cMsgs.length === 1 && aMsgs.length === 1, "broadcast delivery");
-		assertEquals(cMsgs[0].namespace, "org-2", "receiver sees its own namespace");
-		assertEquals(aMsgs[0].namespace, "default");
-		assertEquals(cMsgs[0].from, "alice");
-	} finally {
-		a.dispose();
-		c.dispose();
-	}
+await test("core: unknown frame -> nack unsupported with an id, error without", async () => {
+	const r = await raw();
+	r.send({ type: "auth", protocol: 2, payload: auth() });
+	await until(() => r.frames.some((f) => f.type === "hello"), "hello");
+	r.send({ type: "teleport", id: "t1" });
+	await until(() => r.frames.some((f) => f.type === "nack"), "nack");
+	const nack = r.frames.find((f) => f.type === "nack")!;
+	assertEquals(nack.id, "t1");
+	assertEquals((nack.error as Record<string, unknown>).code, "unsupported");
+	r.send({ type: "teleport" });
+	await until(() => r.frames.some((f) => f.type === "error"), "error");
+	const error = r.frames.find((f) => f.type === "error")!;
+	assertEquals((error.error as Record<string, unknown>).code, "unsupported");
+	r.ws.close();
+	await r.closed;
 });
 
-await test("heartbeat: ping is answered, connection stays up", async () => {
+await test("core: heartbeat — ping is answered, connection stays up", async () => {
 	const hb = client({ pingInterval: 200, pongTimeout: 400 });
 	let closed = false;
 	hb.on("close", () => closed = true);
@@ -1297,7 +1945,7 @@ await test("heartbeat: ping is answered, connection stays up", async () => {
 	}
 });
 
-await test("auth failure closes with 4001 and the client gives up", async () => {
+await test("core: auth failure closes with 4001 and the client gives up", async () => {
 	const bad = client({ auth: () => ({ token: "wrong" }) });
 	try {
 		const err = await assertRejects(() => bad.connect(), WSTerminatedError);
@@ -1308,87 +1956,241 @@ await test("auth failure closes with 4001 and the client gives up", async () => 
 	}
 });
 
-await test("same clientId again: newcomer wins, old socket closed 1001", async () => {
-	const d1 = client({ clientId: "dave" });
-	const d2 = client({ clientId: "dave" });
-	try {
-		await d1.connect();
-		const closeEv = new Promise<{ code: number; willReconnect: boolean }>((r) =>
-			d1.on("close", r)
-		);
-		await d2.connect();
-		const ev = await closeEv;
-		d1.dispose();
-		assertEquals(ev.code, 1001);
-		assertEquals(ev.willReconnect, true);
-		const { recipients } = await d2.publish("x", 1);
-		assertEquals(recipients, 0);
-	} finally {
-		d1.dispose();
-		d2.dispose();
-	}
-});
-
-await test("raw: pre-auth frame -> error unauthorized; bad json -> error + 4400", async () => {
-	const ws = new WebSocket(URL);
-	const frames: Record<string, unknown>[] = [];
-	const closed = new Promise<CloseEvent>((r) => ws.onclose = r);
-	ws.onmessage = (e) => frames.push(JSON.parse(e.data));
-	await new Promise((r) => ws.onopen = r);
-	ws.send(JSON.stringify({ type: "ping" }));
-	await until(() => frames.length === 1, "error frame");
-	assertEquals(frames[0].type, "error");
-	assertEquals((frames[0].error as Record<string, unknown>).code, "unauthorized");
-	ws.send(JSON.stringify({
-		type: "auth",
-		id: "a1",
-		protocol: 1,
-		payload: auth(),
-		clientId: "raw",
-		namespace: "default",
-	}));
-	await until(() => frames.length === 2, "hello");
-	assertEquals(frames[1], {
-		type: "hello",
-		clientId: "raw",
-		namespace: "default",
-		protocol: 1,
-	});
-	ws.send(JSON.stringify({ type: "ping" }));
-	await until(() => frames.length === 3, "pong");
-	assertEquals(frames[2], { type: "pong" });
-	ws.send("not json");
-	const ev = await closed;
-	assertEquals(ev.code, 4400);
-	assertEquals(frames[3].type, "error");
-});
-
-await test("raw: no auth frame -> closed 4002 (needs WS_AUTH_TIMEOUT=1)", async () => {
-	const ws = new WebSocket(URL);
-	const ev = await new Promise<CloseEvent>((r) => ws.onclose = r);
+await test("core: no auth frame -> closed 4002 (needs WS_AUTH_TIMEOUT=1)", async () => {
+	const r = await raw();
+	const ev = await r.closed;
 	assertEquals(ev.code, 4002);
 });
 
-await test("idle reap 4008, then reconnect re-subscribes before flushing (needs WS_IDLE_TIMEOUT=2)", async () => {
-	const e = client({ clientId: "eve" });
+await test("core: idle reap 4008, then a send buffered meanwhile is flushed (needs WS_IDLE_TIMEOUT=2)", async () => {
+	const c = client();
 	try {
-		await e.connect();
-		const msgs: WSMessage[] = [];
-		await e.subscribe("r", (m) => msgs.push(m));
+		await c.connect();
 		const ev = await new Promise<{ code: number; willReconnect: boolean }>((r) =>
-			e.on("close", r)
+			c.on("close", r)
 		);
 		assertEquals(ev.code, 4008);
 		assertEquals(ev.willReconnect, true);
-		// buffered while reconnecting; must land in the re-subscribed room
-		const { recipients } = await e.publish("r", { late: true });
-		assertEquals(recipients, 1);
-		await until(() => msgs.length === 1, "buffered publish delivered");
-		assertEquals(msgs[0].payload, { late: true });
+		// Buffered while reconnecting, flushed once the new socket says hello.
+		const reply = await c.send({ op: "echo", late: true }, { ack: true });
+		assertEquals(reply, { op: "echo", late: true });
 	} finally {
-		e.dispose();
+		c.dispose();
 	}
 });
+
+if (!ROOMS) {
+	await test("core: rooms are refused as unsupported, fast", async () => {
+		const c = client({ sendTimeout: 20_000 });
+		try {
+			await c.connect();
+			const t0 = Date.now();
+			const err = await assertRejects(
+				() => c.subscribe("r", () => {}),
+				WSRemoteError,
+			);
+			assertEquals(err.code, "unsupported");
+			assert(Date.now() - t0 < 2_000, "answered, not timed out");
+		} finally {
+			c.dispose();
+		}
+	});
+}
+
+// ----------------------------------------------------------------- rooms
+
+if (ROOMS) {
+	await test("rooms: hello carries clientId and namespace", async () => {
+		const a = client({ clientId: "alice" });
+		const b = client({ namespace: "org-2" });
+		try {
+			await a.connect();
+			await b.connect();
+			assertEquals(a.clientId, "alice");
+			assertEquals(a.namespace, "default");
+			assert(
+				typeof b.clientId === "string" && b.clientId.length > 0,
+				"generated id",
+			);
+			assertEquals(b.namespace, "org-2");
+		} finally {
+			a.dispose();
+			b.dispose();
+		}
+	});
+
+	await test("rooms: presence sync/join/leave, publish echo + recipients", async () => {
+		const alice = client({ clientId: "alice" });
+		const bob = client({ clientId: "bob" });
+		try {
+			await alice.connect();
+			const aliceEv: WSPresenceEvent[] = [];
+			const aliceMsgs: WSRoomMessage[] = [];
+			await alice.subscribe("room", (m) => aliceMsgs.push(m), {
+				presence: (e) => aliceEv.push(e),
+			});
+			await until(() => aliceEv.length === 1, "alice sync");
+			assertEquals(aliceEv[0].event, "sync");
+			assertEquals(aliceEv[0].clientId, null);
+			assertEquals(aliceEv[0].members, ["alice"]);
+
+			await bob.connect();
+			const bobEv: WSPresenceEvent[] = [];
+			const bobMsgs: WSRoomMessage[] = [];
+			await bob.subscribe("room", (m) => bobMsgs.push(m), {
+				presence: (e) => bobEv.push(e),
+			});
+			await until(() => bobEv.length === 1, "bob sync");
+			assertEquals(bobEv[0].members.sort(), ["alice", "bob"]);
+			await until(() => aliceEv.length === 2, "alice sees join");
+			assertEquals(aliceEv[1].event, "join");
+			assertEquals(aliceEv[1].clientId, "bob");
+
+			const { recipients } = await bob.publish("room", { text: "hi" });
+			assertEquals(recipients, 2, "sender is echoed too");
+			await until(() => aliceMsgs.length === 1 && bobMsgs.length === 1, "delivery");
+			assertEquals(aliceMsgs[0].payload, { text: "hi" });
+			assertEquals(aliceMsgs[0].room, "room");
+			assertEquals(aliceMsgs[0].namespace, "default");
+			assertEquals(aliceMsgs[0].from, "bob");
+			assert(
+				Number.isInteger(aliceMsgs[0].timestamp) && aliceMsgs[0].timestamp > 1e12,
+			);
+
+			// presence upgrade: re-sub with presence on an already joined room
+			const pEv: WSPresenceEvent[] = [];
+			await alice.subscribe("plain", () => {});
+			await alice.subscribe("plain", () => {}, { presence: (e) => pEv.push(e) });
+			await until(() => pEv.length === 1, "sync after presence upgrade");
+			assertEquals(pEv[0].members, ["alice"]);
+
+			bob.dispose();
+			await until(() => aliceEv.length === 3, "alice sees leave");
+			assertEquals(aliceEv[2].event, "leave");
+			assertEquals(aliceEv[2].clientId, "bob");
+			assertEquals(aliceEv[2].members, ["alice"]);
+		} finally {
+			alice.dispose();
+			bob.dispose();
+		}
+	});
+
+	await test("rooms: explicit unsub sends leave and stops delivery", async () => {
+		const a = client({ clientId: "alice" });
+		const b = client({ clientId: "bob" });
+		try {
+			await a.connect();
+			await b.connect();
+			const bEv: WSPresenceEvent[] = [];
+			await b.subscribe("u", () => {}, { presence: (e) => bEv.push(e) });
+			const aMsgs: WSRoomMessage[] = [];
+			await a.subscribe("u", (m) => aMsgs.push(m));
+			await until(() => bEv.length === 2, "bob sees alice join");
+			await a.unsubscribe("u");
+			await until(() => bEv.length === 3, "bob sees alice leave");
+			assertEquals(bEv[2].event, "leave");
+			assertEquals(bEv[2].members, ["bob"]);
+			const { recipients } = await b.publish("u", 1);
+			assertEquals(recipients, 1);
+			await sleep(200);
+			assertEquals(aMsgs.length, 0);
+		} finally {
+			a.dispose();
+			b.dispose();
+		}
+	});
+
+	await test("rooms: namespaces isolate; foreign namespace publish is forbidden", async () => {
+		const a = client({ clientId: "alice" });
+		const c = client({ clientId: "carol", namespace: "org-2" });
+		try {
+			await a.connect();
+			await c.connect();
+			const cMsgs: WSRoomMessage[] = [];
+			await c.subscribe("room", (m) => cMsgs.push(m));
+			await a.subscribe("room", () => {});
+			const { recipients } = await a.publish("room", { x: 1 });
+			assertEquals(recipients, 1);
+			await sleep(200);
+			assertEquals(cMsgs.length, 0);
+			const err = await assertRejects(
+				() => a.publish("room", 1, "org-2"),
+				WSRemoteError,
+			);
+			assertEquals(err.code, "forbidden");
+		} finally {
+			a.dispose();
+			c.dispose();
+		}
+	});
+
+	await test("rooms: broadcast denied by default, crosses namespaces when allowed", async () => {
+		const a = client({ clientId: "alice" });
+		const c = client({ clientId: "carol", namespace: "org-2" });
+		try {
+			await a.connect();
+			await c.connect();
+			const err = await assertRejects(() => a.broadcast("room", 1), WSRemoteError);
+			assertEquals(err.code, "forbidden");
+
+			const cMsgs: WSRoomMessage[] = [];
+			const aMsgs: WSRoomMessage[] = [];
+			await c.subscribe("announcements", (m) => cMsgs.push(m));
+			await a.subscribe("announcements", (m) => aMsgs.push(m));
+			const { recipients } = await a.broadcast("announcements", { text: "all" });
+			assertEquals(recipients, 2);
+			await until(
+				() => cMsgs.length === 1 && aMsgs.length === 1,
+				"broadcast delivery",
+			);
+			assertEquals(cMsgs[0].namespace, "org-2", "receiver sees its own namespace");
+			assertEquals(aMsgs[0].namespace, "default");
+			assertEquals(cMsgs[0].from, "alice");
+		} finally {
+			a.dispose();
+			c.dispose();
+		}
+	});
+
+	await test("rooms: same clientId again — newcomer wins, old socket closed 1001", async () => {
+		const d1 = client({ clientId: "dave" });
+		const d2 = client({ clientId: "dave" });
+		try {
+			await d1.connect();
+			const closeEv = new Promise<{ code: number; willReconnect: boolean }>((r) =>
+				d1.on("close", r)
+			);
+			await d2.connect();
+			const ev = await closeEv;
+			d1.dispose();
+			assertEquals(ev.code, 1001);
+			assertEquals(ev.willReconnect, true);
+			const { recipients } = await d2.publish("x", 1);
+			assertEquals(recipients, 0);
+		} finally {
+			d1.dispose();
+			d2.dispose();
+		}
+	});
+
+	await test("rooms: after a reconnect, re-subscribe lands before the flush (needs WS_IDLE_TIMEOUT=2)", async () => {
+		const e = client({ clientId: "eve" });
+		try {
+			await e.connect();
+			const msgs: WSRoomMessage[] = [];
+			await e.subscribe("r", (m) => msgs.push(m));
+			const ev = await new Promise<{ code: number }>((r) => e.on("close", r));
+			assertEquals(ev.code, 4008);
+			// buffered while reconnecting; must land in the re-subscribed room
+			const { recipients } = await e.publish("r", { late: true });
+			assertEquals(recipients, 1);
+			await until(() => msgs.length === 1, "buffered publish delivered");
+			assertEquals(msgs[0].payload, { late: true });
+		} finally {
+			e.dispose();
+		}
+	});
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 Deno.exit(failed ? 1 : 0);
@@ -1398,13 +2200,40 @@ Deno.exit(failed ? 1 : 0);
 
 ## Appendix B — checklist
 
+### Core
+
 Handshake
 
-- [ ] `auth` is accepted as the first frame; `hello` with `clientId`, `namespace`
-      and `protocol: 1` goes out well within 10 s
+- [ ] `auth` is accepted as the first frame; `hello` with `protocol: 2` goes out
+      well within 10 s
 - [ ] Rejected credentials close with 4001; "not allowed" closes with 4003
 - [ ] No `auth` within your deadline closes with 4002
 - [ ] Non-`auth` frames before authentication get `error` `unauthorized`
+- [ ] A repeated `auth` is ignored
+
+Messages
+
+- [ ] A `msg` without `id` is handled and answered with nothing
+- [ ] A `msg` with `id` is answered with exactly one `ack` or `nack` echoing it;
+      the `ack` carries the reply in `payload`, or no `payload` at all
+- [ ] A refusal is a `nack` with a meaningful `code`; a crash is `internal`,
+      without internals in the message, and the socket stays open
+- [ ] A direct message to the client is `{"type": "msg", "payload": …}`, with no
+      `room`
+- [ ] Unknown frame types get `nack` `unsupported` with an `id`, `error`
+      `unsupported` without; the socket stays open
+
+Liveness and closing
+
+- [ ] `ping` → `pong`, promptly, even while a message handler is running
+- [ ] Silent connections are reaped with 4008
+- [ ] Shutdown closes with 1001/1000 so clients come back
+
+### Rooms extension
+
+Identity
+
+- [ ] `hello` carries `clientId` and `namespace`
 - [ ] Server-assigned id/namespace override the client's proposal; otherwise the
       proposal is honoured; otherwise generated / `"default"`
 - [ ] A duplicate client id evicts the older connection with 1001 and does not
@@ -1412,14 +2241,14 @@ Handshake
 
 Rooms and messages
 
-- [ ] Frames of one connection are handled in arrival order
+- [ ] Rooms frames of one connection are handled in arrival order
 - [ ] `sub` registers rooms, re-subscribing is harmless, and it is always
       acknowledged with `ack {id}`
 - [ ] `unsub` is acknowledged; unknown rooms are ignored
 - [ ] `pub` delivers `msg` to every subscriber of `(room, namespace)`, the
       publisher included, and acks with `recipients`
-- [ ] `msg` carries `room`, `namespace`, `from`, `payload` (untouched),
-      `timestamp` (integer epoch ms)
+- [ ] A delivered `msg` carries `room`, `namespace`, `from`, `payload`
+      (untouched), `timestamp` (integer epoch ms)
 - [ ] `pub` with a foreign `namespace` is nacked `forbidden`
 - [ ] `pub` without a `room` and `sub`/`unsub` with a non-array `rooms` are
       answered `nack` `bad_request` without closing the socket
@@ -1435,11 +2264,5 @@ Presence
       event
 - [ ] Subscribers without presence are counted in `members` but receive no
       presence frames
-
-Liveness and closing
-
-- [ ] `ping` → `pong`
-- [ ] Silent connections are reaped with 4008
-- [ ] Shutdown closes with 1001/1000 so clients come back
 - [ ] Closing a connection for any reason removes it from all rooms and emits
       `leave` events

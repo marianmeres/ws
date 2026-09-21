@@ -1,5 +1,6 @@
 /**
- * Connection registry, room index, presence tracking and delivery.
+ * Connection registry, direct messages, room index, presence tracking and
+ * delivery.
  *
  * @module
  */
@@ -23,13 +24,18 @@ import type {
 	SubRequest,
 	WSDecoder,
 	WSEncoder,
-	WSMessage,
+	WSErrorInfo,
 	WSRequestedIdentity,
+	WSRoomMessage,
 } from "../protocol/frames.ts";
+import { WSRemoteError } from "../protocol/errors.ts";
 import type { WSBroadcastEnvelope, WSPubSubAdapter } from "./adapters/abstract.ts";
 import { WSPubSubLocal } from "./adapters/local.ts";
 
-/** What a hook knows about a connection. */
+/**
+ * What a hook knows about a connection. Passed to `onMessage` and
+ * `allowBroadcast`.
+ */
 export interface WSConnectionContext {
 	/** Assigned client id, unique across live connections. */
 	clientId: string;
@@ -83,6 +89,25 @@ export interface WSServiceOptions {
 	 * rejected request is answered `403` and never reaches `verify`.
 	 */
 	allowedOrigins?: string[] | ((origin: string | null, request: Request) => boolean);
+	/**
+	 * Receives every message a client sends with `send()` — the core,
+	 * room-free way for a client to talk to the server itself.
+	 *
+	 * The return value is the reply: when the client asked for an ack
+	 * (`send(x, { ack: true })`) it travels back in the `ack` and resolves the
+	 * client's promise; for a fire-and-forget send it is discarded. Throw a
+	 * `WSRemoteError` to refuse the message with your own `code` and
+	 * `message`; any other throw is logged and answered `internal`, without
+	 * leaking its text. Either way the connection stays open.
+	 *
+	 * Called in arrival order, but not awaited before the next frame is
+	 * handled — an async hook may finish out of order. Chain the work yourself
+	 * where order matters.
+	 *
+	 * **Unset means this server accepts no messages**: every `msg` is answered
+	 * with `unsupported` (a `nack`, or an `error` for a fire-and-forget send).
+	 */
+	onMessage?: (ctx: WSConnectionContext, payload: unknown) => unknown;
 	/**
 	 * Gate for cross-namespace broadcast. **Denies by default** — letting any
 	 * client punch through every namespace boundary is not a safe default, and
@@ -153,7 +178,8 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 /**
- * Owns every connection, the room index, and message delivery.
+ * Owns every connection, the room index, and message delivery — direct
+ * messages to one connection (core) as well as room fan-out (rooms extension).
  *
  * Usable standalone (drive it from any `Deno.serve` handler) or through
  * `createWSApp`, which mounts it as a demino app.
@@ -164,6 +190,7 @@ export class WSService {
 			WSServiceOptions,
 			| "verify"
 			| "allowedOrigins"
+			| "onMessage"
 			| "allowBroadcast"
 			| "adapter"
 			| "logger"
@@ -173,6 +200,7 @@ export class WSService {
 	>;
 	#verify: WSServiceOptions["verify"];
 	#allowedOrigins: WSServiceOptions["allowedOrigins"];
+	#onMessageHook: WSServiceOptions["onMessage"];
 	#allowBroadcast: WSServiceOptions["allowBroadcast"];
 	#adapter: WSPubSubAdapter;
 	#encode: WSEncoder;
@@ -212,6 +240,7 @@ export class WSService {
 		};
 		this.#verify = options.verify;
 		this.#allowedOrigins = options.allowedOrigins;
+		this.#onMessageHook = options.onMessage;
 		this.#allowBroadcast = options.allowBroadcast;
 		this.#adapter = options.adapter ?? new WSPubSubLocal();
 		this.#encode = options.encode ?? defaultEncode;
@@ -296,6 +325,30 @@ export class WSService {
 	}
 
 	/**
+	 * Sends a direct message to one connected client — the server-to-client
+	 * half of the core protocol. It arrives as a `msg` frame carrying nothing
+	 * but `payload`, through the client's `message` event.
+	 *
+	 * Instance-local: a client connected to another instance is not reached,
+	 * and nothing is propagated through the adapter.
+	 *
+	 * @param clientId - the connection's assigned id (`ctx.clientId` in a hook)
+	 * @param payload - opaque application data
+	 * @returns `true` when handed to an open socket on this instance, `false`
+	 * when no such client is connected here or the payload could not be encoded
+	 *
+	 * @example
+	 * ```ts
+	 * service.send(ctx.clientId, { op: "progress", done: 42 });
+	 * ```
+	 */
+	send(clientId: string, payload: unknown): boolean {
+		const conn = this.#connections.get(clientId);
+		if (!conn) return false;
+		return this.#send(conn, { type: FRAME.MSG, payload });
+	}
+
+	/**
 	 * Publishes into a namespace + room from server-side code.
 	 *
 	 * Delivered messages carry `from: null`, which is how clients distinguish
@@ -319,7 +372,7 @@ export class WSService {
 		namespace: string = DEFAULT_NAMESPACE,
 		from: string | null = null,
 	): Promise<number> {
-		const message: WSMessage = {
+		const message: WSRoomMessage = {
 			room,
 			namespace,
 			from,
@@ -347,7 +400,7 @@ export class WSService {
 		payload: unknown,
 		from: string | null = null,
 	): Promise<number> {
-		const message: WSMessage = {
+		const message: WSRoomMessage = {
 			room,
 			// A broadcast has no single namespace; receivers see their own.
 			namespace: "*",
@@ -486,27 +539,33 @@ export class WSService {
 	 */
 	async #dispatch(conn: Connection, frame: ClientFrame): Promise<void> {
 		if (!frame || typeof frame.type !== "string") {
-			return this.#send(conn, {
+			this.#send(conn, {
 				type: FRAME.ERROR,
 				error: { code: ERROR_CODE.BAD_REQUEST, message: "missing frame type" },
 			});
+			return;
 		}
 
 		if (frame.type === FRAME.AUTH) return await this.#onAuth(conn, frame);
 
 		if (!conn.authed) {
-			return this.#send(conn, {
+			this.#send(conn, {
 				type: FRAME.ERROR,
 				error: {
 					code: ERROR_CODE.UNAUTHORIZED,
 					message: "not authenticated",
 				},
 			});
+			return;
 		}
 
 		switch (frame.type) {
 			case FRAME.PING:
-				return this.#send(conn, { type: FRAME.PONG });
+				this.#send(conn, { type: FRAME.PONG });
+				return;
+
+			case FRAME.MSG:
+				return await this.#onMsg(conn, frame);
 
 			// `sub`/`unsub` are handled synchronously on purpose. The socket
 			// preserves ordering, and handling these without an await means a
@@ -524,13 +583,14 @@ export class WSService {
 			case FRAME.BROADCAST:
 				return await this.#onBroadcast(conn, frame);
 
+			// Possibly a perfectly good frame from a newer or richer protocol
+			// than this server speaks. Answering it — rather than ignoring it —
+			// is what lets the client fail fast instead of waiting out its
+			// send timeout.
 			default:
-				return this.#send(conn, {
-					type: FRAME.ERROR,
-					error: {
-						code: ERROR_CODE.BAD_REQUEST,
-						message: `unknown frame type`,
-					},
+				return this.#refuse(conn, (frame as { id?: unknown }).id, {
+					code: ERROR_CODE.UNSUPPORTED,
+					message: "unsupported frame type",
 				});
 		}
 	}
@@ -608,6 +668,52 @@ export class WSService {
 			namespace,
 			protocol: PROTOCOL_VERSION,
 		});
+	}
+
+	/** A client's message to the server itself (core). */
+	async #onMsg(
+		conn: Connection,
+		frame: Extract<ClientFrame, { type: typeof FRAME.MSG }>,
+	): Promise<void> {
+		if (!this.#onMessageHook) {
+			return this.#refuse(conn, frame.id, {
+				code: ERROR_CODE.UNSUPPORTED,
+				message: "this server accepts no messages",
+			});
+		}
+
+		let reply: unknown;
+		try {
+			reply = await this.#onMessageHook(this.#context(conn), frame.payload);
+		} catch (e) {
+			// An application-level refusal, not a broken connection: answer it
+			// and keep the socket. Only a deliberate WSRemoteError speaks for
+			// itself — anything else could carry internals, so it stays in the log.
+			if (e instanceof WSRemoteError) {
+				return this.#refuse(conn, frame.id, { code: e.code, message: e.message });
+			}
+			this.logger?.error?.(`onMessage threw (${conn.id}): ${e}`);
+			return this.#refuse(conn, frame.id, {
+				code: ERROR_CODE.INTERNAL,
+				message: "internal error",
+			});
+		}
+
+		const id = nonEmptyString(frame.id);
+		if (id === undefined) return;
+		const sent = this.#send(conn, {
+			type: FRAME.ACK,
+			id,
+			...(reply === undefined ? {} : { payload: reply }),
+		});
+		// A reply the encoder refuses (a BigInt, a cycle) must still answer the
+		// request, or the client waits out its whole send timeout.
+		if (!sent && conn.socket.readyState === WebSocket.OPEN) {
+			this.#nack(conn, id, {
+				code: ERROR_CODE.INTERNAL,
+				message: "reply could not be encoded",
+			});
+		}
 	}
 
 	#onSub(conn: Connection, id: string, requests: unknown): void {
@@ -698,7 +804,7 @@ export class WSService {
 			});
 		}
 
-		const message: WSMessage = {
+		const message: WSRoomMessage = {
 			room,
 			namespace,
 			from: conn.id,
@@ -722,17 +828,10 @@ export class WSService {
 			});
 		}
 
-		const ctx: WSConnectionContext = {
-			clientId: conn.id,
-			namespace: conn.namespace,
-			meta: conn.meta,
-			request: conn.request,
-		};
-
 		let allowed = false;
 		try {
 			allowed = this.#allowBroadcast
-				? await this.#allowBroadcast(ctx, room)
+				? await this.#allowBroadcast(this.#context(conn), room)
 				: false;
 		} catch (e) {
 			this.logger?.debug?.(`allowBroadcast threw: ${e}`);
@@ -746,7 +845,7 @@ export class WSService {
 			});
 		}
 
-		const message: WSMessage = {
+		const message: WSRoomMessage = {
 			room,
 			namespace: "*",
 			from: conn.id,
@@ -764,7 +863,7 @@ export class WSService {
 	 * @param namespace - target namespace, or `null` to cross all of them
 	 * @returns how many sockets received it, on this instance
 	 */
-	#deliverLocal(namespace: string | null, message: WSMessage): number {
+	#deliverLocal(namespace: string | null, message: WSRoomMessage): number {
 		const byNamespace = this.#index.get(message.room);
 		if (!byNamespace) return 0;
 
@@ -893,35 +992,54 @@ export class WSService {
 		}
 	}
 
-	#nack(
-		conn: Connection,
-		id: string,
-		error: { code: string; message: string },
-	): void {
+	#context(conn: Connection): WSConnectionContext {
+		return {
+			clientId: conn.id,
+			namespace: conn.namespace,
+			meta: conn.meta,
+			request: conn.request,
+		};
+	}
+
+	#nack(conn: Connection, id: string, error: WSErrorInfo): void {
 		this.#send(conn, { type: FRAME.NACK, id, error });
 	}
 
-	#send(conn: Connection, frame: ServerFrame): void {
-		if (conn.socket.readyState !== WebSocket.OPEN) return;
+	/**
+	 * Answers a frame the server will not act on: a `nack` when it carried a
+	 * usable `id` — someone is waiting for it — and an uncorrelated `error`
+	 * when it did not.
+	 */
+	#refuse(conn: Connection, id: unknown, error: WSErrorInfo): void {
+		const usable = nonEmptyString(id);
+		if (usable !== undefined) this.#nack(conn, usable, error);
+		else this.#send(conn, { type: FRAME.ERROR, error });
+	}
+
+	/** @returns whether the frame was encoded and handed to an open socket */
+	#send(conn: Connection, frame: ServerFrame): boolean {
+		if (conn.socket.readyState !== WebSocket.OPEN) return false;
 		let wire: string | ArrayBufferView | ArrayBuffer;
 		try {
 			wire = this.#encode(frame);
 		} catch (e) {
 			this.logger?.debug?.(`encode failed (${conn.id}): ${e}`);
-			return;
+			return false;
 		}
-		this.#sendEncoded(conn, wire);
+		return this.#sendEncoded(conn, wire);
 	}
 
 	#sendEncoded(
 		conn: Connection,
 		wire: string | ArrayBufferView | ArrayBuffer,
-	): void {
-		if (conn.socket.readyState !== WebSocket.OPEN) return;
+	): boolean {
+		if (conn.socket.readyState !== WebSocket.OPEN) return false;
 		try {
 			conn.socket.send(wire);
+			return true;
 		} catch (e) {
 			this.logger?.debug?.(`send failed (${conn.id}): ${e}`);
+			return false;
 		}
 	}
 

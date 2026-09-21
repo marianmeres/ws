@@ -2,11 +2,11 @@
 
 Three entry points:
 
-| Import                     | Contains                                  | Runtime   |
-| -------------------------- | ----------------------------------------- | --------- |
-| `@marianmeres/ws`          | the client, plus everything from protocol | any       |
-| `@marianmeres/ws/server`   | the reference server                      | Deno only |
-| `@marianmeres/ws/protocol` | wire definitions only, dependency-free    | any       |
+| Import                     | Contains                                   | Runtime   |
+| -------------------------- | ------------------------------------------ | --------- |
+| `@marianmeres/ws`          | the client, plus everything from protocol  | any       |
+| `@marianmeres/ws/server`   | the reference server, plus `WSRemoteError` | Deno only |
+| `@marianmeres/ws/protocol` | wire definitions only, dependency-free     | any       |
 
 ---
 
@@ -14,8 +14,13 @@ Three entry points:
 
 ### `createWSClient(options?)`
 
-Creates a client. Nothing connects until the first `connect()`, `subscribe()`
-or `publish()`.
+Creates a client. Nothing connects until the first `connect()`, `send()`,
+`subscribe()` or `publish()`.
+
+The client works two ways, freely mixed on one connection — **messages**
+(`send()` / the `message` event; the server only has to implement the protocol
+core) and **rooms** (`subscribe()` / `publish()` / `broadcast()` / presence;
+the rooms extension). See [Messages](#messages) and [Rooms](#rooms) below.
 
 `WSClient` is exported too — `new WSClient(options)` is the same thing,
 following the `PubSub` / `createPubSub` precedent.
@@ -25,11 +30,11 @@ following the `PubSub` / `createPubSub` precedent.
 | Name                 | Type                                | Default            | Description                                                                   |
 | -------------------- | ----------------------------------- | ------------------ | ----------------------------------------------------------------------------- |
 | `url`                | `string \| URL`                     | `"/ws"`            | `ws(s)://`, or `http(s)://` (upgraded), or a path resolved against `location` |
-| `namespace`          | `string`                            | `"default"`        | Isolation boundary                                                            |
-| `clientId`           | `string`                            | generated          | Preferred id; the server may override                                         |
+| `namespace`          | `string`                            | `"default"`        | Isolation boundary for rooms. Sent to the server only when set                |
+| `clientId`           | `string`                            | —                  | Preferred id; the server may override or ignore it                            |
 | `rooms`              | `string[]`                          | `[]`               | Rooms joined on every (re)connect                                             |
 | `auth`               | `() => unknown \| Promise<unknown>` | —                  | Auth payload; called before _every_ (re)connect                               |
-| `autoConnect`        | `boolean`                           | `true`             | First `subscribe()`/`publish()` starts the connection                         |
+| `autoConnect`        | `boolean`                           | `true`             | First `send()`/`subscribe()`/`publish()` starts the connection                |
 | `logger`             | `Logger \| null`                    | `createClog("ws")` | `null` silences                                                               |
 | `reconnectDelay`     | `number`                            | `500`              | Initial backoff, ms                                                           |
 | `reconnectDelayMax`  | `number`                            | `30_000`           | Backoff ceiling, ms                                                           |
@@ -56,14 +61,17 @@ import { createWSClient } from "@marianmeres/ws";
 
 const ws = createWSClient({
 	url: "wss://example.com/ws",
-	namespace: "org-123",
 	auth: () => session.token, // re-read on every reconnect
 });
 
+// messages
+ws.on("message", (msg) => console.log(msg.payload));
+const reply = await ws.send({ op: "load", id: 42 }, { ack: true });
+
+// rooms
 const unsub = await ws.subscribe("chat", (msg) => {
 	console.log(msg.from, msg.payload, msg.timestamp);
 });
-
 const { recipients } = await ws.publish("chat", { text: "hello" });
 
 unsub();
@@ -116,7 +124,67 @@ Terminal teardown: disconnects, then drops every handler, room, timer and
 pending promise. Pending sends reject with `WSDisposedError`. The instance is
 unusable afterwards.
 
-#### Subscriptions
+#### Messages
+
+The core of the protocol: the client and the server talk to each other
+directly. Incoming messages arrive through the [`message`](#wsevents) event.
+
+##### `send<T>(payload, options?): Promise<void>` / `send<R, T>(payload, { ack: true }): Promise<R>`
+
+Sends a message to the server — all a core-only server has to understand.
+
+**Fire-and-forget** by default: resolves as soon as the frame is written to the
+socket. There is no delivery confirmation — a frame written into a connection
+that turns out to be dead is lost, exactly as with a plain `WebSocket`. Calling
+it without `await` is safe: the promise is marked handled, so a failure nobody
+awaits (the queue timing out while offline, say) is not an unhandled rejection.
+Await it to learn about one.
+
+**With `{ ack: true }`** the frame carries an id and the promise waits for the
+server's acknowledgement. It resolves with the reply the server put in the ack —
+which makes this a request/response call — or with `undefined` for a bare ack. A
+refusal (`nack`) rejects with `WSRemoteError` carrying the server's `code`, which
+can be one of the server application's own. An acknowledged send in flight when
+the socket closes rejects there and then with `WSConnectionLostError`; it is not
+resent.
+
+Either way, while disconnected the frame is buffered and flushed after the next
+connect, in order — bounded by `sendTimeout`, which spans queue, flight and (with
+an ack) acknowledgement. After a terminal close nothing is buffered: the promise
+rejects immediately with `WSTerminatedError`.
+
+A third overload, `send<T>(payload, options?: WSSendOptions): Promise<unknown>`,
+covers an `ack` flag decided at runtime.
+
+**Parameters**
+
+- `payload` (`T`) — opaque application data; never inspected or mutated
+- `options.ack` (boolean, optional) — wait for the server's acknowledgement and
+  its reply. Default `false`
+
+**Throws** `WSRemoteError` (ack only), `WSTimeoutError`, `WSConnectionLostError`
+(ack only), `WSOutboxDropError`, `WSNotConnectedError`, `WSTerminatedError`,
+`WSDisposedError`
+
+**Example**
+
+```typescript
+ws.send({ op: "cursor", x: 10, y: 20 }); // fire-and-forget
+
+const doc = await ws.send<Doc>({ op: "load", id: 42 }, { ack: true });
+
+try {
+	await ws.send({ op: "delete", id: 42 }, { ack: true });
+} catch (e) {
+	if (e instanceof WSRemoteError && e.code === "forbidden") showNotAllowed();
+}
+```
+
+#### Rooms
+
+The rooms extension: namespaces, rooms, presence and broadcast. A server that
+does not implement it answers these with `unsupported`, so they fail with
+`WSRemoteError` code `"unsupported"` at once rather than after `sendTimeout`.
 
 ##### `subscribe<T>(room, handler, options?): Promise<Unsubscriber>`
 
@@ -137,7 +205,8 @@ connect, and a failure there surfaces as an `error` event.
 **Parameters**
 
 - `room` (string) — room name, scoped to this client's namespace
-- `handler` (`MessageHandler<T>`) — receives every message published to the room
+- `handler` (`MessageHandler<T>`) — receives every message published to the
+  room, as a `WSRoomMessage<T>`
 - `options.presence` (`PresenceHandler`, optional) — enables presence for this
   room
 
@@ -166,8 +235,6 @@ room registered while offline reads `true` before the wire subscription exists.
 
 Last known membership of a presence-enabled room. Empty for rooms without
 presence.
-
-#### Sending
 
 ##### `publish<T>(room, payload, namespace?): Promise<WSPublishResult>`
 
@@ -208,18 +275,18 @@ unsubscriber is `Symbol.dispose`-compatible.
 
 #### Properties
 
-| Member            | Type                      | Notes                                           |
-| ----------------- | ------------------------- | ----------------------------------------------- |
-| `state`           | Svelte store of `WSState` | Fires immediately, then on every change         |
-| `connected`       | `boolean`                 | `true` only in `open` — not merely socket-open  |
-| `connectionState` | `WSConnectionState`       |                                                 |
-| `clientId`        | `string \| null`          | Server-assigned; `null` until connected         |
-| `namespace`       | `string`                  | The server's assignment wins over the request   |
-| `rooms`           | `string[]`                | Rooms currently held                            |
-| `socket`          | `WebSocket \| null`       | Escape hatch; sending on it bypasses the outbox |
-| `url`             | `URL`                     | A copy — mutating it does nothing               |
-| `logger`          | `Logger \| null`          | Assignable; set to `null` to silence            |
-| `dump()`          | `Record<string, unknown>` | Debug snapshot; shape is not stable API         |
+| Member            | Type                      | Notes                                                                     |
+| ----------------- | ------------------------- | ------------------------------------------------------------------------- |
+| `state`           | Svelte store of `WSState` | Fires immediately, then on every change                                   |
+| `connected`       | `boolean`                 | `true` only in `open` — not merely socket-open                            |
+| `connectionState` | `WSConnectionState`       |                                                                           |
+| `clientId`        | `string \| null`          | Server-assigned; `null` until connected, and when the server assigns none |
+| `namespace`       | `string`                  | The server's assignment wins over the request; else the requested one     |
+| `rooms`           | `string[]`                | Rooms currently held                                                      |
+| `socket`          | `WebSocket \| null`       | Escape hatch; sending on it bypasses the outbox                           |
+| `url`             | `URL`                     | A copy — mutating it does nothing                                         |
+| `logger`          | `Logger \| null`          | Assignable; set to `null` to silence                                      |
+| `dump()`          | `Record<string, unknown>` | Debug snapshot; shape is not stable API                                   |
 
 ##### `WSClient.resolveUrl(input): URL` (static)
 
@@ -258,6 +325,17 @@ Exported mainly so the curve is testable.
 The options object documented under
 [`createWSClient`](#createwsclientoptions).
 
+### `WSSendOptions`
+
+```typescript
+{
+	ack?: boolean; // default false
+}
+```
+
+Options for [`send()`](#messages). `ack: true` waits for the server's
+acknowledgement and resolves with its reply.
+
 ### `SubscribeOptions`
 
 ```typescript
@@ -274,28 +352,41 @@ time the fleet reconnects.
 ### `MessageHandler<T>` / `PresenceHandler`
 
 ```typescript
-type MessageHandler<T = unknown> = (msg: WSMessage<T>) => void;
+type MessageHandler<T = unknown> = (msg: WSRoomMessage<T>) => void;
 type PresenceHandler = (event: WSPresenceEvent) => void;
 ```
+
+A room handler receives a `WSRoomMessage` — every routing field present. The
+[`message`](#wsevents) event receives the looser `WSMessage`, because it also
+carries direct messages from the server.
 
 A throwing handler is caught, reported through the `error` event, and does not
 stop delivery to the others.
 
 ### `WSEvents`
 
-| Event          | Payload                            |
-| -------------- | ---------------------------------- |
-| `open`         | `void` — socket open, pre-auth     |
-| `connected`    | `{ clientId, namespace }`          |
-| `message`      | `WSMessage` — firehose, every room |
-| `presence`     | `WSPresenceEvent`                  |
-| `close`        | `{ code, reason, willReconnect }`  |
-| `reconnecting` | `{ attempt, delay }`               |
-| `terminated`   | `{ code, reason }` — gave up       |
-| `error`        | `Error`                            |
+| Event          | Payload                                                      |
+| -------------- | ------------------------------------------------------------ |
+| `open`         | `void` — socket open, pre-auth                               |
+| `connected`    | `{ clientId: string \| null, namespace }`                    |
+| `message`      | `WSMessage` — every inbound message, direct or from any room |
+| `presence`     | `WSPresenceEvent`                                            |
+| `close`        | `{ code, reason, willReconnect }`                            |
+| `reconnecting` | `{ attempt, delay }`                                         |
+| `terminated`   | `{ code, reason }` — gave up                                 |
+| `error`        | `Error`                                                      |
+
+`message` is the receiving side of [messages](#messages): a direct message from
+the server carries only `payload`; a room delivery also carries `room`,
+`namespace`, `from` and `timestamp`. Check `msg.room` to tell them apart.
+
+`connected.clientId` is `null` when the server assigns no identity — a
+core-only server need not.
 
 `error` means something failed but the client carried on (a decode failure, a
-throwing handler). `terminated` is the only non-retrying exit.
+throwing handler, an `error` frame from the server — for instance a
+fire-and-forget `send()` the server refused). `terminated` is the only
+non-retrying exit.
 
 A local `disconnect()` is a `close` too: code `4900`, `willReconnect: false` —
 that pair is how a deliberate teardown is told apart from a lost connection.
@@ -348,6 +439,7 @@ Creates a mountable demino app plus the service it is wired to.
 | `middlewares`                | `DeminoHandler[]`                                 | `[]`                      | Applied to all routes                                                                                                                                                         |
 | `options.verify`             | `(payload, req, requested) => AuthResult \| null` | —                         | Return `null` (or throw) to reject with `4001`. Absent means no authentication. `requested` is the identity the client asked for — see [below](#security-namespace-isolation) |
 | `options.allowedOrigins`     | `string[] \| (origin, req) => boolean`            | — (no check)              | Origins allowed to upgrade → `403` — see [below](#security-cross-site-websocket-hijacking)                                                                                    |
+| `options.onMessage`          | `(ctx, payload) => unknown`                       | — (**unsupported**)       | Receives every client `send()`; the return value is the reply — see [below](#messages-onmessage)                                                                              |
 | `options.allowBroadcast`     | `(ctx, room) => boolean`                          | **deny**                  | Gate for cross-namespace broadcast                                                                                                                                            |
 | `options.httpAuth`           | `DeminoHandler`                                   | —                         | Guards the HTTP routes. **Without it they are not mounted**                                                                                                                   |
 | `options.deminoOptions`      | `DeminoOptions`                                   | —                         | Passed through to `demino()`                                                                                                                                                  |
@@ -390,6 +482,42 @@ const { app, service } = createWSApp("/ws", [], {
 await service.publish("notifications", { text: "deploy finished" }, "org-123");
 
 Deno.serve(app);
+```
+
+#### Messages: `onMessage`
+
+Every client `send()` reaches `onMessage(ctx, payload)`, with the sender's
+[`WSConnectionContext`](#wsconnectioncontext).
+
+- **The return value is the reply.** For a send with `{ ack: true }` it travels
+  back in the `ack` and resolves the client's promise (`undefined` makes a bare
+  ack). For a fire-and-forget send it is discarded. It may be a promise.
+- **Throw a `WSRemoteError`** to refuse the message with your own `code` and
+  `message` — the client's `send()` rejects with exactly those. Any other throw
+  is logged and answered `internal`, without its text. The connection stays open
+  either way.
+- **Called in arrival order, not awaited before the next frame.** An async hook
+  may finish out of order; chain the work yourself where order matters.
+- **Unset, the server accepts no messages**: every `send()` is answered
+  `unsupported`.
+
+To send a client a message of your own — now or later — use
+[`service.send()`](#sendclientid-payload-boolean).
+
+```typescript
+import { createWSApp, WSRemoteError } from "@marianmeres/ws/server";
+
+const { app, service } = createWSApp("/ws", [], {
+	verify: (payload) => authenticate(payload),
+	onMessage: async (ctx, payload) => {
+		const { op, id } = payload as { op: string; id: number };
+		if (op !== "load") {
+			throw new WSRemoteError({ code: "unknown_op", message: `unknown op ${op}` });
+		}
+		service.send(ctx.clientId, { op: "progress", stage: "loading" });
+		return await loadDoc(id); // the reply
+	},
+});
 ```
 
 #### Security: namespace isolation
@@ -453,7 +581,8 @@ site's page cannot read your token, only ride your cookies.
 
 ### `WSService`
 
-Owns every connection, the room index, presence and delivery. Usable standalone
+Owns every connection, direct messages, the room index, presence and delivery.
+Usable standalone
 — `new WSService(options)`, driven from any `Deno.serve` handler — or through
 `createWSApp`, which mounts it as a demino app.
 
@@ -463,9 +592,19 @@ Upgrades an HTTP request and takes ownership of the socket. Return the 101
 response from your route handler unmodified. With `allowedOrigins` set, a
 disallowed request is answered `403` instead and nothing is upgraded.
 
+##### `send(clientId, payload): boolean`
+
+Sends a direct message to one connected client — the server-to-client half of
+the protocol core. It arrives with nothing but `payload`, through the client's
+`message` event; no room handler sees it.
+
+Returns `true` when handed to an open socket, `false` when no such client is
+connected **to this instance** (or the payload could not be encoded).
+Instance-local: nothing is propagated through the adapter.
+
 ##### `publish(room, payload, namespace?, from?): Promise<number>`
 
-Injects a message from server-side code. Delivered messages carry `from: null`
+Injects a message into a room from server-side code. Delivered messages carry `from: null`
 unless you pass one, which is how clients tell server pushes from peer traffic.
 
 `namespace` defaults to `"default"`. Resolves with the recipients on **this
@@ -533,7 +672,7 @@ Everything in that table except `httpAuth` and `deminoOptions`.
 }
 ```
 
-Passed to `allowBroadcast`.
+Passed to `onMessage` and `allowBroadcast`.
 
 ### `WSStats`
 
@@ -573,9 +712,11 @@ unimplemented seam.
 ```typescript
 {
 	namespace: string | null; // null for a cross-namespace broadcast
-	message: WSMessage;
+	message: WSRoomMessage;
 }
 ```
+
+Room messages only — direct messages (`service.send()`) never cross instances.
 
 ---
 
@@ -588,19 +729,38 @@ implementing this protocol against a different server or client.
 
 ```typescript
 {
+	payload: T;
+	room?: string;        // present on a room delivery only
+	namespace?: string;   // 〃
+	from?: string | null; // 〃
+	timestamp?: number;   // 〃
+}
+```
+
+Any message, as the [`message`](#wsevents) event delivers it. Only `payload` is
+guaranteed: a direct message from the server carries nothing else, a room
+delivery carries all of it (see `WSRoomMessage`). `room` tells them apart.
+
+`payload` is **opaque**: never inspected, never mutated. Your payload may carry
+its own `type` field and nothing collides.
+
+### `WSRoomMessage<T>`
+
+```typescript
+{
+	payload: T;
 	room: string;
 	namespace: string;
 	from: string | null;
-	payload: T;
 	timestamp: number; // server-assigned epoch ms
 }
 ```
 
+A message delivered through a room — what room handlers receive, and a
+`WSMessage` with every routing field present.
+
 `from` is `null` when the message was injected server-side. For a broadcast,
 `namespace` is the receiver's own — not the sender's.
-
-`payload` is **opaque**: never inspected, never mutated. Your payload may carry
-its own `type` field and nothing collides.
 
 ### `WSPresenceEvent`
 
@@ -627,8 +787,9 @@ away.
 }
 ```
 
-Sockets the message was handed to **on the receiving server instance**.
-Best-effort telemetry, never a delivery guarantee.
+Sockets the message was handed to **on the receiving server instance**, as
+reported for `publish()` / `broadcast()`. Best-effort telemetry, never a
+delivery guarantee.
 
 ### `AuthResult`
 
@@ -679,13 +840,14 @@ Discriminated unions over `FRAME`, keyed on `type`. `WSFrame` is either
 direction. You need these only to write a custom `encode`/`decode` or a
 third-party implementation.
 
-| Direction       | Frames                                                     |
-| --------------- | ---------------------------------------------------------- |
-| client → server | `auth`, `sub`, `unsub`, `pub`, `broadcast`, `ping`         |
-| server → client | `hello`, `ack`, `nack`, `msg`, `presence`, `pong`, `error` |
+| Direction       | Core                                           | Rooms extension                    |
+| --------------- | ---------------------------------------------- | ---------------------------------- |
+| client → server | `auth`, `msg`, `ping`                          | `sub`, `unsub`, `pub`, `broadcast` |
+| server → client | `hello`, `msg`, `ack`, `nack`, `pong`, `error` | `presence`                         |
 
 A `msg` frame minus its `type` field _is_ a `WSMessage` — no translation layer,
-no divergence between wire names and API names.
+no divergence between wire names and API names. See [PROTOCOL.md](PROTOCOL.md)
+for every frame's fields.
 
 ### `PresenceEventType`
 
@@ -712,12 +874,16 @@ string-matching messages.
 | ----------------------- | ----------------------------------------------- | ---------------- |
 | `WSTerminatedError`     | Terminal close code                             | `code`, `reason` |
 | `WSConnectTimeoutError` | `connectTimeout` elapsed (retrying continues)   |                  |
-| `WSTimeoutError`        | `sendTimeout` elapsed with no acknowledgement   |                  |
-| `WSConnectionLostError` | Socket closed while the frame was in flight     |                  |
+| `WSTimeoutError`        | `sendTimeout` elapsed — still queued, or no ack |                  |
+| `WSConnectionLostError` | Socket closed while the frame awaited its ack   |                  |
 | `WSOutboxDropError`     | Evicted from a full outbox                      |                  |
-| `WSRemoteError`         | Server sent a `nack`                            | `code`           |
+| `WSRemoteError`         | Server sent a `nack` (or an `error` frame)      | `code`           |
 | `WSNotConnectedError`   | Sent while disconnected with `outboxMaxSize: 0` |                  |
 | `WSDisposedError`       | Client was disposed                             |                  |
+
+`WSRemoteError` is also what a server-side `onMessage` throws to refuse a
+message: `new WSRemoteError({ code, message })`. Its `code` and `message` reach
+the client unchanged. It is re-exported from `@marianmeres/ws/server` for that.
 
 ---
 
@@ -725,7 +891,9 @@ string-matching messages.
 
 ### `PROTOCOL_VERSION`
 
-`1`. Announced by the server in `hello`; a mismatch warns rather than fails.
+`2`. Announced by the server in `hello`; a mismatch warns rather than fails.
+Version 2 split the protocol into a required core and the optional rooms
+extension; a version-1 server still works for rooms.
 
 ### `DEFAULT_NAMESPACE`
 
@@ -763,8 +931,11 @@ Frame type discriminators — the `type` field of every frame. See
 
 ### `ERROR_CODE`
 
-`"unauthorized" | "forbidden" | "bad_request" | "rate_limited" | "internal"` —
-the `code` on `WSErrorInfo` and `WSRemoteError`.
+`"unauthorized" | "forbidden" | "bad_request" | "rate_limited" | "unsupported" | "internal"`
+— the standard `code` values on `WSErrorInfo` and `WSRemoteError`.
+`"unsupported"` answers a frame type the server does not implement, e.g. rooms
+against a core-only server. A server application may also use codes of its own
+when it refuses a message.
 
 ### `PRESENCE`
 

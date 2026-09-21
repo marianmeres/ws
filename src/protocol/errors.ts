@@ -67,7 +67,12 @@ export class WSConnectTimeoutError extends WSError {
 	}
 }
 
-/** `sendTimeout` elapsed while queued, in flight, or awaiting an ack. */
+/**
+ * `sendTimeout` elapsed while queued, in flight, or awaiting an ack.
+ *
+ * A send that awaits no ack — `send()` without `{ ack: true }` — can only hit
+ * this while still queued, i.e. when no connection came up in time.
+ */
 export class WSTimeoutError extends WSError {
 	/**
 	 * Reports the deadline that was exceeded.
@@ -75,7 +80,7 @@ export class WSTimeoutError extends WSError {
 	 * @param ms - the elapsed `sendTimeout`
 	 */
 	constructor(ms: number) {
-		super(`No acknowledgement within ${ms}ms`);
+		super(`Send not completed within ${ms}ms`);
 	}
 }
 
@@ -100,7 +105,12 @@ export class WSConnectionLostError extends WSError {
 	}
 }
 
-/** The server rejected the operation with a `nack`. */
+/**
+ * The server rejected the operation with a `nack`.
+ *
+ * Also the way a server-side `onMessage` hook rejects a message on purpose:
+ * throw one, and its `code` and `message` travel back in the `nack` unchanged.
+ */
 export class WSRemoteError extends WSError {
 	/** Machine-readable code from the server — see `ERROR_CODE`. */
 	readonly code: string;

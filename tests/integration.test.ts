@@ -4,9 +4,9 @@ import type { DeminoHandler } from "@marianmeres/demino";
 import { createWSClient } from "../src/mod.ts";
 import type {
 	WSEncoder,
-	WSMessage,
 	WSPresenceEvent,
 	WSRequestedIdentity,
+	WSRoomMessage,
 } from "../src/protocol/frames.ts";
 import { FRAME } from "../src/protocol/constants.ts";
 import { WSRemoteError, WSTerminatedError } from "../src/protocol/errors.ts";
@@ -34,7 +34,7 @@ Deno.test("connect, subscribe, publish, deliver", async () => {
 		assertEquals(alice.clientId, "alice");
 		assertEquals(alice.namespace, "default");
 
-		const received: WSMessage[] = [];
+		const received: WSRoomMessage[] = [];
 		await bob.subscribe("chat", (msg) => received.push(msg));
 
 		const { recipients } = await alice.publish("chat", { text: "hi" });
@@ -61,10 +61,10 @@ Deno.test("namespaces isolate identically named rooms", async () => {
 		await one.connect();
 		await two.connect();
 
-		const seenByTwo: WSMessage[] = [];
+		const seenByTwo: WSRoomMessage[] = [];
 		await two.subscribe("chat", (msg) => seenByTwo.push(msg));
 
-		const seenByOne: WSMessage[] = [];
+		const seenByOne: WSRoomMessage[] = [];
 		await one.subscribe("chat", (msg) => seenByOne.push(msg));
 
 		const { recipients } = await one.publish("chat", { text: "org-1 only" });
@@ -119,8 +119,8 @@ Deno.test("broadcast crosses namespaces when allowed", async () => {
 		await one.connect();
 		await two.connect();
 
-		const seenByOne: WSMessage[] = [];
-		const seenByTwo: WSMessage[] = [];
+		const seenByOne: WSRoomMessage[] = [];
+		const seenByTwo: WSRoomMessage[] = [];
 		await one.subscribe("alerts", (m) => seenByOne.push(m));
 		await two.subscribe("alerts", (m) => seenByTwo.push(m));
 
@@ -158,7 +158,7 @@ Deno.test("a fan-out frame is encoded once, not once per subscriber", async () =
 	const clients = ["a", "b", "c"].map((id) => client(server.url, { clientId: id }));
 
 	try {
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		for (const c of clients) {
 			await c.connect();
 			await c.subscribe("chat", (m) => seen.push(m));
@@ -184,7 +184,7 @@ Deno.test("a broadcast is encoded once per namespace", async () => {
 	const two = client(server.url, { namespace: "org-2" });
 
 	try {
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		await one.connect();
 		await two.connect();
 		await one.subscribe("alerts", (m) => seen.push(m));
@@ -254,7 +254,7 @@ Deno.test("server-injected messages arrive with from: null", async () => {
 
 	try {
 		await c.connect();
-		const received: WSMessage[] = [];
+		const received: WSRoomMessage[] = [];
 		await c.subscribe("notifications", (m) => received.push(m));
 
 		const recipients = await server.service.publish("notifications", { n: 1 });
@@ -275,8 +275,8 @@ Deno.test("refcounting: one handler leaving does not unsubscribe the room", asyn
 
 	try {
 		await c.connect();
-		const a: WSMessage[] = [];
-		const b: WSMessage[] = [];
+		const a: WSRoomMessage[] = [];
+		const b: WSRoomMessage[] = [];
 		const unsubA = await c.subscribe("chat", (m) => a.push(m));
 		await c.subscribe("chat", (m) => b.push(m));
 
@@ -298,7 +298,7 @@ Deno.test("unsubscribe stops delivery", async () => {
 
 	try {
 		await c.connect();
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		await c.subscribe("chat", (m) => seen.push(m));
 		await c.unsubscribe("chat");
 		assertEquals(c.isSubscribed("chat"), false);
@@ -318,7 +318,7 @@ Deno.test("autoConnect: publish works without an explicit connect()", async () =
 
 	try {
 		await consumer.connect();
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		await consumer.subscribe("chat", (m) => seen.push(m));
 
 		// No connect() call: the send starts the machine and buffers until open.
@@ -476,7 +476,7 @@ Deno.test("HTTP injection works when guarded", async () => {
 
 	try {
 		await c.connect();
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		await c.subscribe("chat", (m) => seen.push(m));
 
 		const denied = await fetch(`${server.httpUrl}/publish/default/chat`, {

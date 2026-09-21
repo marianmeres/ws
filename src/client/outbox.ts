@@ -6,6 +6,10 @@
  * that pend indefinitely, so every tracked frame carries **one timeout
  * spanning queue + flight + ack** — not an ack-only timeout.
  *
+ * Not every frame awaits an ack. A `msg` sent without `{ ack: true }` is
+ * complete the moment it is written to the socket; it passes through here
+ * only so that, while offline, it is buffered and bounded like everything else.
+ *
  * Written by hand rather than on top of `@marianmeres/batch`: that flusher
  * triggers on interval/count, whereas this one triggers on connection state.
  * Bending it into shape costs more than the little code it saves.
@@ -13,16 +17,34 @@
  * @module
  */
 
-import type { ClientFrame, WSPublishResult } from "../protocol/frames.ts";
+import type { ClientFrame } from "../protocol/frames.ts";
 import { WSOutboxDropError, WSTimeoutError } from "../protocol/errors.ts";
+
+/** What a settled send resolves with — the parts of the `ack` the caller needs. */
+export interface OutboxResult {
+	/** Delivery count from a `pub`/`broadcast` ack; `0` otherwise. */
+	recipients: number;
+	/** The server's reply from a `msg` ack; `undefined` otherwise. */
+	payload?: unknown;
+}
+
+/** A tracked frame together with the key it is tracked under. */
+export interface OutboxEntry {
+	/** The key — the frame's wire `id` when it has one, a local one otherwise. */
+	id: string;
+	/** The frame itself. */
+	frame: ClientFrame;
+}
 
 interface PendingSend {
 	frame: ClientFrame;
-	resolve: (result: WSPublishResult) => void;
+	resolve: (result: OutboxResult) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
 	/** Still waiting in the queue (true) or already transmitted (false). */
 	queued: boolean;
+	/** Settled by an ack (true), or complete once transmitted (false). */
+	awaitAck: boolean;
 }
 
 /** Configuration for {@link Outbox}. */
@@ -68,18 +90,26 @@ export class Outbox {
 	/**
 	 * Registers a frame and returns the promise the caller awaits.
 	 *
-	 * @param id - correlation id, matched against the server's ack/nack
+	 * @param id - correlation id, matched against the server's ack/nack; for a
+	 * frame that awaits no ack, any locally unique key
 	 * @param frame - the frame itself, retained so it can be flushed later
 	 * @param queued - `true` to buffer it, `false` if it is going out now
+	 * @param awaitAck - `false` when the frame is complete once transmitted —
+	 * see {@link transmitted}
 	 */
-	track(id: string, frame: ClientFrame, queued: boolean): Promise<WSPublishResult> {
-		return new Promise<WSPublishResult>((resolve, reject) => {
+	track(
+		id: string,
+		frame: ClientFrame,
+		queued: boolean,
+		awaitAck = true,
+	): Promise<OutboxResult> {
+		return new Promise<OutboxResult>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.#discard(id);
 				reject(new WSTimeoutError(this.#options.sendTimeout));
 			}, this.#options.sendTimeout);
 
-			this.#pending.set(id, { frame, resolve, reject, timer, queued });
+			this.#pending.set(id, { frame, resolve, reject, timer, queued, awaitAck });
 
 			if (queued) {
 				this.#queue.push(id);
@@ -89,26 +119,43 @@ export class Outbox {
 	}
 
 	/**
-	 * Marks every buffered frame as transmitted and returns them in FIFO order.
-	 * They stay pending — they are awaiting acks now, not a connection.
+	 * Takes every buffered frame out of the queue and returns them in FIFO
+	 * order, for the caller to write and then report via {@link transmitted}
+	 * or {@link fail}. They stay pending — awaiting acks now, not a connection.
 	 */
-	drain(): ClientFrame[] {
-		const frames: ClientFrame[] = [];
+	drain(): OutboxEntry[] {
+		const entries: OutboxEntry[] = [];
 		for (const id of this.#queue) {
 			const entry = this.#pending.get(id);
 			if (!entry) continue;
 			entry.queued = false;
-			frames.push(entry.frame);
+			entries.push({ id, frame: entry.frame });
 		}
 		this.#queue = [];
-		return frames;
+		return entries;
 	}
 
-	/** Resolves a pending frame — the server acked it. */
-	settle(id: string, recipients: number): boolean {
+	/**
+	 * Reports a frame as written to the socket. One that awaits no ack is
+	 * complete and resolves here; one that does keeps waiting for its ack.
+	 */
+	transmitted(id: string): void {
+		const entry = this.#pending.get(id);
+		if (!entry || entry.awaitAck) return;
+		this.#discard(id);
+		entry.resolve({ recipients: 0 });
+	}
+
+	/**
+	 * Resolves a pending frame — the server acked it.
+	 *
+	 * @param recipients - the ack's delivery count, `0` when it carried none
+	 * @param payload - the ack's reply, when it carried one
+	 */
+	settle(id: string, recipients: number, payload?: unknown): boolean {
 		const entry = this.#discard(id);
 		if (!entry) return false;
-		entry.resolve({ recipients });
+		entry.resolve(payload === undefined ? { recipients } : { recipients, payload });
 		return true;
 	}
 

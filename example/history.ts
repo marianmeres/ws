@@ -23,7 +23,7 @@ import {
 	type WSPubSubAdapter,
 	WSPubSubLocal,
 } from "../src/server.ts";
-import type { WSMessage } from "../src/protocol.ts";
+import type { WSRoomMessage } from "../src/protocol.ts";
 import { HISTORY_LIMIT, isChatPayload } from "./shared.ts";
 
 /** Composite key for the buffer map. `|` cannot appear in a validated namespace. */
@@ -36,7 +36,7 @@ const key = (namespace: string, room: string) => `${namespace}|${room}`;
 export class HistoryAdapter implements WSPubSubAdapter {
 	readonly #inner: WSPubSubAdapter;
 	readonly #limit: number;
-	readonly #buffers = new Map<string, WSMessage[]>();
+	readonly #buffers = new Map<string, WSRoomMessage[]>();
 
 	constructor(inner: WSPubSubAdapter = new WSPubSubLocal(), limit = HISTORY_LIMIT) {
 		this.#inner = inner;
@@ -65,7 +65,7 @@ export class HistoryAdapter implements WSPubSubAdapter {
 	}
 
 	/** Oldest first. Returns a copy, so callers cannot corrupt the buffer. */
-	read(namespace: string, room: string): WSMessage[] {
+	read(namespace: string, room: string): WSRoomMessage[] {
 		return [...(this.#buffers.get(key(namespace, room)) ?? [])];
 	}
 

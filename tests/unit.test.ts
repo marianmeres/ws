@@ -9,7 +9,7 @@ import {
 	WSOutboxDropError,
 	WSTimeoutError,
 } from "../src/protocol/errors.ts";
-import type { ClientFrame, WSMessage } from "../src/protocol/frames.ts";
+import type { ClientFrame, WSRoomMessage } from "../src/protocol/frames.ts";
 
 const frame = (id: string): ClientFrame => ({
 	type: "pub",
@@ -133,6 +133,25 @@ Deno.test("outbox — settleInFlight answers transmitted frames, spares queued o
 	await assertRejects(() => queued, WSDisposedError);
 });
 
+Deno.test("outbox — an unacked frame completes when transmitted, an acked one waits", async () => {
+	const outbox = new Outbox({ maxSize: 10, sendTimeout: 1_000 });
+	const unacked = outbox.track("u", { type: "msg", payload: 1 }, true, false);
+	const acked = outbox.track("a", { type: "msg", id: "a", payload: 2 }, true);
+
+	const drained = outbox.drain();
+	assertEquals(drained.map((e) => e.id), ["u", "a"]);
+
+	outbox.transmitted("u");
+	outbox.transmitted("a");
+	assertEquals((await unacked).payload, undefined);
+	// Being written is not being answered.
+	assertEquals(outbox.pendingCount, 1);
+
+	outbox.settle("a", 0, { reply: true });
+	assertEquals((await acked).payload, { reply: true });
+	assertEquals(outbox.pendingCount, 0);
+});
+
 Deno.test("heartbeat — a later ping cannot postpone an unanswered one", async () => {
 	// Regression: arming the deadline on every ping used to reset it, so any
 	// pingInterval <= pongTimeout reset the timer forever and silently
@@ -219,7 +238,7 @@ Deno.test("rooms — a handler unsubscribing mid-delivery cannot corrupt it", ()
 	rooms.add("chat", first);
 	rooms.add("chat", second);
 
-	const msg: WSMessage = {
+	const msg: WSRoomMessage = {
 		room: "chat",
 		namespace: "default",
 		from: null,

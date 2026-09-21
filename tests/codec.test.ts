@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
 
 import { createWSClient } from "../src/mod.ts";
-import type { WSDecoder, WSEncoder, WSMessage } from "../src/protocol/frames.ts";
+import type { WSDecoder, WSEncoder, WSRoomMessage } from "../src/protocol/frames.ts";
 import { startBinaryHelloServer, startServer, until } from "./_helpers.ts";
 
 /** The simplest codec that puts a real binary frame on the wire. */
@@ -43,7 +43,7 @@ Deno.test("a matching binary codec works end to end", async () => {
 
 	try {
 		await c.connect();
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		await c.subscribe("chat", (m) => seen.push(m));
 
 		const { recipients } = await c.publish("chat", { text: "binary" });

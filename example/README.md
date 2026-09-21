@@ -9,6 +9,11 @@ with the Bootstrap Reboot bridge, and the controls come from
 [`@marianmeres/vanilla-ui`](https://jsr.io/@marianmeres/vanilla-ui)'s base style
 layer — minimal, but every colour is a token and no button is hand-rolled.
 
+It is a showcase of the **rooms** side of the client. The other way to use it —
+a plain message channel between client and server (`send()` on the client,
+`onMessage` / `service.send()` on the server) — is covered in the
+[main README](../README.md#1-messages--a-data-channel-to-your-server).
+
 ```bash
 deno task example        # builds the client bundle, then serves on :8000
 ```

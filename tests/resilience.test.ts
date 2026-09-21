@@ -1,7 +1,7 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 
 import { createWSClient } from "../src/mod.ts";
-import type { WSMessage } from "../src/protocol/frames.ts";
+import type { WSRoomMessage } from "../src/protocol/frames.ts";
 import {
 	WSConnectionLostError,
 	WSConnectTimeoutError,
@@ -31,7 +31,7 @@ Deno.test("reconnects after the server dies, and re-subscribes", async () => {
 
 	try {
 		await c.connect();
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		await c.subscribe("chat", (m) => seen.push(m));
 
 		await server.stop();
@@ -62,7 +62,7 @@ Deno.test("buffered publishes flush *after* re-subscribe, not before", async () 
 
 	try {
 		await c.connect();
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		await c.subscribe("chat", (m) => seen.push(m));
 
 		await server.stop();
@@ -104,7 +104,7 @@ Deno.test("a sub lost to a dropped socket resolves and keeps its room", async ()
 		// The socket is already on its way out, but the client still reads
 		// "open", so the `sub` goes out and nobody is left to acknowledge it.
 		const stopping = server.stop();
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		const subscribed = c.subscribe("chat", (m) => seen.push(m));
 		await stopping;
 
@@ -150,6 +150,80 @@ Deno.test("an in-flight publish rejects at the close, not at the timeout", async
 	} finally {
 		c.dispose();
 		await noAck.stop();
+	}
+});
+
+Deno.test("an in-flight acked send rejects at the close; an unacked one already resolved", async () => {
+	// This server closes the socket instead of answering the `msg`.
+	const noAck = startNoAckServer();
+	const c = client(noAck.url, { sendTimeout: 10_000, reconnectDelay: 10_000 });
+
+	try {
+		await c.connect();
+
+		const started = Date.now();
+		await assertRejects(() => c.send({ n: 1 }, { ack: true }), WSConnectionLostError);
+		const elapsed = Date.now() - started;
+		assert(
+			elapsed < 2_000,
+			`waited ${elapsed}ms — that is the timeout, not the close`,
+		);
+	} finally {
+		c.dispose();
+		await noAck.stop();
+	}
+});
+
+Deno.test("a send buffered while offline resolves once flushed, and arrives", async () => {
+	const port = freePort();
+	const received: unknown[] = [];
+	const options = {
+		onMessage: (_: unknown, payload: unknown) => void received.push(payload),
+	};
+	let server = startServer(options, port);
+	const c = client(server.url, { reconnectDelay: 30, reconnectDelayMax: 120 });
+
+	try {
+		await c.connect();
+		await server.stop();
+		await until(() => !c.connected, "client notices the drop");
+
+		// Issued while there is no connection at all: nothing can be written,
+		// so neither can resolve yet.
+		let settled = false;
+		const fire = c.send({ n: 1 }).then(() => settled = true);
+		const ask = c.send({ n: 2 }, { ack: true });
+		await sleep(100);
+		assertEquals(settled, false, "resolved before it was ever written");
+
+		server = startServer(options, port);
+		await fire;
+		await ask;
+		assertEquals(received, [{ n: 1 }, { n: 2 }], "flushed in order");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("an ignored fire-and-forget send that fails is not an unhandled rejection", async () => {
+	// Nothing listens on this port, so the send can only time out in the queue.
+	const c = client(`ws://127.0.0.1:${freePort()}/ws`, {
+		sendTimeout: 50,
+		reconnectDelay: 10_000,
+	});
+
+	try {
+		// Deliberately neither awaited nor caught — the way fire-and-forget
+		// invites it to be called. An unhandled rejection fails this test (and
+		// would exit a Deno or Node process).
+		c.send({ n: 1 });
+		await sleep(150);
+
+		// Awaiting one still reports the failure.
+		await assertRejects(() => c.send({ n: 2 }), WSTimeoutError);
+	} finally {
+		c.dispose();
 	}
 });
 
@@ -398,7 +472,7 @@ Deno.test("disconnect() is resumable — handlers and rooms survive", async () =
 
 	try {
 		await c.connect();
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		await c.subscribe("chat", (m) => seen.push(m));
 
 		c.disconnect();
@@ -482,7 +556,7 @@ Deno.test("a replaced connection does not evict its replacement", async () => {
 			"exactly one connection survives",
 		);
 
-		const seen: WSMessage[] = [];
+		const seen: WSRoomMessage[] = [];
 		await second.subscribe("chat", (m) => seen.push(m));
 		await server.service.publish("chat", { text: "to the survivor" });
 		await until(() => seen.length === 1, "the survivor still works");

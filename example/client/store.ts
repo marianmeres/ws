@@ -16,8 +16,8 @@ import { type Observable, observable } from "@marianmeres/vanilla";
 import {
 	createWSClient,
 	type WSClient,
-	type WSMessage,
 	type WSPresenceEvent,
+	type WSRoomMessage,
 	type WSState,
 } from "../../src/mod.ts";
 import {
@@ -63,7 +63,7 @@ let entrySeq = 0;
 const localKey = () => `local-${++entrySeq}`;
 
 /** Stable de-dup key for a wire message: ours if it has one, else from+time. */
-function messageKey(msg: WSMessage): string {
+function messageKey(msg: WSRoomMessage): string {
 	const { payload } = msg;
 	if (isChatPayload(payload) && payload.id) return payload.id;
 	return `${msg.from ?? "server"}:${msg.timestamp}`;
@@ -172,7 +172,7 @@ export function createChatStore(
 	}
 
 	/** Turns a wire message into an entry, or `null` if it is not ours to show. */
-	function toEntry(msg: WSMessage): Entry | null {
+	function toEntry(msg: WSRoomMessage): Entry | null {
 		const key = messageKey(msg);
 		const fromServer = msg.from === null;
 
@@ -206,7 +206,7 @@ export function createChatStore(
 		};
 	}
 
-	function onMessage(msg: WSMessage): void {
+	function onMessage(msg: WSRoomMessage): void {
 		if (isTypingPayload(msg.payload)) {
 			const nick = msg.payload.nick;
 			if (msg.from === ws.clientId) return; // our own ping, echoed back
@@ -253,7 +253,7 @@ export function createChatStore(
 				`/api/history/${encodeURIComponent(ns)}/${encodeURIComponent(target)}`,
 			);
 			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const { messages } = await res.json() as { messages: WSMessage[] };
+			const { messages } = await res.json() as { messages: WSRoomMessage[] };
 			if (room.get() !== target) return; // user switched away mid-fetch
 
 			const backlog: Entry[] = [];

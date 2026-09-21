@@ -1,5 +1,5 @@
 /**
- * Refcounted room registry.
+ * Refcounted room registry (rooms extension).
  *
  * N handlers on one room produce exactly one wire subscription; the `unsub`
  * frame goes out when the last handler detaches. This is what lets
@@ -9,10 +9,10 @@
  * @module
  */
 
-import type { SubRequest, WSMessage, WSPresenceEvent } from "../protocol/frames.ts";
+import type { SubRequest, WSPresenceEvent, WSRoomMessage } from "../protocol/frames.ts";
 
-/** Receives messages published to a room. */
-export type MessageHandler<T = unknown> = (msg: WSMessage<T>) => void;
+/** Receives messages published to a room — every routing field is present. */
+export type MessageHandler<T = unknown> = (msg: WSRoomMessage<T>) => void;
 
 /** Receives membership changes for a room subscribed with presence enabled. */
 export type PresenceHandler = (event: WSPresenceEvent) => void;
@@ -129,7 +129,7 @@ export class RoomRegistry {
 	 * Handlers are snapshotted first, so a handler that unsubscribes (or
 	 * subscribes) during delivery cannot corrupt the in-flight iteration.
 	 */
-	deliver(room: string, msg: WSMessage, onError: (e: unknown) => void): void {
+	deliver(room: string, msg: WSRoomMessage, onError: (e: unknown) => void): void {
 		const entry = this.#rooms.get(room);
 		if (!entry) return;
 		for (const handler of [...entry.handlers]) {

@@ -12,8 +12,13 @@
  *
  * It costs nothing today and it is the only thing that makes a breaking
  * protocol change survivable later.
+ *
+ * Version 2 split the protocol into a required **core** (handshake, messages
+ * in both directions, heartbeat) and an optional **rooms extension**
+ * (subscriptions, publishing, presence, broadcast), so a server that only
+ * needs a data channel implements the core and nothing else.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** Namespace used when the client does not specify one. */
 export const DEFAULT_NAMESPACE = "default";
@@ -24,11 +29,40 @@ export const DEFAULT_NAMESPACE = "default";
  * Note these are *protocol* types and have nothing to do with whatever the
  * application puts inside `payload` — the payload is opaque and is never
  * inspected nor mutated by this library.
+ *
+ * Every server implements the **core** frames. The **rooms extension**
+ * frames are sent only when the application uses rooms (`subscribe()`,
+ * `publish()`, `broadcast()`, presence), so a server that does not support
+ * them never sees one.
  */
 export const FRAME = {
-	// client -> server
+	// core, client -> server
 	/** Handshake. Always the first frame; carries the auth payload. */
 	AUTH: "auth",
+	/** Liveness probe. Answered with `pong`. */
+	PING: "ping",
+
+	// core, server -> client
+	/** Handshake accepted; carries the protocol version (and, with rooms, identity). */
+	HELLO: "hello",
+	/** Positive acknowledgement of a frame that carried an `id`; may carry a reply. */
+	ACK: "ack",
+	/** Negative acknowledgement; carries a `WSErrorInfo`. */
+	NACK: "nack",
+	/** Reply to `ping`. */
+	PONG: "pong",
+	/** Uncorrelated error — not tied to any request id. */
+	ERROR: "error",
+
+	// core, both directions
+	/**
+	 * A message. Client -> server it is addressed to the server itself;
+	 * server -> client it is either a direct message (core) or a room delivery
+	 * (rooms extension, recognisable by its `room` field).
+	 */
+	MSG: "msg",
+
+	// rooms extension, client -> server
 	/** Join one or more rooms, optionally with presence. */
 	SUB: "sub",
 	/** Leave one or more rooms. */
@@ -37,24 +71,10 @@ export const FRAME = {
 	PUB: "pub",
 	/** Publish into a room across every namespace. Gated server-side. */
 	BROADCAST: "broadcast",
-	/** Liveness probe. Answered with `pong`. */
-	PING: "ping",
 
-	// server -> client
-	/** Handshake accepted; carries the assigned id, namespace and version. */
-	HELLO: "hello",
-	/** Positive acknowledgement of a correlated request. */
-	ACK: "ack",
-	/** Negative acknowledgement; carries a `WSErrorInfo`. */
-	NACK: "nack",
-	/** A message delivered to a subscribed room. */
-	MSG: "msg",
+	// rooms extension, server -> client
 	/** A membership change in a presence-enabled room. */
 	PRESENCE: "presence",
-	/** Reply to `ping`. */
-	PONG: "pong",
-	/** Uncorrelated error — not tied to any request id. */
-	ERROR: "error",
 } as const;
 
 /**
@@ -112,11 +132,16 @@ export const ERROR_CODE = {
 	BAD_REQUEST: "bad_request",
 	/** Frame rate cap exceeded. */
 	RATE_LIMITED: "rate_limited",
+	/**
+	 * A frame type this server does not implement — typically a rooms frame
+	 * sent to a core-only server, or a `msg` to a server with no handler.
+	 */
+	UNSUPPORTED: "unsupported",
 	/** Unexpected server-side failure. */
 	INTERNAL: "internal",
 } as const;
 
-/** Presence event kinds. */
+/** Presence event kinds (rooms extension). */
 export const PRESENCE = {
 	/** Full membership snapshot, sent on every (re)subscribe. */
 	SYNC: "sync",

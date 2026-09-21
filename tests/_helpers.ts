@@ -96,8 +96,8 @@ export function startSilentServer(port = 0): {
 
 /**
  * A server that completes the handshake and then closes the socket the moment
- * it is asked to publish — so the frame is definitely transmitted and its ack
- * definitely cannot arrive.
+ * it is asked to publish, or sent a message — so the frame is definitely
+ * transmitted and its ack definitely cannot arrive.
  */
 export function startNoAckServer(port = 0): {
 	url: string;
@@ -122,7 +122,7 @@ export function startNoAckServer(port = 0): {
 						namespace: "default",
 						protocol: PROTOCOL_VERSION,
 					}));
-				} else if (frame.type === "pub") {
+				} else if (frame.type === "pub" || frame.type === "msg") {
 					socket.close(1001, "gone mid-publish");
 				}
 			};
@@ -183,6 +183,102 @@ export function startBinaryHelloServer(port = 0): {
 	const { port: actual } = server.addr as Deno.NetAddr;
 	return {
 		url: `ws://127.0.0.1:${actual}/ws`,
+		async stop() {
+			for (const socket of sockets) {
+				try {
+					socket.close();
+				} catch { /* already gone */ }
+			}
+			sockets.clear();
+			await server.shutdown();
+		},
+	};
+}
+
+/**
+ * A server that implements the **core** protocol and nothing else — the
+ * minimum PROTOCOL.md asks of a third-party server. No rooms, no identity in
+ * `hello`, no namespaces. Any frame it does not implement is `unsupported`.
+ *
+ * Rejects the auth payload `{ token: "bad" }` with 4001. Answers an acked
+ * `msg` with `{ echo: payload }`.
+ */
+export function startCoreServer(port = 0): {
+	url: string;
+	/** Every `auth` frame received, as sent. */
+	auths: Record<string, unknown>[];
+	/** Every `msg` payload received, in order. */
+	received: unknown[];
+	/** Pushes a direct message to every connected socket. */
+	push(payload: unknown): void;
+	stop(): Promise<void>;
+} {
+	const sockets = new Set<WebSocket>();
+	/** Sockets past the handshake — the only ones a push may reach. */
+	const ready = new Set<WebSocket>();
+	const auths: Record<string, unknown>[] = [];
+	const received: unknown[] = [];
+
+	const server = Deno.serve(
+		{ port, onListen: () => {}, hostname: "127.0.0.1" },
+		(req) => {
+			if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+				return new Response("nope", { status: 426 });
+			}
+			const { socket, response } = Deno.upgradeWebSocket(req);
+			sockets.add(socket);
+			const send = (frame: unknown) => socket.send(JSON.stringify(frame));
+
+			socket.onmessage = (event) => {
+				const frame = JSON.parse(event.data);
+				if (frame.type === "auth") {
+					auths.push(frame);
+					if (frame.payload?.token === "bad") {
+						socket.close(4001, "authentication failed");
+						return;
+					}
+					ready.add(socket);
+					send({ type: "hello", protocol: PROTOCOL_VERSION });
+				} else if (!ready.has(socket)) {
+					send({ type: "error", error: { code: "unauthorized", message: "" } });
+				} else if (frame.type === "ping") {
+					send({ type: "pong" });
+				} else if (frame.type === "msg") {
+					received.push(frame.payload);
+					if (typeof frame.id === "string") {
+						send({
+							type: "ack",
+							id: frame.id,
+							payload: { echo: frame.payload },
+						});
+					}
+				} else {
+					const error = { code: "unsupported", message: "rooms not supported" };
+					send(
+						typeof frame.id === "string"
+							? { type: "nack", id: frame.id, error }
+							: { type: "error", error },
+					);
+				}
+			};
+			socket.onclose = () => {
+				sockets.delete(socket);
+				ready.delete(socket);
+			};
+			return response;
+		},
+	);
+
+	const { port: actual } = server.addr as Deno.NetAddr;
+	return {
+		url: `ws://127.0.0.1:${actual}/ws`,
+		auths,
+		received,
+		push(payload) {
+			for (const socket of ready) {
+				socket.send(JSON.stringify({ type: "msg", payload }));
+			}
+		},
 		async stop() {
 			for (const socket of sockets) {
 				try {

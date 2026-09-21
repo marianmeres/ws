@@ -1,7 +1,9 @@
 # @marianmeres/ws — Agent Guide
 
-WebSocket client with namespaces, rooms, presence and reconnect, plus a
-demino-mountable reference server.
+WebSocket client with reconnect, half-open detection and buffered sends, used
+two ways: plain messages to/from the server (protocol **core**), or namespaces,
+rooms and presence (the optional **rooms extension**). Plus a demino-mountable
+reference server implementing both.
 
 ## Quick Reference
 
@@ -16,6 +18,8 @@ test: "deno task test"
 | Task                         | File                      | Key export                            |
 | ---------------------------- | ------------------------- | ------------------------------------- |
 | Client                       | `src/client/ws-client.ts` | `createWSClient`, `WSClient`          |
+| Messages (core), client      | `src/client/ws-client.ts` | `WSClient.send`, `message` event      |
+| Messages (core), server      | `src/server/service.ts`   | `onMessage` option, `WSService.send`  |
 | Reconnect curve              | `src/client/backoff.ts`   | `backoffDelay`                        |
 | Outbox + pending acks        | `src/client/outbox.ts`    | `Outbox`                              |
 | Room refcounting             | `src/client/rooms.ts`     | `RoomRegistry`                        |
@@ -33,7 +37,7 @@ src/
 ├── protocol.ts            # ./protocol entry -> protocol/mod.ts
 ├── protocol/              # dependency-free; imported by BOTH sides
 │   ├── constants.ts       # PROTOCOL_VERSION, FRAME, CLOSE, ERROR_CODE, PRESENCE
-│   ├── frames.ts          # ClientFrame / ServerFrame unions, WSMessage
+│   ├── frames.ts          # ClientFrame / ServerFrame unions, WSMessage, WSRoomMessage
 │   └── errors.ts          # typed errors
 ├── client/
 └── server/
@@ -66,8 +70,34 @@ to compensate — do not reintroduce that.
 frame shape means changing it there, and bumping `PROTOCOL_VERSION` if the
 change is breaking.
 
+**The protocol is two layers; keep them apart.** Core: `auth`/`hello`, `msg`
+(both directions), `ack`/`nack`, `ping`/`pong`, `error`. Rooms extension: `sub`,
+`unsub`, `pub`, `broadcast`, `presence`, and the routing fields (`room`,
+`namespace`, `from`, `timestamp`) on a delivered `msg`. A core-only server
+(PROTOCOL.md §8) must stay sufficient: never make a rooms concept — room,
+namespace, `clientId` — required in the core. That is why `hello` identity is
+optional, `auth` sends `clientId`/`namespace` only when the app set them, and
+`WSMessage` has only `payload` required (`WSRoomMessage` is the room-delivery
+refinement room handlers get). `tests/core.test.ts` runs the client against a
+core-only server (`startCoreServer`) and fails if the core stops being enough.
+
+**Every frame with an `id` gets exactly one answer.** A server answers an unknown
+or unimplemented frame type with `unsupported` — `nack` when it has a string
+`id`, `error` when not. Ignoring it would leave the client waiting out
+`sendTimeout`; answering it is what makes the rooms extension safely optional.
+
+**A `send()` without `{ ack: true }` completes when written.** It carries no
+wire id; the outbox tracks it under a local key with `awaitAck: false` only so
+it can be buffered and bounded offline, and `Outbox.transmitted()` resolves it.
+It is therefore never "in flight" — `settleInFlight` never sees it. Its returned
+promise is marked handled (`.catch(noop)` on it, then returned): fire-and-forget
+invites not awaiting, and it can still reject (queue timeout, outbox drop,
+terminal close). Removing that makes an ignored send fatal in Deno/Node; a
+resilience test fails if you do.
+
 **Ordering on reconnect is load-bearing.** `#onHello` must re-subscribe _before_
-flushing the outbox, and the server must handle `sub`/`unsub` **synchronously**.
+flushing the outbox (which holds `pub`, `broadcast` and `msg` frames alike), and
+the server must handle `sub`/`unsub` **synchronously**.
 Together these guarantee a buffered publish cannot land in a room the server has
 not registered yet. There is a test that fails if you break it
 (`buffered publishes flush *after* re-subscribe`).
@@ -85,7 +115,16 @@ or Node process.
 dispatch.** A malformed but parseable frame is a `nack`/`error` `bad_request`
 and the socket stays open; an unexpected throw is `error` `internal` and a 1011
 close. Both paths, including the async one, end in a `.catch()` — a handler that
-throws must never be able to take the process down.
+throws must never be able to take the process down. The one exception is the
+application's `onMessage`: its throw is an application failure, not broken
+bookkeeping, so it is answered (`WSRemoteError` → its own `code`/`message`,
+anything else → `internal` with no text) and the socket stays open.
+
+**`onMessage` is not serialized.** It is called in arrival order but not awaited
+before the next frame, like every other async path in the service. The Python
+servers in PROTOCOL.md do serialize (a per-connection worker) — both are
+documented as such; do not "fix" either to match the other without updating
+PROTOCOL.md §3.2.
 
 **Every send carries one deadline** spanning queue + flight + ack — not an
 ack-only timeout. Combining acks with infinite retry otherwise produces promises
@@ -145,13 +184,20 @@ run `deno publish` then the npm build.
 
 ## Before Making Changes
 
-1. `deno task test` — 66 tests, mostly real sockets against a real server:
-   `unit`, `integration`, `resilience`, `protocol` (server input hardening,
-   raw sockets) and `codec` (custom encode/decode, binary frames)
+1. `deno task test` — 83 tests, mostly real sockets against a real server:
+   `unit`, `integration`, `resilience`, `core` (messages: a core-only server,
+   `onMessage`, `service.send`), `protocol` (server input hardening, raw
+   sockets) and `codec` (custom encode/decode, binary frames)
 2. `deno lint && deno fmt --check && deno check src/mod.ts src/server.ts src/protocol.ts`
 3. Touched a public signature? `deno doc --lint src/mod.ts src/server.ts
    src/protocol.ts` **and** `deno publish --dry-run --allow-dirty`
-4. Touching the wire? Update `src/protocol/` first, then both sides
+4. Touching the wire? Update `src/protocol/` first, then both sides, then
+   PROTOCOL.md — including its two Python servers and the Appendix A script.
+   Re-verify them, don't eyeball them: copy each code block out, point the
+   script's `jsr:@marianmeres/ws` import at `src/mod.ts`, run each server with
+   `WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2` (Python 3.10+, `websockets>=13`, in a
+   venv) and run the script — core server without `WS_ROOMS`, full one with
+   `WS_ROOMS=1`
 5. Touching reconnect, outbox or heartbeat? Read `tests/resilience.test.ts`
    first — those tests encode the failure modes the design exists to handle
 6. `deno task npm:build` if packaging changed (npm ships the **client only**;
@@ -167,6 +213,8 @@ run `deno publish` then the npm build.
 - No server-side replay, so no at-least-once delivery
 - `recipients` counts are instance-local; they stay that way under a
   distributed adapter
+- Direct messages (`WSService.send`) are instance-local; the adapter carries
+  room messages only
 - Only `WSPubSubLocal` exists — Redis/Deno-KV adapters are an unimplemented seam
 - Presence is scoped to `(room, namespace)`; broadcast crosses namespaces but
   presence does not
@@ -175,12 +223,12 @@ run `deno publish` then the npm build.
 
 ## Documentation Index
 
-| Document            | Purpose                                                       |
-| ------------------- | ------------------------------------------------------------- |
-| `README.md`         | Human-facing overview and usage                               |
-| `API.md`            | Complete API reference — every public export                  |
-| `PROTOCOL.md`       | Wire protocol spec + Python server, for other implementations |
-| `example/README.md` | The reference app: what it demonstrates, and how              |
+| Document            | Purpose                                                                             |
+| ------------------- | ----------------------------------------------------------------------------------- |
+| `README.md`         | Human-facing overview and usage                                                     |
+| `API.md`            | Complete API reference — every public export                                        |
+| `PROTOCOL.md`       | Wire protocol spec (core + rooms extension), two Python servers, conformance script |
+| `example/README.md` | The reference app: what it demonstrates, and how                                    |
 
 `tmp/spec.md` (design spec and decision log) is referenced in some commits but
 is **untracked** — `tmp/*` is gitignored, so it does not exist in a fresh clone.

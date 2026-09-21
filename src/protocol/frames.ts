@@ -7,6 +7,11 @@
  * application. Your payload may contain its own `type` field and nothing will
  * collide.
  *
+ * The frames come in two layers. The **core** — `auth`/`hello`, `msg` in both
+ * directions, `ack`/`nack`, `ping`/`pong`, `error` — is all a server must
+ * implement. The **rooms extension** — `sub`, `unsub`, `pub`, `broadcast`,
+ * `presence`, and the routing fields on a delivered `msg` — is opt-in.
+ *
  * @module
  */
 
@@ -21,23 +26,46 @@ export interface WSErrorInfo {
 }
 
 /**
- * A message as delivered to application code.
+ * A message as delivered to application code — the `message` event fires
+ * with one for every inbound `msg` frame.
  *
  * A `msg` frame minus its `type` field *is* a `WSMessage` — there is no
  * translation layer and no divergence between wire names and API names.
+ *
+ * Only `payload` is guaranteed. A direct message from the server (core) has
+ * nothing else; a message delivered through a room (rooms extension) carries
+ * every routing field — see {@link WSRoomMessage}. `room` tells them apart.
  */
 export interface WSMessage<T = unknown> {
+	/** Opaque application payload. */
+	payload: T;
+	/** Room the message was published to. Absent on a direct message. */
+	room?: string;
+	/** Namespace the message belongs to. Absent on a direct message. */
+	namespace?: string;
+	/**
+	 * Originating client id, `null` when injected server-side. Absent on a
+	 * direct message, which always comes from the server.
+	 */
+	from?: string | null;
+	/** Server-assigned epoch milliseconds. Absent on a direct message. */
+	timestamp?: number;
+}
+
+/**
+ * A message delivered through a room (rooms extension). This is what room
+ * handlers receive: every routing field is present.
+ */
+export interface WSRoomMessage<T = unknown> extends WSMessage<T> {
 	/** Room the message was published to. */
 	room: string;
-	/** Namespace the message belongs to. */
+	/** Namespace the message belongs to — always the receiver's own. */
 	namespace: string;
 	/**
 	 * Originating client id, or `null` when the message was injected
 	 * server-side (via the service API or the HTTP routes).
 	 */
 	from: string | null;
-	/** Opaque application payload. */
-	payload: T;
 	/** Server-assigned epoch milliseconds. */
 	timestamp: number;
 }
@@ -47,7 +75,7 @@ export type PresenceEventType = (typeof PRESENCE)[keyof typeof PRESENCE];
 
 /**
  * A membership change in a room the client subscribed to with presence
- * enabled.
+ * enabled (rooms extension).
  *
  * `sync` carries the full snapshot and is emitted on every (re)subscribe —
  * crucially including after a reconnect, when membership may have changed
@@ -68,7 +96,7 @@ export interface WSPresenceEvent {
 	timestamp: number;
 }
 
-/** A single room subscription request. */
+/** A single room subscription request (rooms extension). */
 export interface SubRequest {
 	/** Room name to join. */
 	room: string;
@@ -80,13 +108,25 @@ export interface SubRequest {
 export type ClientFrame =
 	| {
 		type: typeof FRAME.AUTH;
-		id: string;
+		/**
+		 * Not sent since protocol 2 and never acknowledged. Kept optional so a
+		 * server keeps accepting a protocol-1 client that still sends it.
+		 */
+		id?: string;
 		protocol: number;
 		payload: unknown;
 		/** Preferred client id — the server may override it. */
 		clientId?: string;
+		/** Requested namespace — sent only when the application chose one. */
 		namespace?: string;
 	}
+	| {
+		type: typeof FRAME.MSG;
+		/** Present only when the sender awaits an `ack`/`nack`. */
+		id?: string;
+		payload: unknown;
+	}
+	| { type: typeof FRAME.PING }
 	| { type: typeof FRAME.SUB; id: string; rooms: SubRequest[] }
 	| { type: typeof FRAME.UNSUB; id: string; rooms: string[] }
 	| {
@@ -96,28 +136,36 @@ export type ClientFrame =
 		namespace?: string;
 		payload: unknown;
 	}
-	| { type: typeof FRAME.BROADCAST; id: string; room: string; payload: unknown }
-	| { type: typeof FRAME.PING };
+	| { type: typeof FRAME.BROADCAST; id: string; room: string; payload: unknown };
 
 /** Frames sent by the server. */
 export type ServerFrame =
 	| {
 		type: typeof FRAME.HELLO;
-		clientId: string;
-		namespace: string;
 		protocol: number;
+		/** Assigned client id. Optional in the core; always sent with rooms. */
+		clientId?: string;
+		/** Assigned namespace. Optional in the core; always sent with rooms. */
+		namespace?: string;
 	}
-	| { type: typeof FRAME.ACK; id: string; recipients?: number }
+	| {
+		type: typeof FRAME.ACK;
+		id: string;
+		/** Delivery count, on `pub`/`broadcast` acks only. */
+		recipients?: number;
+		/** The server's reply, on `msg` acks only. Any JSON value. */
+		payload?: unknown;
+	}
 	| { type: typeof FRAME.NACK; id: string; error: WSErrorInfo }
 	| ({ type: typeof FRAME.MSG } & WSMessage)
-	| ({ type: typeof FRAME.PRESENCE } & WSPresenceEvent)
 	| { type: typeof FRAME.PONG }
-	| { type: typeof FRAME.ERROR; error: WSErrorInfo };
+	| { type: typeof FRAME.ERROR; error: WSErrorInfo }
+	| ({ type: typeof FRAME.PRESENCE } & WSPresenceEvent);
 
 /** Any frame, in either direction. */
 export type WSFrame = ClientFrame | ServerFrame;
 
-/** Result of a successful `publish()` / `broadcast()`. */
+/** Result of a successful `publish()` / `broadcast()` (rooms extension). */
 export interface WSPublishResult {
 	/**
 	 * Sockets the message was handed to **on the receiving server instance**.

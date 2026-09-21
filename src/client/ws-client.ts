@@ -1,6 +1,13 @@
 /**
  * The WebSocket client.
  *
+ * Two ways to use it, freely mixed on one connection:
+ *
+ * - **Messages** (core): `send()` to the server, `on("message")` to receive.
+ *   Needs nothing from the server beyond the core protocol.
+ * - **Rooms** (extension): `subscribe()` / `publish()` / `broadcast()` and
+ *   presence, for servers that relay between clients.
+ *
  * @module
  */
 
@@ -24,6 +31,7 @@ import type {
 	WSMessage,
 	WSPresenceEvent,
 	WSPublishResult,
+	WSRoomMessage,
 } from "../protocol/frames.ts";
 import {
 	WSConnectionLostError,
@@ -36,7 +44,7 @@ import {
 } from "../protocol/errors.ts";
 import { backoffDelay } from "./backoff.ts";
 import { Heartbeat } from "./heartbeat.ts";
-import { Outbox } from "./outbox.ts";
+import { Outbox, type OutboxResult } from "./outbox.ts";
 import { type MessageHandler, type PresenceHandler, RoomRegistry } from "./rooms.ts";
 
 /**
@@ -78,9 +86,16 @@ const TRANSITIONS: Record<WSConnectionState, readonly WSConnectionState[]> = {
 export interface WSEvents {
 	/** Socket opened; authentication has not happened yet. */
 	open: void;
-	/** Authenticated and ready. */
-	connected: { clientId: string; namespace: string };
-	/** Firehose — every message, regardless of room. */
+	/**
+	 * Authenticated and ready. `clientId` is `null` when the server assigned
+	 * none — identity belongs to the rooms extension, and a core-only server
+	 * may skip it.
+	 */
+	connected: { clientId: string | null; namespace: string };
+	/**
+	 * Every inbound message: direct messages from the server, and — with
+	 * rooms — every room delivery regardless of room. `room` tells them apart.
+	 */
 	message: WSMessage;
 	/** Membership change in a room subscribed with presence enabled. */
 	presence: WSPresenceEvent;
@@ -111,6 +126,17 @@ export interface WSState {
 	lastError: Error | null;
 }
 
+/** Options for {@link WSClient.send}. */
+export interface WSSendOptions {
+	/**
+	 * Wait for the server's acknowledgement and resolve with its reply.
+	 *
+	 * Default `false`: resolve as soon as the frame is written to the socket,
+	 * with no confirmation that the server ever received it.
+	 */
+	ack?: boolean;
+}
+
 /** Per-room subscription options. */
 export interface SubscribeOptions {
 	/**
@@ -130,11 +156,14 @@ export interface WSClientOptions<TAuth = unknown> {
 	 * a path resolved against `location` in the browser. Default `/ws`.
 	 */
 	url?: string | URL;
-	/** Isolation boundary. Default `"default"`. */
+	/**
+	 * Isolation boundary for rooms. Default `"default"`. Sent to the server only
+	 * when set here — a server without rooms has no use for it.
+	 */
 	namespace?: string;
-	/** Preferred client id; the server may override it. */
+	/** Preferred client id; the server may override or ignore it. */
 	clientId?: string;
-	/** Rooms joined automatically on every (re)connect. */
+	/** Rooms joined automatically on every (re)connect (rooms extension). */
 	rooms?: string[];
 	/**
 	 * Produces the auth payload. Called before *every* (re)connect, so
@@ -142,7 +171,7 @@ export interface WSClientOptions<TAuth = unknown> {
 	 */
 	auth?: () => TAuth | Promise<TAuth>;
 	/**
-	 * Let the first `subscribe()`/`publish()` start the connection.
+	 * Let the first `send()`/`subscribe()`/`publish()` start the connection.
 	 * Default `true` — with an outbox and infinite retry, requiring an explicit
 	 * `connect()` first is ceremony whose only product is an error for people
 	 * who forgot.
@@ -213,9 +242,18 @@ function makeUnsubscriber(fn: () => void): Unsubscriber {
 }
 
 /**
- * A reconnecting WebSocket client with namespaces, rooms and presence.
+ * A reconnecting WebSocket client: plain messages to and from the server, and
+ * optionally namespaces, rooms and presence on top.
  *
- * @example
+ * @example Messages — the server is the peer
+ * ```ts
+ * const ws = createWSClient({ url: "/ws", auth: () => session.token });
+ * ws.on("message", (msg) => console.log(msg.payload));
+ * await ws.send({ op: "typing" }); // fire-and-forget
+ * const doc = await ws.send({ op: "load", id: 42 }, { ack: true }); // reply
+ * ```
+ *
+ * @example Rooms — the server relays between clients
  * ```ts
  * const ws = createWSClient({ url: "/ws", namespace: "org-123" });
  * const unsub = await ws.subscribe("chat", (msg) => console.log(msg.payload));
@@ -225,6 +263,8 @@ function makeUnsubscriber(fn: () => void): Unsubscriber {
 export class WSClient<TAuth = unknown> {
 	#url: URL;
 	#requestedNamespace: string;
+	/** Whether the application chose a namespace, i.e. whether `auth` carries it. */
+	#namespaceRequested: boolean;
 	#requestedClientId: string | undefined;
 	#authFn: (() => TAuth | Promise<TAuth>) | undefined;
 	#autoConnect: boolean;
@@ -276,7 +316,7 @@ export class WSClient<TAuth = unknown> {
 
 	/**
 	 * Nothing connects here — the socket opens on the first `connect()`,
-	 * `subscribe()` or `publish()`.
+	 * `send()`, `subscribe()` or `publish()`.
 	 *
 	 * @param options - see {@link WSClientOptions}; every field has a default
 	 */
@@ -285,6 +325,7 @@ export class WSClient<TAuth = unknown> {
 
 		this.#url = WSClient.resolveUrl(options.url ?? DEFAULTS.url);
 		this.#requestedNamespace = options.namespace ?? DEFAULTS.namespace;
+		this.#namespaceRequested = options.namespace !== undefined;
 		this.#requestedClientId = options.clientId;
 		this.#authFn = options.auth;
 		this.#autoConnect = options.autoConnect ?? DEFAULTS.autoConnect;
@@ -361,12 +402,18 @@ export class WSClient<TAuth = unknown> {
 		return this.#state;
 	}
 
-	/** Server-assigned id, available once connected. */
+	/**
+	 * Server-assigned id, available once connected. Stays `null` when the
+	 * server assigns none (a core-only server may not).
+	 */
 	get clientId(): string | null {
 		return this.#clientId;
 	}
 
-	/** Active namespace — the server's assignment wins over the request. */
+	/**
+	 * Active namespace — the server's assignment wins over the request. Falls
+	 * back to the requested one when the server assigns none.
+	 */
 	get namespace(): string {
 		return this.#namespace ?? this.#requestedNamespace;
 	}
@@ -573,7 +620,8 @@ export class WSClient<TAuth = unknown> {
 	 * @param options - pass `presence` to enable membership tracking
 	 * @returns detaches this handler; also `Symbol.dispose`-compatible, and
 	 * idempotent, so calling it twice is harmless
-	 * @throws {WSRemoteError} when connected and the server refuses
+	 * @throws {WSRemoteError} when connected and the server refuses — with code
+	 * `unsupported` when it does not implement rooms at all
 	 * @throws {WSDisposedError} when the client was disposed
 	 *
 	 * @example
@@ -679,6 +727,94 @@ export class WSClient<TAuth = unknown> {
 	// --------------------------------------------------------------- sending
 
 	/**
+	 * Sends a message to the server — the room-free way to talk to it, and all
+	 * a core-only server has to understand.
+	 *
+	 * Fire-and-forget: resolves as soon as the frame is written to the socket.
+	 * While disconnected it is buffered and resolves when flushed after the
+	 * next connect — bounded by `sendTimeout`, never indefinitely. There is no
+	 * delivery confirmation: a frame written into a connection that turns out
+	 * to be dead is lost, exactly as with a plain `WebSocket`. Pass
+	 * `{ ack: true }` when that matters.
+	 *
+	 * Safe to call without awaiting: the returned promise is marked handled,
+	 * so a failure nobody awaits is not an unhandled rejection. Await it to
+	 * learn about one.
+	 *
+	 * @param payload - opaque application data; never inspected or mutated
+	 * @param options - see {@link WSSendOptions}
+	 * @returns resolves once the frame is written to the socket
+	 * @throws {WSTimeoutError} still buffered when `sendTimeout` elapsed
+	 * @throws {WSOutboxDropError} evicted from a full outbox
+	 * @throws {WSNotConnectedError} sent while offline with `outboxMaxSize: 0`
+	 * @throws {WSTerminatedError} sent after a terminal close
+	 *
+	 * @example
+	 * ```ts
+	 * ws.send({ op: "cursor", x: 10, y: 20 });
+	 * ```
+	 */
+	send<T = unknown>(
+		payload: T,
+		options?: WSSendOptions & { ack?: false },
+	): Promise<void>;
+	/**
+	 * Sends a message to the server and waits for its acknowledgement.
+	 *
+	 * Resolves with the reply the server put in the ack — which makes this a
+	 * request/response call — or with `undefined` when it sent a bare ack.
+	 * Buffered while disconnected like any other send, and one `sendTimeout`
+	 * spans queue, flight and ack.
+	 *
+	 * @param payload - opaque application data; never inspected or mutated
+	 * @param options - `{ ack: true }`
+	 * @returns the server's reply, `undefined` when there was none
+	 * @throws {WSRemoteError} the server rejected it with a `nack` — code
+	 * `unsupported` when it accepts no messages at all
+	 * @throws {WSTimeoutError} `sendTimeout` elapsed with no acknowledgement
+	 * @throws {WSConnectionLostError} the socket closed before the ack arrived;
+	 * the message was not resent
+	 * @throws {WSOutboxDropError} evicted from a full outbox
+	 * @throws {WSNotConnectedError} sent while offline with `outboxMaxSize: 0`
+	 * @throws {WSTerminatedError} sent after a terminal close
+	 *
+	 * @example
+	 * ```ts
+	 * const doc = await ws.send<Doc>({ op: "load", id: 42 }, { ack: true });
+	 * ```
+	 */
+	send<R = unknown, T = unknown>(
+		payload: T,
+		options: WSSendOptions & { ack: true },
+	): Promise<R>;
+	/**
+	 * Either of the above, decided at runtime by `options.ack`.
+	 *
+	 * @param payload - opaque application data; never inspected or mutated
+	 * @param options - see {@link WSSendOptions}
+	 * @returns `undefined` without an ack, the server's reply with one
+	 */
+	send<T = unknown>(payload: T, options?: WSSendOptions): Promise<unknown>;
+	send(payload: unknown, options: WSSendOptions = {}): Promise<unknown> {
+		this.#assertUsable();
+		if (options.ack) {
+			const id = this.#nextId();
+			return this.#send({ type: FRAME.MSG, id, payload }, id).then((r) =>
+				r.payload
+			);
+		}
+		// No wire id: nothing is coming back. The outbox still needs a key to
+		// buffer it under while offline.
+		const sent = this.#send({ type: FRAME.MSG, payload }, this.#nextId(), false)
+			.then(noop);
+		// Fire-and-forget invites not awaiting, and an ignored rejection is
+		// fatal in Deno and Node. Marked handled, ignoring it is safe; awaiting
+		// it still reports the failure.
+		sent.catch(noop);
+		return sent;
+	}
+
+	/**
 	 * Publishes to a room within this client's namespace.
 	 *
 	 * Resolves with the recipient count once the server acknowledges. While
@@ -711,7 +847,7 @@ export class WSClient<TAuth = unknown> {
 			room,
 			payload,
 			...(namespace ? { namespace } : {}),
-		}, id);
+		}, id).then(({ recipients }) => ({ recipients }));
 	}
 
 	/**
@@ -730,7 +866,8 @@ export class WSClient<TAuth = unknown> {
 	broadcast<T = unknown>(room: string, payload: T): Promise<WSPublishResult> {
 		this.#assertUsable();
 		const id = this.#nextId();
-		return this.#send({ type: FRAME.BROADCAST, id, room, payload }, id);
+		return this.#send({ type: FRAME.BROADCAST, id, room, payload }, id)
+			.then(({ recipients }) => ({ recipients }));
 	}
 
 	// -------------------------------------------------------------- internals
@@ -747,7 +884,13 @@ export class WSClient<TAuth = unknown> {
 		if (this.#state === "idle") this.#open();
 	}
 
-	#send(frame: ClientFrame, id: string): Promise<WSPublishResult> {
+	/**
+	 * Sends a frame through the outbox: now when connected, buffered otherwise.
+	 *
+	 * @param id - the frame's wire `id`, or a local key for a frame without one
+	 * @param awaitAck - `false` completes the send once written, not once acked
+	 */
+	#send(frame: ClientFrame, id: string, awaitAck = true): Promise<OutboxResult> {
 		if (this.#autoConnect) this.#ensureStarted();
 
 		// Nothing restarts from `terminated` except an explicit connect(), so
@@ -763,12 +906,16 @@ export class WSClient<TAuth = unknown> {
 			return Promise.reject(new WSNotConnectedError());
 		}
 
-		const promise = this.#outbox.track(id, frame, !canSendNow);
-		if (canSendNow) {
-			const error = this.#sendRaw(frame);
-			if (error) this.#outbox.fail(id, error);
-		}
+		const promise = this.#outbox.track(id, frame, !canSendNow, awaitAck);
+		if (canSendNow) this.#transmit(id, frame);
 		return promise;
+	}
+
+	/** Writes a tracked frame and reports the outcome to the outbox. */
+	#transmit(id: string, frame: ClientFrame): void {
+		const error = this.#sendRaw(frame);
+		if (error) this.#outbox.fail(id, error);
+		else this.#outbox.transmitted(id);
 	}
 
 	/**
@@ -778,11 +925,12 @@ export class WSClient<TAuth = unknown> {
 	 * by the re-subscribe step on reconnect, so queueing them too would apply
 	 * them twice.
 	 */
-	#sendControl(frame: ClientFrame): Promise<WSPublishResult> {
-		const id = "id" in frame ? frame.id : this.#nextId();
-		const promise = this.#outbox.track(id, frame, false);
+	#sendControl(
+		frame: Extract<ClientFrame, { type: typeof FRAME.SUB | typeof FRAME.UNSUB }>,
+	): Promise<OutboxResult> {
+		const promise = this.#outbox.track(frame.id, frame, false);
 		const error = this.#sendRaw(frame);
-		if (error) this.#outbox.fail(id, error);
+		if (error) this.#outbox.fail(frame.id, error);
 		return promise;
 	}
 
@@ -874,13 +1022,14 @@ export class WSClient<TAuth = unknown> {
 		// The await above yields; a close may have superseded this socket.
 		if (generation !== this.#generation) return;
 
+		// Only what the application actually chose goes on the wire: a server
+		// without rooms should not have to wade through identity it never uses.
 		this.#sendRaw({
 			type: FRAME.AUTH,
-			id: this.#nextId(),
 			protocol: PROTOCOL_VERSION,
 			payload,
 			...(this.#requestedClientId ? { clientId: this.#requestedClientId } : {}),
-			namespace: this.#requestedNamespace,
+			...(this.#namespaceRequested ? { namespace: this.#requestedNamespace } : {}),
 		});
 
 		// Without this, a server that accepts the socket then never replies
@@ -915,7 +1064,7 @@ export class WSClient<TAuth = unknown> {
 				break;
 
 			case FRAME.ACK:
-				this.#outbox.settle(frame.id, frame.recipients ?? 0);
+				this.#outbox.settle(frame.id, frame.recipients ?? 0, frame.payload);
 				break;
 
 			case FRAME.NACK:
@@ -925,11 +1074,15 @@ export class WSClient<TAuth = unknown> {
 			case FRAME.MSG: {
 				const { type: _t, ...message } = frame;
 				this.#emit("message", message as WSMessage);
-				this.#rooms.deliver(
-					message.room,
-					message as WSMessage,
-					(e) => this.#fail(e, "message handler threw"),
-				);
+				// Only a room delivery carries `room`. A direct message from the
+				// server has no room to route by — the firehose is its only way in.
+				if (typeof message.room === "string") {
+					this.#rooms.deliver(
+						message.room,
+						message as WSRoomMessage,
+						(e) => this.#fail(e, "message handler threw"),
+					);
+				}
 				break;
 			}
 
@@ -956,7 +1109,11 @@ export class WSClient<TAuth = unknown> {
 		}
 	}
 
-	#onHello(clientId: string, namespace: string, protocol: number): void {
+	#onHello(
+		clientId: string | undefined,
+		namespace: string | undefined,
+		protocol: number,
+	): void {
 		clearTimeout(this.#handshakeTimer);
 		this.#handshakeTimer = undefined;
 
@@ -966,15 +1123,21 @@ export class WSClient<TAuth = unknown> {
 			);
 		}
 
-		this.#clientId = clientId;
-		this.#namespace = namespace;
+		// Identity belongs to the rooms extension: a core-only server may
+		// assign none, and then there is none — not a stale one from before.
+		this.#clientId = typeof clientId === "string" && clientId ? clientId : null;
+		this.#namespace = typeof namespace === "string" && namespace ? namespace : null;
 		this.#attempt = 0;
 		this.#lastError = null;
 
 		if (!this.#setState("open")) return;
 
-		this.logger?.debug?.(`connected as ${clientId} in "${namespace}"`);
-		this.#emit("connected", { clientId, namespace });
+		this.logger?.debug?.(
+			`connected${
+				this.#clientId ? ` as ${this.#clientId}` : ""
+			} in "${this.namespace}"`,
+		);
+		this.#emit("connected", { clientId: this.#clientId, namespace: this.namespace });
 		this.#heartbeat.start();
 		this.#settleConnect(null);
 
@@ -993,10 +1156,7 @@ export class WSClient<TAuth = unknown> {
 		const buffered = this.#outbox.drain();
 		if (buffered.length) {
 			this.logger?.debug?.(`flushing ${buffered.length} buffered frame(s)`);
-			for (const frame of buffered) {
-				const error = this.#sendRaw(frame);
-				if (error && "id" in frame) this.#outbox.fail(frame.id, error);
-			}
+			for (const { id, frame } of buffered) this.#transmit(id, frame);
 		}
 	}
 
@@ -1045,8 +1205,10 @@ export class WSClient<TAuth = unknown> {
 	 * `sub`/`unsub` resolve: the room registry is authoritative locally and the
 	 * re-subscribe step will establish it on the next connection, which is
 	 * exactly the contract of a `subscribe()` issued while offline — and the
-	 * server forgets its rooms on close anyway. Publishes reject: they were not
-	 * delivered, and at-most-once means they will not be resent.
+	 * server forgets its rooms on close anyway. Publishes and acked sends
+	 * reject: they were not confirmed, and at-most-once means they will not be
+	 * resent. (A send without an ack is never in flight — it completed when it
+	 * was written.)
 	 */
 	#settleInFlight(): void {
 		this.#outbox.settleInFlight((frame) =>
@@ -1222,13 +1384,20 @@ export class WSClient<TAuth = unknown> {
  * @param options - see {@link WSClientOptions}
  * @returns a client that has not connected yet
  *
- * @example
+ * @example Messages
  * ```ts
  * const ws = createWSClient({
  *     url: "wss://example.com/ws",
- *     namespace: "org-123",
  *     auth: () => session.token, // re-read on every reconnect
  * });
+ *
+ * ws.on("message", (msg) => console.log(msg.payload));
+ * const reply = await ws.send({ op: "ping" }, { ack: true });
+ * ```
+ *
+ * @example Rooms
+ * ```ts
+ * const ws = createWSClient({ url: "wss://example.com/ws", namespace: "org-123" });
  *
  * await ws.subscribe("chat", (msg) => console.log(msg.from, msg.payload));
  * await ws.publish("chat", { text: "hello" });
