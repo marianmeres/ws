@@ -23,6 +23,13 @@ export interface WSErrorInfo {
 	code: string;
 	/** Human-readable explanation. Never parse this. */
 	message: string;
+	/**
+	 * Optional structured detail for the application — any JSON value, never
+	 * inspected by the protocol. Where `message` is for a human to read,
+	 * this is for code to branch on: a retry-after, a limit that was hit, the
+	 * field that failed validation.
+	 */
+	details?: unknown;
 }
 
 /**

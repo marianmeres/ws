@@ -123,6 +123,41 @@ Deno.test("core-only server: rooms fail fast with unsupported, not a timeout", a
 	}
 });
 
+Deno.test("core-only server: a nack's details reach WSRemoteError.details, an error frame's too", async () => {
+	const server = startCoreServer();
+	const c = client(server.url);
+
+	try {
+		// Structured detail the application branches on — a countdown here —
+		// rides along with the code; `message` stays for humans.
+		const details = { time_left_seconds: 42 };
+		const err = await assertRejects(
+			() => c.send({ op: "refuse", details }, { ack: true }),
+			WSRemoteError,
+		);
+		assertEquals(err.code, "refused");
+		assertEquals(err.details, details);
+
+		// Nothing attached, nothing invented.
+		const bare = await assertRejects(
+			() => c.send({ op: "refuse" }, { ack: true }),
+			WSRemoteError,
+		);
+		assertEquals(bare.details, undefined);
+
+		// The uncorrelated `error` frame carries it the same way.
+		const errors: Error[] = [];
+		c.on("error", (e) => errors.push(e));
+		await c.send({ op: "refuse", details: { capacity: "full" } });
+		await until(() => errors.length === 1, "error event");
+		assert(errors[0] instanceof WSRemoteError);
+		assertEquals(errors[0].details, { capacity: "full" });
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
 Deno.test("core-only server: 4001 is terminal", async () => {
 	const server = startCoreServer();
 	const c = client(server.url, { auth: () => ({ token: "bad" }) });
@@ -208,6 +243,66 @@ Deno.test("onMessage throwing: WSRemoteError speaks for itself, anything else is
 		// An application error is not a broken connection.
 		assert(c.connected);
 		assertEquals(await c.send("ok", { ack: true }), "fine");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("onMessage throwing WSRemoteError with details delivers them unchanged", async () => {
+	const details = { capacity: "full", time_left_seconds: 42 };
+	const server = startServer({
+		onMessage: (_ctx, payload) => {
+			if (payload === "busy") {
+				throw new WSRemoteError({ code: "busy", message: "try later", details });
+			}
+			throw new WSRemoteError({ code: "nope", message: "no" });
+		},
+	});
+	const c = client(server.url);
+
+	try {
+		const busy = await assertRejects(
+			() => c.send("busy", { ack: true }),
+			WSRemoteError,
+		);
+		assertEquals(busy.code, "busy");
+		assertEquals(busy.message, "try later");
+		assertEquals(busy.details, details);
+
+		const bare = await assertRejects(() => c.send("x", { ack: true }), WSRemoteError);
+		assertEquals(bare.details, undefined);
+
+		// A fire-and-forget refusal travels as an `error` frame; same passthrough.
+		const errors: Error[] = [];
+		c.on("error", (e) => errors.push(e));
+		await c.send("busy");
+		await until(() => errors.length === 1, "error event");
+		assertEquals((errors[0] as WSRemoteError).details, details);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a refusal whose details the encoder rejects is still answered", async () => {
+	const server = startServer({
+		onMessage: () => {
+			// `details` is the application's, so it can be anything — a BigInt
+			// included, which JSON cannot encode.
+			throw new WSRemoteError({ code: "odd", message: "odd", details: { n: 1n } });
+		},
+	});
+	const c = client(server.url, { sendTimeout: 20_000 });
+
+	try {
+		const started = Date.now();
+		const err = await assertRejects(() => c.send(1, { ack: true }), WSRemoteError);
+		// Not the refusal the hook meant, but an answer — rather than the
+		// client waiting out its whole send timeout for a nack that never left.
+		assertEquals(err.code, ERROR_CODE.INTERNAL);
+		assert(Date.now() - started < 2_000, "answered, not timed out");
+		assert(c.connected);
 	} finally {
 		c.dispose();
 		await server.stop();

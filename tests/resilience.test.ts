@@ -358,6 +358,133 @@ Deno.test("a local disconnect() emits close 4900, willReconnect false", async ()
 	}
 });
 
+/** A logger that records every warning and error, for asserting there were none. */
+function recordingLogger(): { logger: Record<string, unknown>; lines: string[] } {
+	const lines: string[] = [];
+	const record = (level: string) => (...args: unknown[]) =>
+		lines.push(`${level}: ${args.map(String).join(" ")}`);
+	return {
+		logger: {
+			debug: () => {},
+			info: () => {},
+			warn: record("warn"),
+			error: record("error"),
+		},
+		lines,
+	};
+}
+
+Deno.test("reconnect: false — a lost connection ends idle, quietly, and connect() resumes it", async () => {
+	const port = freePort();
+	let server = startServer({}, port);
+	const { logger, lines } = recordingLogger();
+	const c = client(server.url, { reconnect: false, reconnectDelay: 30, logger });
+
+	try {
+		const closes: Array<{ code: number; willReconnect: boolean }> = [];
+		const reconnecting: unknown[] = [];
+		const terminated: unknown[] = [];
+		c.on("close", (e) => closes.push(e));
+		c.on("reconnecting", (e) => reconnecting.push(e));
+		c.on("terminated", (e) => terminated.push(e));
+
+		await c.connect();
+		await server.stop();
+		await until(() => c.connectionState === "idle", "the client settles");
+
+		// The close is reported honestly — nothing is coming — and classified as
+		// neither a retry nor a failure.
+		assertEquals(closes.map((e) => [e.code, e.willReconnect]), [[1001, false]]);
+		assertEquals(reconnecting, [], "no retry may be scheduled");
+		assertEquals(terminated, [], "declining to retry is not a terminal failure");
+		await sleep(150);
+		assertEquals(c.connectionState, "idle");
+		assertEquals(c.dump().attempt, 0);
+		// The whole point over `on("close", () => disconnect())`: no bogus
+		// "illegal state transition" warning, and no error-level line either.
+		assertEquals(lines, []);
+
+		// Idle is resumable, like after disconnect(): the caller decides when.
+		server = startServer({}, port);
+		await c.connect();
+		assert(c.connected);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("reconnect: false — a pending connect() rejects when the close is not retried", async () => {
+	// Nothing listens here. With retries the await would simply wait for the
+	// server; without them there is nothing to wait for, and it must say so.
+	const c = client(`ws://127.0.0.1:${freePort()}/ws`, { reconnect: false });
+
+	try {
+		const error = await assertRejects(() => c.connect(), WSTerminatedError);
+		// The code of a refused connection is the runtime's to report (Deno
+		// says 0, browsers 1006); what matters is that it is not a retry.
+		assert(typeof error.code === "number");
+		assertEquals(c.connectionState, "idle", "declined, not terminated");
+	} finally {
+		c.dispose();
+	}
+});
+
+Deno.test("a reconnect function sees code, reason and attempt, and its verdict is honoured", async () => {
+	const port = freePort();
+	const server = startServer({}, port);
+	const seen: Array<{ code: number; attempt: number }> = [];
+	const c = client(server.url, {
+		reconnectDelay: 30,
+		reconnectDelayMax: 60,
+		// One retry, then give up.
+		reconnect: ({ code, attempt }: { code: number; attempt: number }) => {
+			seen.push({ code, attempt });
+			return attempt < 1;
+		},
+	});
+
+	try {
+		await c.connect();
+		await server.stop();
+		await until(() => c.connectionState === "idle", "the client gives up", 5_000);
+
+		// First close: the working connection went away, no attempts failed yet,
+		// so the policy allows one retry. That retry finds nobody listening, and
+		// the policy, now at attempt 1, declines. (The code of the refused
+		// connection is the runtime's: Deno reports 0, browsers 1006.)
+		assertEquals(seen.length, 2);
+		assertEquals(seen[0], { code: 1001, attempt: 0 });
+		assertEquals(seen[1].attempt, 1);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("the reconnect policy is not consulted for a terminal close", async () => {
+	const server = startServer({ verify: () => null });
+	let consulted = 0;
+	const c = client(server.url, {
+		reconnect: () => {
+			consulted++;
+			return true;
+		},
+	});
+
+	try {
+		// `terminalCloseCodes` decides first; a policy cannot talk the client
+		// into retrying rejected credentials.
+		const error = await assertRejects(() => c.connect(), WSTerminatedError);
+		assertEquals(error.code, 4001);
+		assertEquals(c.connectionState, "terminated");
+		assertEquals(consulted, 0);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
 Deno.test("a stale auth() rejection leaves the newer socket alone", async () => {
 	const server = startServer();
 	let attempt = 0;

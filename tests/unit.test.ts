@@ -100,6 +100,25 @@ Deno.test("outbox — the timeout spans the queue, not just the flight", async (
 	assertEquals(outbox.pendingCount, 0);
 });
 
+Deno.test("outbox — a per-frame timeout replaces the default for that frame alone", async () => {
+	const outbox = new Outbox({ maxSize: 10, sendTimeout: 5_000 });
+	const quick = outbox.track("q", frame("q"), true, true, 40);
+	const patient = outbox.track("p", frame("p"), true);
+
+	const started = Date.now();
+	const error = await assertRejects(() => quick, WSTimeoutError);
+	assert(Date.now() - started < 1_000, "the shorter deadline must apply");
+	// The error names the deadline that applied, not the default.
+	assert(error.message.includes("40ms"), error.message);
+
+	// The default-deadline frame is untouched.
+	assertEquals(outbox.pendingCount, 1);
+	assertEquals(outbox.queuedCount, 1);
+
+	outbox.failAll(new WSDisposedError());
+	await assertRejects(() => patient, WSDisposedError);
+});
+
 Deno.test("outbox — failAll settles everything", async () => {
 	const outbox = new Outbox({ maxSize: 10, sendTimeout: 5_000 });
 	const a = outbox.track("a", frame("a"), true);

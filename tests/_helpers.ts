@@ -201,7 +201,10 @@ export function startBinaryHelloServer(port = 0): {
  * `hello`, no namespaces. Any frame it does not implement is `unsupported`.
  *
  * Rejects the auth payload `{ token: "bad" }` with 4001. Answers an acked
- * `msg` with `{ echo: payload }`.
+ * `msg` with `{ echo: payload }` — except one whose payload is
+ * `{ op: "refuse", details? }`, which it refuses with code `refused`, carrying
+ * the `details` the payload asked for (a `nack` with an id, an `error` frame
+ * without).
  */
 export function startCoreServer(port = 0): {
 	url: string;
@@ -245,7 +248,19 @@ export function startCoreServer(port = 0): {
 					send({ type: "pong" });
 				} else if (frame.type === "msg") {
 					received.push(frame.payload);
-					if (typeof frame.id === "string") {
+					if (frame.payload?.op === "refuse") {
+						const { details } = frame.payload;
+						const error = {
+							code: "refused",
+							message: "refused on request",
+							...(details === undefined ? {} : { details }),
+						};
+						send(
+							typeof frame.id === "string"
+								? { type: "nack", id: frame.id, error }
+								: { type: "error", error },
+						);
+					} else if (typeof frame.id === "string") {
 						send({
 							type: "ack",
 							id: frame.id,

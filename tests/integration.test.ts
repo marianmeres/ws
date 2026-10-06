@@ -9,8 +9,13 @@ import type {
 	WSRoomMessage,
 } from "../src/protocol/frames.ts";
 import { FRAME } from "../src/protocol/constants.ts";
-import { WSRemoteError, WSTerminatedError } from "../src/protocol/errors.ts";
-import { startServer, until } from "./_helpers.ts";
+import {
+	WSConnectionLostError,
+	WSRemoteError,
+	WSTerminatedError,
+	WSTimeoutError,
+} from "../src/protocol/errors.ts";
+import { sleep, startServer, startSilentServer, until } from "./_helpers.ts";
 
 /** Quiet, heartbeat-free client — liveness has its own tests. */
 const client = (url: string, options: Record<string, unknown> = {}) =>
@@ -308,6 +313,42 @@ Deno.test("unsubscribe stops delivery", async () => {
 	} finally {
 		c.dispose();
 		await server.stop();
+	}
+});
+
+Deno.test("a per-send timeout bounds that send while the default governs the rest", async () => {
+	// The silent server completes the handshake and then answers nothing, so
+	// an acked send can only end by its deadline.
+	const silent = startSilentServer();
+	const c = client(silent.url, { sendTimeout: 30_000 });
+
+	try {
+		await c.connect();
+
+		let defaultSettled = false;
+		const patient = c.send({ op: "create" }, { ack: true });
+		patient.then(() => defaultSettled = true, () => defaultSettled = true);
+
+		const started = Date.now();
+		const error = await assertRejects(
+			() => c.send({ op: "start" }, { ack: true, timeout: 50 }),
+			WSTimeoutError,
+		);
+		const elapsed = Date.now() - started;
+		assert(elapsed < 2_000, `waited ${elapsed}ms — that is not a 50ms deadline`);
+		// It reports the deadline that applied, not the client-wide one.
+		assert(error.message.includes("50ms"), error.message);
+
+		// The send on the default deadline is still waiting — 30 s, not 50 ms.
+		await sleep(100);
+		assertEquals(defaultSettled, false, "the default deadline was shortened too");
+
+		// Still in flight, so the close settles it — not the dispose after it.
+		c.dispose();
+		await assertRejects(() => patient, WSConnectionLostError);
+	} finally {
+		c.dispose();
+		await silent.stop();
 	}
 });
 

@@ -36,6 +36,7 @@ following the `PubSub` / `createPubSub` precedent.
 | `auth`               | `() => unknown \| Promise<unknown>` | —                  | Auth payload; called before _every_ (re)connect                               |
 | `autoConnect`        | `boolean`                           | `true`             | First `send()`/`subscribe()`/`publish()` starts the connection                |
 | `logger`             | `Logger \| null`                    | `createClog("ws")` | `null` silences                                                               |
+| `reconnect`          | `boolean \| (close) => boolean`     | `true`             | Retry after a non-terminal close? `false` never; a function decides per close |
 | `reconnectDelay`     | `number`                            | `500`              | Initial backoff, ms                                                           |
 | `reconnectDelayMax`  | `number`                            | `30_000`           | Backoff ceiling, ms                                                           |
 | `terminalCloseCodes` | `number[]`                          | `[4001, 4003]`     | Codes after which retrying stops                                              |
@@ -51,6 +52,17 @@ following the `PubSub` / `createPubSub` precedent.
 reference server still closes a connection that sent nothing for `idleTimeout`
 (60 s) with `4008`, so a heartbeat-free client reconnects roughly every minute.
 Disable both or neither.
+
+`reconnect` and `terminalCloseCodes` are different knobs. A terminal close is a
+_failure_: the client ends `terminated`, logs at error level, emits
+`terminated`. A close that `reconnect` declines to retry is not: the client
+ends `idle`, quietly, exactly as after `disconnect()`, and a later `connect()`
+(or any send, with `autoConnect`) starts it again. Use `reconnect: false` for
+a server that forgets the session when its socket closes, so that reconnecting
+could only ever authenticate into nothing; use the function form to give up
+after a number of tries — it receives a [`WSCloseInfo`](#wscloseinfo).
+The policy is consulted only for non-terminal codes; `terminalCloseCodes`
+decides first.
 
 **Returns** `WSClient`
 
@@ -97,16 +109,18 @@ gate, not a prerequisite.
 
 Rejects **only** where retrying cannot help:
 
-- `WSTerminatedError` — a terminal close code, or code `4900` when
-  `disconnect()` (or `dispose()`, which disconnects first) is called while this
-  is still pending
+- `WSTerminatedError` — a terminal close code; a close the `reconnect` policy
+  declined to retry (the client is `idle` then, not `terminated`); or code
+  `4900` when `disconnect()` (or `dispose()`, which disconnects first) is
+  called while this is still pending
 - `WSConnectTimeoutError` — `connectTimeout` elapsed. Retrying continues in the
   background, so this bounds _your await_, not the connection attempt
 - `WSDisposedError` — called on an already disposed client. A `dispose()`
   _during_ a pending connect settles it with the `4900` `WSTerminatedError`
   above, not with this
 
-Ordinary network failure never rejects; that is what the infinite retry is for.
+Ordinary network failure never rejects while the client retries; that is what
+the infinite retry is for.
 
 ##### `disconnect(): void`
 
@@ -144,14 +158,15 @@ Await it to learn about one.
 server's acknowledgement. It resolves with the reply the server put in the ack —
 which makes this a request/response call — or with `undefined` for a bare ack. A
 refusal (`nack`) rejects with `WSRemoteError` carrying the server's `code`, which
-can be one of the server application's own. An acknowledged send in flight when
-the socket closes rejects there and then with `WSConnectionLostError`; it is not
-resent.
+can be one of the server application's own, and any structured `details` it
+attached. An acknowledged send in flight when the socket closes rejects there
+and then with `WSConnectionLostError`; it is not resent.
 
 Either way, while disconnected the frame is buffered and flushed after the next
-connect, in order — bounded by `sendTimeout`, which spans queue, flight and (with
-an ack) acknowledgement. After a terminal close nothing is buffered: the promise
-rejects immediately with `WSTerminatedError`.
+connect, in order — bounded by one deadline spanning queue, flight and (with an
+ack) acknowledgement: the client's `sendTimeout`, or `options.timeout` for this
+send alone. After a terminal close nothing is buffered: the promise rejects
+immediately with `WSTerminatedError`.
 
 A third overload, `send<T>(payload, options?: WSSendOptions): Promise<unknown>`,
 covers an `ack` flag decided at runtime.
@@ -161,6 +176,9 @@ covers an `ack` flag decided at runtime.
 - `payload` (`T`) — opaque application data; never inspected or mutated
 - `options.ack` (boolean, optional) — wait for the server's acknowledgement and
   its reply. Default `false`
+- `options.timeout` (number, optional) — deadline for this send in ms,
+  replacing the client's `sendTimeout`. Lets one slow request coexist with a
+  short default instead of one `sendTimeout` sized for the slowest
 
 **Throws** `WSRemoteError` (ack only), `WSTimeoutError`, `WSConnectionLostError`
 (ack only), `WSOutboxDropError`, `WSNotConnectedError`, `WSTerminatedError`,
@@ -173,10 +191,18 @@ ws.send({ op: "cursor", x: 10, y: 20 }); // fire-and-forget
 
 const doc = await ws.send<Doc>({ op: "load", id: 42 }, { ack: true });
 
+// A slow one, without stretching the client-wide default for everything else.
+const job = await ws.send<Job>({ op: "create" }, { ack: true, timeout: 60_000 });
+
 try {
 	await ws.send({ op: "delete", id: 42 }, { ack: true });
 } catch (e) {
 	if (e instanceof WSRemoteError && e.code === "forbidden") showNotAllowed();
+	if (e instanceof WSRemoteError && e.code === "busy") {
+		// Structured detail the server attached, for code rather than for humans.
+		const { retryAfter } = e.details as { retryAfter: number };
+		showCountdown(retryAfter);
+	}
 }
 ```
 
@@ -330,11 +356,32 @@ The options object documented under
 ```typescript
 {
 	ack?: boolean; // default false
+	timeout?: number; // default: the client's sendTimeout
 }
 ```
 
 Options for [`send()`](#messages). `ack: true` waits for the server's
-acknowledgement and resolves with its reply.
+acknowledgement and resolves with its reply. `timeout` replaces the client's
+`sendTimeout` for this send, with the same semantics — one deadline spanning
+queue, flight and acknowledgement — and `WSTimeoutError` then reports the value
+that applied.
+
+### `WSCloseInfo`
+
+```typescript
+{
+	code: number; // WebSocket close code
+	reason: string; // close reason from the peer; possibly empty
+	attempt: number; // consecutive reconnect attempts that have failed so far
+}
+```
+
+What the function form of [`reconnect`](#createwsclientoptions) is told about
+the close it decides on. `attempt` is `0` after a close that ended a working
+connection and climbs by one per failed retry, so `({ attempt }) => attempt < 5`
+gives up after five tries, and `({ code }) => code !== 1000` declines to come
+back after a deliberate server-side close. A policy that throws is reported
+through the `error` event and the default — retry — applies.
 
 ### `SubscribeOptions`
 
@@ -390,6 +437,8 @@ non-retrying exit.
 
 A local `disconnect()` is a `close` too: code `4900`, `willReconnect: false` —
 that pair is how a deliberate teardown is told apart from a lost connection.
+`willReconnect` is also `false` for a close the `reconnect` policy declined;
+the client is `idle` afterwards.
 
 ### `WSState`
 
@@ -493,9 +542,11 @@ Every client `send()` reaches `onMessage(ctx, payload)`, with the sender's
   back in the `ack` and resolves the client's promise (`undefined` makes a bare
   ack). For a fire-and-forget send it is discarded. It may be a promise.
 - **Throw a `WSRemoteError`** to refuse the message with your own `code` and
-  `message` — the client's `send()` rejects with exactly those. Any other throw
-  is logged and answered `internal`, without its text. The connection stays open
-  either way.
+  `message` — the client's `send()` rejects with exactly those. Add `details`
+  (any JSON value) when the application needs more than a code to act on: a
+  retry-after, the field that failed; it arrives on the client as
+  `WSRemoteError.details`, untouched. Any other throw is logged and answered
+  `internal`, without its text. The connection stays open either way.
 - **Called in arrival order, not awaited before the next frame.** An async hook
   may finish out of order; chain the work yourself where order matters.
 - **Unset, the server accepts no messages**: every `send()` is answered
@@ -513,6 +564,13 @@ const { app, service } = createWSApp("/ws", [], {
 		const { op, id } = payload as { op: string; id: number };
 		if (op !== "load") {
 			throw new WSRemoteError({ code: "unknown_op", message: `unknown op ${op}` });
+		}
+		if (loading.size >= MAX) {
+			throw new WSRemoteError({
+				code: "busy",
+				message: "too many documents loading",
+				details: { retryAfter: 5 }, // for the client's code, not its user
+			});
 		}
 		service.send(ctx.clientId, { op: "progress", stage: "loading" });
 		return await loadDoc(id); // the reply
@@ -822,8 +880,14 @@ Hints, not facts — see
 {
 	code: string; // machine-readable — see ERROR_CODE
 	message: string; // human-readable. Never parse this
+	details?: unknown; // optional structured detail for the application; any JSON
 }
 ```
+
+The error carried by `nack` and `error` frames. `details` is the server
+application's to define and the client application's to interpret — the
+protocol never inspects it. Where `message` tells a person what went wrong,
+`details` tells code what to do about it.
 
 ### `SubRequest`
 
@@ -870,20 +934,26 @@ the socket with `4400 PROTOCOL_ERROR`.
 All extend `WSError`, so callers can branch on `instanceof` rather than
 string-matching messages.
 
-| Error                   | Thrown when                                     | Extra            |
-| ----------------------- | ----------------------------------------------- | ---------------- |
-| `WSTerminatedError`     | Terminal close code                             | `code`, `reason` |
-| `WSConnectTimeoutError` | `connectTimeout` elapsed (retrying continues)   |                  |
-| `WSTimeoutError`        | `sendTimeout` elapsed — still queued, or no ack |                  |
-| `WSConnectionLostError` | Socket closed while the frame awaited its ack   |                  |
-| `WSOutboxDropError`     | Evicted from a full outbox                      |                  |
-| `WSRemoteError`         | Server sent a `nack` (or an `error` frame)      | `code`           |
-| `WSNotConnectedError`   | Sent while disconnected with `outboxMaxSize: 0` |                  |
-| `WSDisposedError`       | Client was disposed                             |                  |
+| Error                   | Thrown when                                           | Extra             |
+| ----------------------- | ----------------------------------------------------- | ----------------- |
+| `WSTerminatedError`     | Terminal close code                                   | `code`, `reason`  |
+| `WSConnectTimeoutError` | `connectTimeout` elapsed (retrying continues)         |                   |
+| `WSTimeoutError`        | The send's deadline elapsed — still queued, or no ack |                   |
+| `WSConnectionLostError` | Socket closed while the frame awaited its ack         |                   |
+| `WSOutboxDropError`     | Evicted from a full outbox                            |                   |
+| `WSRemoteError`         | Server sent a `nack` (or an `error` frame)            | `code`, `details` |
+| `WSNotConnectedError`   | Sent while disconnected with `outboxMaxSize: 0`       |                   |
+| `WSDisposedError`       | Client was disposed                                   |                   |
+
+`WSTerminatedError` also rejects a `connect()` left pending by a close the
+`reconnect` policy declined to retry; the client is `idle` then, not
+`terminated`. `WSTimeoutError`'s deadline is the client's `sendTimeout`, or the
+`timeout` passed to that `send()`; its message names the one that applied.
 
 `WSRemoteError` is also what a server-side `onMessage` throws to refuse a
-message: `new WSRemoteError({ code, message })`. Its `code` and `message` reach
-the client unchanged. It is re-exported from `@marianmeres/ws/server` for that.
+message: `new WSRemoteError({ code, message, details? })`. Its `code`, `message`
+and `details` reach the client unchanged — `details` is `undefined` when the
+server sent none. It is re-exported from `@marianmeres/ws/server` for that.
 
 ---
 

@@ -117,8 +117,11 @@ and the socket stays open; an unexpected throw is `error` `internal` and a 1011
 close. Both paths, including the async one, end in a `.catch()` — a handler that
 throws must never be able to take the process down. The one exception is the
 application's `onMessage`: its throw is an application failure, not broken
-bookkeeping, so it is answered (`WSRemoteError` → its own `code`/`message`,
-anything else → `internal` with no text) and the socket stays open.
+bookkeeping, so it is answered (`WSRemoteError` → its own
+`code`/`message`/`details`, anything else → `internal` with no text) and the
+socket stays open. `details` is the application's, so like a reply it may be
+unencodable — and like a reply, that is answered `internal` rather than leaving
+the client to wait out its deadline for a `nack` that never left.
 
 **`onMessage` is not serialized.** It is called in arrival order but not awaited
 before the next frame, like every other async path in the service. The Python
@@ -126,8 +129,16 @@ servers in PROTOCOL.md do serialize (a per-connection worker) — both are
 documented as such; do not "fix" either to match the other without updating
 PROTOCOL.md §3.2.
 
+**`reconnect` and `terminalCloseCodes` are different knobs; keep them so.** A
+terminal code is a _failure_: `terminated` state, error log, `terminated` event,
+`failAll`. A close the `reconnect` policy declines is not: `idle`, quietly, with
+queued frames kept — the `disconnect()` outcome — and it must still settle a
+pending `connect()` (with `WSTerminatedError`), or the await hangs. The policy
+is consulted only for non-terminal codes. Do not merge the two into one list.
+
 **Every send carries one deadline** spanning queue + flight + ack — not an
-ack-only timeout. Combining acks with infinite retry otherwise produces promises
+ack-only timeout; the client's `sendTimeout`, or the `timeout` of that `send()`.
+Combining acks with infinite retry otherwise produces promises
 that pend forever. And a socket close settles in-flight frames at once, rather
 than waiting out a deadline for an answer that can no longer arrive: `sub` and
 `unsub` resolve, everything else rejects with `WSConnectionLostError`. Queued
@@ -184,7 +195,7 @@ run `deno publish` then the npm build.
 
 ## Before Making Changes
 
-1. `deno task test` — 83 tests, mostly real sockets against a real server:
+1. `deno task test` — 92 tests, mostly real sockets against a real server:
    `unit`, `integration`, `resilience`, `core` (messages: a core-only server,
    `onMessage`, `service.send`), `protocol` (server input hardening, raw
    sockets) and `codec` (custom encode/decode, binary frames)
@@ -194,7 +205,9 @@ run `deno publish` then the npm build.
 4. Touching the wire? Update `src/protocol/` first, then both sides, then
    PROTOCOL.md — including its two Python servers and the Appendix A script.
    Re-verify them, don't eyeball them: copy each code block out, point the
-   script's `jsr:@marianmeres/ws` import at `src/mod.ts`, run each server with
+   script's `jsr:@marianmeres/ws` import at `src/mod.ts` (and run it with
+   `--config deno.json` from outside the repo, or the client's bare imports do
+   not resolve), run each server with
    `WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2` (Python 3.10+, `websockets>=13`, in a
    venv) and run the script — core server without `WS_ROOMS`, full one with
    `WS_ROOMS=1`

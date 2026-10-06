@@ -81,12 +81,16 @@ ws.send({ op: "cursor", x: 10, y: 20 });
 // Request/response: waits for the server's acknowledgement, resolves with its reply.
 const doc = await ws.send<Doc>({ op: "load", id: 42 }, { ack: true });
 
-// A refusal arrives as a typed error carrying the server's own code.
+// A refusal arrives as a typed error carrying the server's own code — and any
+// structured `details` it attached, for your code rather than your user.
 try {
 	await ws.send({ op: "delete", id: 42 }, { ack: true });
 } catch (e) {
 	if (e instanceof WSRemoteError && e.code === "forbidden") showNotAllowed();
 }
+
+// One slow request, without stretching the client-wide `sendTimeout` for all.
+const job = await ws.send<Job>({ op: "create" }, { ack: true, timeout: 60_000 });
 ```
 
 **Fire-and-forget or acknowledged — your call, per message.** Without
@@ -289,7 +293,11 @@ handlers receive.
 `disconnect()` and an explicit terminal close code (`4001 AUTH_FAILED`,
 `4003 FORBIDDEN` by default). A server-sent `1000 Normal Closure` _does_
 reconnect — a graceful shutdown or rolling deploy is exactly when clients must
-come back.
+come back. When reconnecting is pointless for your application rather than for
+the protocol — a server that forgets the session with its socket — set
+`reconnect: false` (or a function deciding per close): the client ends `idle`,
+quietly, and a later `connect()` starts it again. That is a different thing
+from a terminal code, which is a failure and is reported as one.
 
 **Terminal failures are loud.** Giving up is the only non-retrying exit, so it
 rejects any pending `connect()`, emits `terminated`, and logs at error level. A
@@ -304,8 +312,9 @@ give — it resolved when it was written. At-least-once would need server-side
 replay, which this version does not do.
 
 **Sends are bounded.** Every send carries one deadline covering queue, flight
-_and_ acknowledgement. Without it, a send issued while offline would pend
-forever behind an infinite retry.
+_and_ acknowledgement — the client's `sendTimeout`, or the `timeout` of that
+particular `send()`. Without it, a send issued while offline would pend forever
+behind an infinite retry.
 
 **A server that does not do rooms says so.** Against a core-only server,
 `subscribe()` and `publish()` reject at once with `WSRemoteError` code

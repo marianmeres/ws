@@ -217,11 +217,15 @@ with `undefined` (while an explicit `null` resolves with `null`). A `nack`
 rejects the client's `send()` with a `WSRemoteError` carrying `error.code` and
 `error.message` unchanged — so besides the standard codes of section 6 you can
 use codes of your own (`not_found`, `invalid_doc`, …) and the application can
-branch on them. `message` is for humans; clients should never parse it.
+branch on them. `message` is for humans; clients should never parse it. When a
+code is not enough to act on, add `error.details` — any JSON value, for the
+application's code rather than its user (section 6); it arrives as
+`WSRemoteError.details`, untouched.
 
-The client waits **30 s** (its `sendTimeout`) for the answer, counted from the
-moment the application called `send()` — so a message buffered while offline
-spends part of that budget in the queue.
+The client waits **30 s** (its `sendTimeout`, or a per-send `timeout` the
+application chose) for the answer, counted from the moment the application
+called `send()` — so a message buffered while offline spends part of that
+budget in the queue.
 
 **Server → client.** Send a message at any time after `hello`:
 
@@ -403,10 +407,10 @@ client only sends it when the application passes one explicitly).
 | ---------- | ----- | ------------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | `hello`    | core  | `protocol`, `clientId?`, `namespace?`                               | Becomes connected; adopts any id and namespace; re-subscribes; flushes |
 | `ack`      | core  | `id`, `payload?`, `recipients?`                                     | Resolves the pending request — with `payload`, or with `recipients`    |
-| `nack`     | core  | `id`, `error: {code, message}`                                      | Rejects the pending request with `code` and `message`                  |
+| `nack`     | core  | `id`, `error: {code, message, details?}`                            | Rejects the pending request with `code`, `message` and `details`       |
 | `msg`      | core  | `payload`; with rooms also `room`, `namespace`, `from`, `timestamp` | Emits a `message` event; with `room`, also calls that room's handlers  |
 | `pong`     | core  | —                                                                   | Nothing beyond proof of life                                           |
-| `error`    | core  | `error: {code, message}`                                            | Emits an `error` event; the connection stays up                        |
+| `error`    | core  | `error: {code, message, details?}`                                  | Emits an `error` event; the connection stays up                        |
 | `presence` | rooms | `event`, `room`, `namespace`, `clientId`, `members`, `timestamp`    | Updates cached membership of `room`; calls presence handlers           |
 
 An `ack`/`nack` for an unknown `id` is ignored. Unknown frame types are ignored.
@@ -651,6 +655,26 @@ Two shapes, one rule: `nack` answers a specific request (it carries the `id`),
 `nack` surfaces to the application as a rejected promise carrying `code`, an
 `error` frame as an `error` event.
 
+Both carry the same `error` object: `code` (machine-readable), `message` (for a
+human to read, never to parse) and, optionally, `details` — any JSON value, for
+the application. Where `message` says what went wrong, `details` lets code act
+on it: a retry-after, the limit that was hit, the field that failed validation.
+The protocol never inspects it; the client hands it to the application as
+`WSRemoteError.details`, `undefined` when the server sent none. Send it only
+when there is something to send.
+
+```json
+{
+	"type": "nack",
+	"id": "k3j9x0a1b2c3",
+	"error": {
+		"code": "busy",
+		"message": "an avatar is being prepared, try again shortly",
+		"details": { "time_left_seconds": 42 }
+	}
+}
+```
+
 | `code`         | Layer | Use it for                                                                     |
 | -------------- | ----- | ------------------------------------------------------------------------------ |
 | `unauthorized` | core  | Any non-`auth` frame before the handshake completed                            |
@@ -722,9 +746,11 @@ line is a stand-in for them:
   returns the user (anything but `None`) or `None` to reject the connection.
 - `on_message(client, payload)` — called for every `ws.send(payload)`. Its return
   value is the reply the client receives when it sent with `{ ack: true }`
-  (`None` means "no reply"). Raise `Reject(code, message)` to refuse the message
-  with your own error code. Call `client.push(payload)` — now or any time later —
-  to send the client a message of your own.
+  (`None` means "no reply"). Raise `Reject(code, message, details=None)` to
+  refuse the message with your own error code — and, when a code is not enough
+  to act on, structured `details` for the client's code (section 6). Call
+  `client.push(payload)` — now or any time later — to send the client a message
+  of your own.
 
 On the client side, that is all used like this:
 
@@ -737,8 +763,8 @@ ws.send({ op: "push", data: 1 }); // fire-and-forget
 const reply = await ws.send({ op: "echo", n: 1 }, { ack: true }); // { op: "echo", n: 1 }
 ```
 
-It was verified against the real client (`@marianmeres/ws` 0.5.0) with the
-script in Appendix A: all 10 core checks pass, on `websockets` 17.1 and Python
+It was verified against the real client (`@marianmeres/ws` 0.6.0) with the
+script in Appendix A: all 11 core checks pass, on `websockets` 17.2 and Python
 3.11 with deprecation warnings promoted to errors.
 
 ```python
@@ -799,15 +825,18 @@ class Reject(Exception):
     """Raise from your message handler to refuse a message on purpose.
 
     The client's `send(payload, { ack: true })` then rejects with a
-    `WSRemoteError` whose `code` and `message` are exactly these. Any *other*
-    exception is logged here and reported to the client as `internal`, without
-    its text — a stack trace is not something to hand to a browser.
+    `WSRemoteError` whose `code`, `message` and `details` are exactly these.
+    `details` is optional and for the client's *code* — any JSON value, say a
+    retry-after — where `message` is for its user. Any *other* exception is
+    logged here and reported to the client as `internal`, without its text — a
+    stack trace is not something to hand to a browser.
     """
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, details: Any = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details = details
 
 
 @dataclass(eq=False)  # identity equality: every Client is a distinct connection
@@ -980,7 +1009,7 @@ class CoreServer:
                 # must still produce an answer, or the client waits 30 s.
                 wire = json.dumps(ack)
             except Reject as e:
-                await _refuse(client.ws, frame_id, e.code, e.message)
+                await _refuse(client.ws, frame_id, e.code, e.message, e.details)
             except Exception:
                 log.exception("on_message failed")
                 await _refuse(client.ws, frame_id, "internal", "internal error")
@@ -1009,14 +1038,27 @@ async def _error(ws: ServerConnection, code: str, message: str) -> None:
     await _send(ws, {"type": "error", "error": {"code": code, "message": message}})
 
 
-async def _refuse(ws: ServerConnection, frame_id: Any, code: str, message: str) -> None:
+async def _refuse(
+    ws: ServerConnection, frame_id: Any, code: str, message: str, details: Any = None
+) -> None:
     """Answers a frame the server will not act on: a `nack` when the client is
-    waiting for this frame (it carried an id), an `error` when nobody is."""
+    waiting for this frame (it carried an id), an `error` when nobody is.
+
+    `details` is the application's — any JSON value, sent only when given. One
+    that json cannot encode is answered as `internal` instead, so the client is
+    never left waiting for a refusal that could not be sent."""
+    error: dict = {"code": code, "message": message}
+    if details is not None:
+        error["details"] = details
+    try:
+        json.dumps(error)
+    except (TypeError, ValueError):
+        log.exception("error details could not be encoded")
+        error = {"code": "internal", "message": "error could not be encoded"}
     if isinstance(frame_id, str) and frame_id:
-        error = {"code": code, "message": message}
         await _send(ws, {"type": "nack", "id": frame_id, "error": error})
     else:
-        await _error(ws, code, message)
+        await _send(ws, {"type": "error", "error": error})
 
 
 # ----------------------------------------------------------------- example app
@@ -1044,7 +1086,8 @@ async def on_message(client: Client, payload: Any) -> Any:
         # message, a push can go out at any time — here, right away.
         await client.push(payload.get("data"))
         return None
-    raise Reject("unknown_op", f"unknown op: {op!r}")
+    # `details` is for the client's code: here, the op it got wrong.
+    raise Reject("unknown_op", f"unknown op: {op!r}", {"op": op})
 
 
 async def main() -> None:
@@ -1081,8 +1124,11 @@ Notes on the design choices, in the order they matter:
   the reply has nowhere to go — and then stops.
 - **`asyncio.wait_for(recv, timeout)` doubles as the auth timer and the idle
   timer.** No sweeper task, no bookkeeping of "last seen".
-- **Errors never leak.** A `Reject` is the only way an error text reaches the
-  client; any other exception is logged and answered `internal`.
+- **Errors never leak.** A `Reject` is the only way an error text — or
+  structured `details` — reaches the client; any other exception is logged and
+  answered `internal`. `details` the application hands over but json cannot
+  encode are answered `internal` too, rather than leaving the client waiting
+  for a `nack` that never went out.
 - **No registry.** `server.clients` is the set of live connections — iterate it
   to push to everyone. Keep your own `user → client` map in `authenticate` /
   `on_message` if you need to push to a particular user; a real deployment with
@@ -1102,8 +1148,8 @@ python ws_server.py                                       # ws://127.0.0.1:8765/
 WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2 python ws_server.py   # timeouts Appendix A expects
 ```
 
-It was verified against the real client (`@marianmeres/ws` 0.5.0) with the
-script in Appendix A and `WS_ROOMS=1`: all 16 checks pass, on `websockets` 17.1
+It was verified against the real client (`@marianmeres/ws` 0.6.0) with the
+script in Appendix A and `WS_ROOMS=1`: all 17 checks pass, on `websockets` 17.2
 and Python 3.11 with deprecation warnings promoted to errors.
 
 ```python
@@ -1160,14 +1206,16 @@ class Reject(Exception):
     """Raise from `on_message` to refuse a message with your own error code.
 
     The client's `send(payload, { ack: true })` rejects with a `WSRemoteError`
-    carrying exactly this `code` and `message`. Any other exception is logged
-    and reported as `internal`, without its text.
+    carrying exactly this `code`, `message` and `details` — the last optional,
+    any JSON value, for the client's code rather than its user. Any other
+    exception is logged and reported as `internal`, without its text.
     """
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, details: Any = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details = details
 
 
 @dataclass
@@ -1421,7 +1469,7 @@ class Hub:
                     ack["payload"] = reply
                 wire = json.dumps(ack)  # inside the try: an unencodable reply is `internal`
             except Reject as e:
-                await self._refuse(conn, frame_id, e.code, e.message)
+                await self._refuse(conn, frame_id, e.code, e.message, e.details)
             except Exception:
                 log.exception("on_message failed")
                 await self._refuse(conn, frame_id, "internal", "internal error")
@@ -1647,13 +1695,27 @@ class Hub:
             conn, {"type": "nack", "id": id_, "error": {"code": code, "message": message}}
         )
 
-    async def _refuse(self, conn: Conn, id_: Any, code: str, message: str) -> None:
+    async def _refuse(
+        self, conn: Conn, id_: Any, code: str, message: str, details: Any = None
+    ) -> None:
         """`nack` when the frame carried a usable id (someone is waiting),
-        an uncorrelated `error` when it did not."""
+        an uncorrelated `error` when it did not.
+
+        `details` is the application's — any JSON value, sent only when given.
+        One that json cannot encode is answered as `internal` instead, so the
+        client is never left waiting for a refusal that could not be sent."""
+        error: dict = {"code": code, "message": message}
+        if details is not None:
+            error["details"] = details
+        try:
+            json.dumps(error)
+        except (TypeError, ValueError):
+            log.exception("error details could not be encoded")
+            error = {"code": "internal", "message": "error could not be encoded"}
         if isinstance(id_, str) and id_:
-            await self._nack(conn, id_, code, message)
+            await self._send(conn, {"type": "nack", "id": id_, "error": error})
         else:
-            await self._error(conn, code, message)
+            await self._send(conn, {"type": "error", "error": error})
 
 
 # ------------------------------------------------------------------ example app
@@ -1682,7 +1744,8 @@ async def on_message(conn: Conn, payload: Any) -> Any:
     if op == "push":
         await conn.push(payload.get("data"))
         return None
-    raise Reject("unknown_op", f"unknown op: {op!r}")
+    # `details` is for the client's code: here, the op it got wrong.
+    raise Reject("unknown_op", f"unknown op: {op!r}", {"op": op})
 
 
 async def allow_broadcast(conn: Conn, room: str) -> bool:
@@ -1779,9 +1842,9 @@ It expects the server to accept the auth payload `{ "token": "dev-secret" }`
 and reject other tokens with 4001, and to answer messages the way both Python
 examples do: `{ "op": "echo" }` replies with the payload, `{ "op": "push",
 "data": … }` pushes `data` back as a direct message, anything else is refused
-with code `unknown_op`. Two checks need short server timeouts (auth 1 s, idle
-2 s); the Python examples read them from `WS_AUTH_TIMEOUT` and
-`WS_IDLE_TIMEOUT`.
+with code `unknown_op` and `details: { "op": … }`. Two checks need short server
+timeouts (auth 1 s, idle 2 s); the Python examples read them from
+`WS_AUTH_TIMEOUT` and `WS_IDLE_TIMEOUT`.
 
 Core checks always run. With `WS_ROOMS=1` the rooms checks run as well — they
 also expect broadcast to be allowed into `announcements` only, the policy in the
@@ -1804,8 +1867,9 @@ WS_URL=ws://127.0.0.1:8765/ws WS_ROOMS=1 deno run -A conformance.ts   # with roo
  * The server must accept the auth payload { token: "dev-secret" } and reject
  * any other with 4001, and answer messages like the Python examples do:
  * { op: "echo" } replies with the payload, { op: "push", data } pushes `data`
- * back as a direct message, anything else is refused with code "unknown_op".
- * With rooms, broadcast must be allowed into "announcements" only.
+ * back as a direct message, anything else is refused with code "unknown_op"
+ * and details { op }. With rooms, broadcast must be allowed into
+ * "announcements" only.
  *
  * Two checks need short server timeouts: WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2.
  */
@@ -1816,7 +1880,7 @@ import {
 	WSRemoteError,
 	type WSRoomMessage,
 	WSTerminatedError,
-} from "jsr:@marianmeres/ws@^0.5.0";
+} from "jsr:@marianmeres/ws@^0.6.0";
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@^1";
 
 const URL = Deno.env.get("WS_URL") ?? "ws://127.0.0.1:8765/ws";
@@ -1910,6 +1974,20 @@ await test("core: a refused message rejects with the server's code; socket stays
 		assertEquals(err.code, "unknown_op");
 		assert(c.connected);
 		assertEquals(await c.send({ op: "echo" }, { ack: true }), { op: "echo" });
+	} finally {
+		c.dispose();
+	}
+});
+
+await test("core: a refusal's details reach the application, untouched", async () => {
+	const c = client();
+	try {
+		const err = await assertRejects(
+			() => c.send({ op: "nope" }, { ack: true }),
+			WSRemoteError,
+		);
+		assertEquals(err.code, "unknown_op");
+		assertEquals(err.details, { op: "nope" });
 	} finally {
 		c.dispose();
 	}
@@ -2218,6 +2296,8 @@ Messages
       the `ack` carries the reply in `payload`, or no `payload` at all
 - [ ] A refusal is a `nack` with a meaningful `code`; a crash is `internal`,
       without internals in the message, and the socket stays open
+- [ ] `error.details`, when the application supplies any, is passed through
+      unchanged — and omitted, not `null`, when it supplies none
 - [ ] A direct message to the client is `{"type": "msg", "payload": …}`, with no
       `room`
 - [ ] Unknown frame types get `nack` `unsupported` with an `id`, `error`

@@ -51,7 +51,10 @@ interface PendingSend {
 export interface OutboxOptions {
 	/** Max frames buffered while disconnected. `0` disables buffering. */
 	maxSize: number;
-	/** Overall deadline per frame, covering queue + flight + ack. */
+	/**
+	 * Default deadline per frame, covering queue + flight + ack. A frame may
+	 * override it when tracked.
+	 */
 	sendTimeout: number;
 	/** Called with frames evicted because the queue was full. */
 	onDrop?: (frames: ClientFrame[]) => void;
@@ -96,18 +99,21 @@ export class Outbox {
 	 * @param queued - `true` to buffer it, `false` if it is going out now
 	 * @param awaitAck - `false` when the frame is complete once transmitted —
 	 * see {@link transmitted}
+	 * @param timeout - deadline for this frame in ms, replacing the default
+	 * `sendTimeout`; same span (queue + flight + ack)
 	 */
 	track(
 		id: string,
 		frame: ClientFrame,
 		queued: boolean,
 		awaitAck = true,
+		timeout: number = this.#options.sendTimeout,
 	): Promise<OutboxResult> {
 		return new Promise<OutboxResult>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.#discard(id);
-				reject(new WSTimeoutError(this.#options.sendTimeout));
-			}, this.#options.sendTimeout);
+				reject(new WSTimeoutError(timeout));
+			}, timeout);
 
 			this.#pending.set(id, { frame, resolve, reject, timer, queued, awaitAck });
 

@@ -49,6 +49,7 @@ export {
 	type SubscribeOptions,
 	WSClient,
 	type WSClientOptions,
+	type WSCloseInfo,
 	type WSConnectionState,
 	type WSEvents,
 	type WSSendOptions,

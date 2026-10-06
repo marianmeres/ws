@@ -100,8 +100,9 @@ export interface WSEvents {
 	/** Membership change in a room subscribed with presence enabled. */
 	presence: WSPresenceEvent;
 	/**
-	 * Socket closed. `willReconnect` reflects the retry classification, and is
-	 * `false` for the `4900` a local `disconnect()` emits.
+	 * Socket closed. `willReconnect` reflects the retry classification — the
+	 * close code against `terminalCloseCodes`, then the `reconnect` policy —
+	 * and is `false` for the `4900` a local `disconnect()` emits.
 	 */
 	close: { code: number; reason: string; willReconnect: boolean };
 	/** A retry is scheduled; `delay` is the jittered backoff in ms. */
@@ -135,6 +136,29 @@ export interface WSSendOptions {
 	 * with no confirmation that the server ever received it.
 	 */
 	ack?: boolean;
+	/**
+	 * Deadline for this send in ms, replacing the client's `sendTimeout`.
+	 * Same semantics: it spans queue, flight and (with `ack`) the
+	 * acknowledgement. Lets one slow request/response coexist with a short
+	 * default, instead of one `sendTimeout` sized for the slowest.
+	 */
+	timeout?: number;
+}
+
+/**
+ * What a reconnect policy function is told about the close it decides on.
+ *
+ * `attempt` counts the reconnect attempts that have already failed in a row —
+ * `0` after a close that ended a working connection — so a policy can give up
+ * after a number of tries as easily as it can give up on a code.
+ */
+export interface WSCloseInfo {
+	/** WebSocket close code. */
+	code: number;
+	/** Close reason as sent by the peer; possibly empty. */
+	reason: string;
+	/** Consecutive reconnect attempts that have failed so far. */
+	attempt: number;
 }
 
 /** Per-room subscription options. */
@@ -180,6 +204,27 @@ export interface WSClientOptions<TAuth = unknown> {
 	/** `null` disables logging. */
 	logger?: Logger | null;
 
+	/**
+	 * Whether to retry after a non-terminal close. Default `true`: retry
+	 * forever, with backoff. `false` never retries; a function decides per
+	 * close, from the code, the reason and the number of failed attempts so
+	 * far (see {@link WSCloseInfo}).
+	 *
+	 * This is a separate knob from `terminalCloseCodes` on purpose. A
+	 * terminal close is a *failure* — the client ends `terminated`, logs at
+	 * error level and emits `terminated`. A close this policy declines to
+	 * retry is not: the client ends `idle`, quietly, exactly as after
+	 * `disconnect()`, and a later `connect()` (or any send, with
+	 * `autoConnect`) starts it again. For a server that forgets the session
+	 * when the socket closes, so that reconnecting could only ever
+	 * authenticate into nothing, this is the right knob; listing every code
+	 * the network can produce as terminal is not.
+	 *
+	 * A `connect()` still pending when the policy declines rejects with
+	 * `WSTerminatedError` carrying the close code — the connection will not
+	 * come up by itself, and the caller should know.
+	 */
+	reconnect?: boolean | ((close: WSCloseInfo) => boolean);
 	/** Initial reconnect delay in ms. Default 500. */
 	reconnectDelay?: number;
 	/** Reconnect delay ceiling in ms. Default 30_000. */
@@ -214,6 +259,7 @@ const DEFAULTS = {
 	url: "/ws",
 	namespace: DEFAULT_NAMESPACE,
 	autoConnect: true,
+	reconnect: true,
 	reconnectDelay: 500,
 	reconnectDelayMax: 30_000,
 	pingInterval: 25_000,
@@ -269,6 +315,7 @@ export class WSClient<TAuth = unknown> {
 	#authFn: (() => TAuth | Promise<TAuth>) | undefined;
 	#autoConnect: boolean;
 	#terminalCodes: readonly number[];
+	#reconnect: boolean | ((close: WSCloseInfo) => boolean);
 	#reconnectDelay: number;
 	#reconnectDelayMax: number;
 	#connectTimeout: number;
@@ -331,6 +378,7 @@ export class WSClient<TAuth = unknown> {
 		this.#autoConnect = options.autoConnect ?? DEFAULTS.autoConnect;
 		this.#terminalCodes = options.terminalCloseCodes ??
 			DEFAULT_TERMINAL_CLOSE_CODES;
+		this.#reconnect = options.reconnect ?? DEFAULTS.reconnect;
 		this.#reconnectDelay = options.reconnectDelay ?? DEFAULTS.reconnectDelay;
 		this.#reconnectDelayMax = options.reconnectDelayMax ??
 			DEFAULTS.reconnectDelayMax;
@@ -509,13 +557,14 @@ export class WSClient<TAuth = unknown> {
 	 * immediately when already connected.
 	 *
 	 * Rejects **only** where retrying cannot help:
-	 * - {@link WSTerminatedError} — terminal close code (bad credentials, etc.)
+	 * - {@link WSTerminatedError} — terminal close code (bad credentials, etc.),
+	 *   or a close the `reconnect` policy declined to retry
 	 * - {@link WSConnectTimeoutError} — `connectTimeout` elapsed; note the
 	 *   client keeps retrying in the background, so this bounds *your await*,
 	 *   not the connection attempt
 	 *
-	 * Ordinary network failure never rejects; that is what the infinite retry
-	 * is for.
+	 * Ordinary network failure never rejects while the client retries; that is
+	 * what the infinite retry is for.
 	 *
 	 * Calling this is optional when `autoConnect` is on — it is a readiness
 	 * gate, not a prerequisite.
@@ -744,7 +793,8 @@ export class WSClient<TAuth = unknown> {
 	 * @param payload - opaque application data; never inspected or mutated
 	 * @param options - see {@link WSSendOptions}
 	 * @returns resolves once the frame is written to the socket
-	 * @throws {WSTimeoutError} still buffered when `sendTimeout` elapsed
+	 * @throws {WSTimeoutError} still buffered when `sendTimeout` (or
+	 * `options.timeout`) elapsed
 	 * @throws {WSOutboxDropError} evicted from a full outbox
 	 * @throws {WSNotConnectedError} sent while offline with `outboxMaxSize: 0`
 	 * @throws {WSTerminatedError} sent after a terminal close
@@ -763,15 +813,17 @@ export class WSClient<TAuth = unknown> {
 	 *
 	 * Resolves with the reply the server put in the ack — which makes this a
 	 * request/response call — or with `undefined` when it sent a bare ack.
-	 * Buffered while disconnected like any other send, and one `sendTimeout`
-	 * spans queue, flight and ack.
+	 * Buffered while disconnected like any other send, and one deadline —
+	 * `sendTimeout`, or `options.timeout` for this send alone — spans queue,
+	 * flight and ack.
 	 *
 	 * @param payload - opaque application data; never inspected or mutated
-	 * @param options - `{ ack: true }`
+	 * @param options - `{ ack: true }`, optionally with a `timeout`
 	 * @returns the server's reply, `undefined` when there was none
 	 * @throws {WSRemoteError} the server rejected it with a `nack` — code
-	 * `unsupported` when it accepts no messages at all
-	 * @throws {WSTimeoutError} `sendTimeout` elapsed with no acknowledgement
+	 * `unsupported` when it accepts no messages at all; `details` carries
+	 * whatever structured detail the server attached
+	 * @throws {WSTimeoutError} the deadline elapsed with no acknowledgement
 	 * @throws {WSConnectionLostError} the socket closed before the ack arrived;
 	 * the message was not resent
 	 * @throws {WSOutboxDropError} evicted from a full outbox
@@ -781,6 +833,8 @@ export class WSClient<TAuth = unknown> {
 	 * @example
 	 * ```ts
 	 * const doc = await ws.send<Doc>({ op: "load", id: 42 }, { ack: true });
+	 * // a slow one, without stretching the client-wide default for everything else
+	 * const job = await ws.send<Job>({ op: "create" }, { ack: true, timeout: 60_000 });
 	 * ```
 	 */
 	send<R = unknown, T = unknown>(
@@ -799,14 +853,17 @@ export class WSClient<TAuth = unknown> {
 		this.#assertUsable();
 		if (options.ack) {
 			const id = this.#nextId();
-			return this.#send({ type: FRAME.MSG, id, payload }, id).then((r) =>
-				r.payload
-			);
+			return this.#send({ type: FRAME.MSG, id, payload }, id, true, options.timeout)
+				.then((r) => r.payload);
 		}
 		// No wire id: nothing is coming back. The outbox still needs a key to
 		// buffer it under while offline.
-		const sent = this.#send({ type: FRAME.MSG, payload }, this.#nextId(), false)
-			.then(noop);
+		const sent = this.#send(
+			{ type: FRAME.MSG, payload },
+			this.#nextId(),
+			false,
+			options.timeout,
+		).then(noop);
 		// Fire-and-forget invites not awaiting, and an ignored rejection is
 		// fatal in Deno and Node. Marked handled, ignoring it is safe; awaiting
 		// it still reports the failure.
@@ -889,8 +946,14 @@ export class WSClient<TAuth = unknown> {
 	 *
 	 * @param id - the frame's wire `id`, or a local key for a frame without one
 	 * @param awaitAck - `false` completes the send once written, not once acked
+	 * @param timeout - per-frame deadline; the client's `sendTimeout` otherwise
 	 */
-	#send(frame: ClientFrame, id: string, awaitAck = true): Promise<OutboxResult> {
+	#send(
+		frame: ClientFrame,
+		id: string,
+		awaitAck = true,
+		timeout?: number,
+	): Promise<OutboxResult> {
 		if (this.#autoConnect) this.#ensureStarted();
 
 		// Nothing restarts from `terminated` except an explicit connect(), so
@@ -906,7 +969,7 @@ export class WSClient<TAuth = unknown> {
 			return Promise.reject(new WSNotConnectedError());
 		}
 
-		const promise = this.#outbox.track(id, frame, !canSendNow, awaitAck);
+		const promise = this.#outbox.track(id, frame, !canSendNow, awaitAck, timeout);
 		if (canSendNow) this.#transmit(id, frame);
 		return promise;
 	}
@@ -1167,7 +1230,8 @@ export class WSClient<TAuth = unknown> {
 		this.#socket = null;
 
 		const terminal = this.#terminalCodes.includes(code);
-		const willReconnect = !terminal && this.#state !== "disposed";
+		const willReconnect = !terminal && this.#state !== "disposed" &&
+			this.#shouldReconnect(code, reason);
 
 		this.logger?.debug?.(
 			`closed (${code}${reason ? ` ${reason}` : ""}), reconnect=${willReconnect}`,
@@ -1192,11 +1256,31 @@ export class WSClient<TAuth = unknown> {
 		this.#settleInFlight();
 
 		if (!willReconnect) {
+			// Not a failure, so no error log and no `terminated` — but the
+			// connection will not come up by itself either, and a pending
+			// connect() must not be left waiting for a retry that never comes.
+			this.#settleConnect(new WSTerminatedError(code, reason));
 			this.#setState("idle");
 			return;
 		}
 
 		this.#scheduleReconnect();
+	}
+
+	/**
+	 * Consults the `reconnect` policy for a non-terminal close.
+	 *
+	 * A policy that throws is a bug in the application, not a reason to stop
+	 * retrying: it is reported and the default — retry — applies.
+	 */
+	#shouldReconnect(code: number, reason: string): boolean {
+		if (typeof this.#reconnect !== "function") return this.#reconnect;
+		try {
+			return this.#reconnect({ code, reason, attempt: this.#attempt });
+		} catch (e) {
+			this.#fail(e, "reconnect policy threw");
+			return true;
+		}
 	}
 
 	/**

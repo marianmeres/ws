@@ -68,16 +68,18 @@ export class WSConnectTimeoutError extends WSError {
 }
 
 /**
- * `sendTimeout` elapsed while queued, in flight, or awaiting an ack.
+ * The send's deadline elapsed while queued, in flight, or awaiting an ack.
  *
- * A send that awaits no ack — `send()` without `{ ack: true }` — can only hit
- * this while still queued, i.e. when no connection came up in time.
+ * The deadline is the client's `sendTimeout`, or the `timeout` passed to that
+ * particular `send()`. A send that awaits no ack — `send()` without
+ * `{ ack: true }` — can only hit this while still queued, i.e. when no
+ * connection came up in time.
  */
 export class WSTimeoutError extends WSError {
 	/**
 	 * Reports the deadline that was exceeded.
 	 *
-	 * @param ms - the elapsed `sendTimeout`
+	 * @param ms - the deadline that applied to this send, in ms
 	 */
 	constructor(ms: number) {
 		super(`Send not completed within ${ms}ms`);
@@ -109,11 +111,19 @@ export class WSConnectionLostError extends WSError {
  * The server rejected the operation with a `nack`.
  *
  * Also the way a server-side `onMessage` hook rejects a message on purpose:
- * throw one, and its `code` and `message` travel back in the `nack` unchanged.
+ * throw one, and its `code`, `message` and `details` travel back in the
+ * `nack` unchanged.
  */
 export class WSRemoteError extends WSError {
 	/** Machine-readable code from the server — see `ERROR_CODE`. */
 	readonly code: string;
+
+	/**
+	 * Structured detail the server attached, if any — see
+	 * `WSErrorInfo.details`. Application-defined; `undefined` when the server
+	 * sent none.
+	 */
+	readonly details?: unknown;
 
 	/**
 	 * Lifts a wire-level error detail into a throwable.
@@ -123,6 +133,7 @@ export class WSRemoteError extends WSError {
 	constructor(info: WSErrorInfo) {
 		super(info.message);
 		this.code = info.code;
+		this.details = info.details;
 	}
 }
 

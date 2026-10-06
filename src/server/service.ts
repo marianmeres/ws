@@ -97,8 +97,10 @@ export interface WSServiceOptions {
 	 * (`send(x, { ack: true })`) it travels back in the `ack` and resolves the
 	 * client's promise; for a fire-and-forget send it is discarded. Throw a
 	 * `WSRemoteError` to refuse the message with your own `code` and
-	 * `message`; any other throw is logged and answered `internal`, without
-	 * leaking its text. Either way the connection stays open.
+	 * `message` — and `details`, any JSON value, when the application needs
+	 * more than a code to act on; any other throw is logged and answered
+	 * `internal`, without leaking its text. Either way the connection stays
+	 * open.
 	 *
 	 * Called in arrival order, but not awaited before the next frame is
 	 * handled — an async hook may finish out of order. Chain the work yourself
@@ -588,10 +590,11 @@ export class WSService {
 			// is what lets the client fail fast instead of waiting out its
 			// send timeout.
 			default:
-				return this.#refuse(conn, (frame as { id?: unknown }).id, {
+				this.#refuse(conn, (frame as { id?: unknown }).id, {
 					code: ERROR_CODE.UNSUPPORTED,
 					message: "unsupported frame type",
 				});
+				return;
 		}
 	}
 
@@ -676,10 +679,11 @@ export class WSService {
 		frame: Extract<ClientFrame, { type: typeof FRAME.MSG }>,
 	): Promise<void> {
 		if (!this.#onMessageHook) {
-			return this.#refuse(conn, frame.id, {
+			this.#refuse(conn, frame.id, {
 				code: ERROR_CODE.UNSUPPORTED,
 				message: "this server accepts no messages",
 			});
+			return;
 		}
 
 		let reply: unknown;
@@ -690,13 +694,28 @@ export class WSService {
 			// and keep the socket. Only a deliberate WSRemoteError speaks for
 			// itself — anything else could carry internals, so it stays in the log.
 			if (e instanceof WSRemoteError) {
-				return this.#refuse(conn, frame.id, { code: e.code, message: e.message });
+				const refused = this.#refuse(conn, frame.id, {
+					code: e.code,
+					message: e.message,
+					...(e.details === undefined ? {} : { details: e.details }),
+				});
+				// `details` is the application's, so it can be anything — and
+				// a refusal the encoder cannot encode must still answer the
+				// request, like a reply it cannot encode (below).
+				if (!refused && conn.socket.readyState === WebSocket.OPEN) {
+					this.#refuse(conn, frame.id, {
+						code: ERROR_CODE.INTERNAL,
+						message: "error could not be encoded",
+					});
+				}
+				return;
 			}
 			this.logger?.error?.(`onMessage threw (${conn.id}): ${e}`);
-			return this.#refuse(conn, frame.id, {
+			this.#refuse(conn, frame.id, {
 				code: ERROR_CODE.INTERNAL,
 				message: "internal error",
 			});
+			return;
 		}
 
 		const id = nonEmptyString(frame.id);
@@ -718,10 +737,11 @@ export class WSService {
 
 	#onSub(conn: Connection, id: string, requests: unknown): void {
 		if (!Array.isArray(requests)) {
-			return this.#nack(conn, id, {
+			this.#nack(conn, id, {
 				code: ERROR_CODE.BAD_REQUEST,
 				message: "rooms must be an array",
 			});
+			return;
 		}
 
 		const syncRooms: string[] = [];
@@ -761,10 +781,11 @@ export class WSService {
 
 	#onUnsub(conn: Connection, id: string, rooms: unknown): void {
 		if (!Array.isArray(rooms)) {
-			return this.#nack(conn, id, {
+			this.#nack(conn, id, {
 				code: ERROR_CODE.BAD_REQUEST,
 				message: "rooms must be an array",
 			});
+			return;
 		}
 
 		for (const room of rooms) {
@@ -781,27 +802,30 @@ export class WSService {
 	): Promise<void> {
 		const room = nonEmptyString(frame.room);
 		if (!room) {
-			return this.#nack(conn, frame.id, {
+			this.#nack(conn, frame.id, {
 				code: ERROR_CODE.BAD_REQUEST,
 				message: "missing room",
 			});
+			return;
 		}
 
 		if (frame.namespace && typeof frame.namespace !== "string") {
-			return this.#nack(conn, frame.id, {
+			this.#nack(conn, frame.id, {
 				code: ERROR_CODE.BAD_REQUEST,
 				message: "namespace must be a string",
 			});
+			return;
 		}
 
 		// A client may only publish into its own namespace. Accepting the
 		// requested one blindly would make the isolation boundary decorative.
 		const namespace = conn.namespace;
 		if (frame.namespace && frame.namespace !== namespace) {
-			return this.#nack(conn, frame.id, {
+			this.#nack(conn, frame.id, {
 				code: ERROR_CODE.FORBIDDEN,
 				message: `cannot publish into namespace "${frame.namespace}"`,
 			});
+			return;
 		}
 
 		const message: WSRoomMessage = {
@@ -822,10 +846,11 @@ export class WSService {
 	): Promise<void> {
 		const room = nonEmptyString(frame.room);
 		if (!room) {
-			return this.#nack(conn, frame.id, {
+			this.#nack(conn, frame.id, {
 				code: ERROR_CODE.BAD_REQUEST,
 				message: "missing room",
 			});
+			return;
 		}
 
 		let allowed = false;
@@ -839,10 +864,11 @@ export class WSService {
 		}
 
 		if (!allowed) {
-			return this.#nack(conn, frame.id, {
+			this.#nack(conn, frame.id, {
 				code: ERROR_CODE.FORBIDDEN,
 				message: "broadcast not permitted",
 			});
+			return;
 		}
 
 		const message: WSRoomMessage = {
@@ -1001,19 +1027,22 @@ export class WSService {
 		};
 	}
 
-	#nack(conn: Connection, id: string, error: WSErrorInfo): void {
-		this.#send(conn, { type: FRAME.NACK, id, error });
+	/** @returns whether the frame was encoded and handed to an open socket */
+	#nack(conn: Connection, id: string, error: WSErrorInfo): boolean {
+		return this.#send(conn, { type: FRAME.NACK, id, error });
 	}
 
 	/**
 	 * Answers a frame the server will not act on: a `nack` when it carried a
 	 * usable `id` — someone is waiting for it — and an uncorrelated `error`
 	 * when it did not.
+	 *
+	 * @returns whether the frame was encoded and handed to an open socket
 	 */
-	#refuse(conn: Connection, id: unknown, error: WSErrorInfo): void {
+	#refuse(conn: Connection, id: unknown, error: WSErrorInfo): boolean {
 		const usable = nonEmptyString(id);
-		if (usable !== undefined) this.#nack(conn, usable, error);
-		else this.#send(conn, { type: FRAME.ERROR, error });
+		if (usable !== undefined) return this.#nack(conn, usable, error);
+		return this.#send(conn, { type: FRAME.ERROR, error });
 	}
 
 	/** @returns whether the frame was encoded and handed to an open socket */
