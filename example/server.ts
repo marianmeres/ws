@@ -98,10 +98,11 @@ const { app: wsApp, service } = createWSApp("/ws", [], {
 		return {
 			// The suffix matters: client ids are unique *by contract* — when a
 			// second connection authenticates with an id that is already
-			// connected, the newcomer wins and the older socket is closed. That
-			// is what makes reconnect-after-half-open recover instead of piling
-			// up ghosts, but it would also make two tabs sharing a nickname
-			// kick each other in an endless loop.
+			// connected, the newcomer wins and the older socket is closed with
+			// 4005, which the client treats as terminal. That is what makes
+			// reconnect-after-half-open recover instead of piling up ghosts —
+			// and it is why two tabs sharing a nickname would log each other
+			// out: the second tab would end the first.
 			clientId: `${nick}#${suffix}`,
 			// The namespace is the isolation boundary: two workspaces can both
 			// have a #general and never see each other.

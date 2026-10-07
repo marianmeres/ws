@@ -12,10 +12,14 @@
  * const { app, service } = createWSApp("/ws", [], {
  *     verify: async (payload) => {
  *         const user = await auth((payload as any)?.token);
+ *         // One live connection per user: a second tab replaces the first,
+ *         // which ends with 4005. Append a per-tab suffix to allow several.
  *         return user ? { clientId: user.id, namespace: user.orgId } : null;
  *     },
  *     // What a client's `send()` reaches; the return value is the reply.
  *     onMessage: (ctx, payload) => handle(ctx.clientId, payload),
+ *     // Rooms are open to every member of the namespace unless you say so.
+ *     allowSubscribe: (ctx, room) => canRead(ctx.meta, room),
  * });
  * Deno.serve(app);
  * ```

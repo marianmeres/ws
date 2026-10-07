@@ -27,26 +27,26 @@ following the `PubSub` / `createPubSub` precedent.
 
 **Parameters**
 
-| Name                 | Type                                | Default            | Description                                                                   |
-| -------------------- | ----------------------------------- | ------------------ | ----------------------------------------------------------------------------- |
-| `url`                | `string \| URL`                     | `"/ws"`            | `ws(s)://`, or `http(s)://` (upgraded), or a path resolved against `location` |
-| `namespace`          | `string`                            | `"default"`        | Isolation boundary for rooms. Sent to the server only when set                |
-| `clientId`           | `string`                            | —                  | Preferred id; the server may override or ignore it                            |
-| `rooms`              | `string[]`                          | `[]`               | Rooms joined on every (re)connect                                             |
-| `auth`               | `() => unknown \| Promise<unknown>` | —                  | Auth payload; called before _every_ (re)connect                               |
-| `autoConnect`        | `boolean`                           | `true`             | First `send()`/`subscribe()`/`publish()` starts the connection                |
-| `logger`             | `Logger \| null`                    | `createClog("ws")` | `null` silences                                                               |
-| `reconnect`          | `boolean \| (close) => boolean`     | `true`             | Retry after a non-terminal close? `false` never; a function decides per close |
-| `reconnectDelay`     | `number`                            | `500`              | Initial backoff, ms                                                           |
-| `reconnectDelayMax`  | `number`                            | `30_000`           | Backoff ceiling, ms                                                           |
-| `terminalCloseCodes` | `number[]`                          | `[4001, 4003]`     | Codes after which retrying stops                                              |
-| `pingInterval`       | `number`                            | `25_000`           | Ping cadence, ms. `0` disables                                                |
-| `pongTimeout`        | `number`                            | `10_000`           | Liveness deadline; also bounds the auth handshake                             |
-| `connectTimeout`     | `number`                            | `0`                | Bounds the first `connect()` await. `0` waits indefinitely                    |
-| `sendTimeout`        | `number`                            | `30_000`           | Per-send deadline covering queue + flight + ack                               |
-| `outboxMaxSize`      | `number`                            | `100`              | Frames buffered while offline. `0` disables buffering                         |
-| `onOutboxDrop`       | `(frames: ClientFrame[]) => void`   | —                  | Called with evicted frames                                                    |
-| `encode` / `decode`  | `WSEncoder` / `WSDecoder`           | JSON               | Must match the server's                                                       |
+| Name                 | Type                                | Default              | Description                                                                   |
+| -------------------- | ----------------------------------- | -------------------- | ----------------------------------------------------------------------------- |
+| `url`                | `string \| URL`                     | `"/ws"`              | `ws(s)://`, or `http(s)://` (upgraded), or a path resolved against `location` |
+| `namespace`          | `string`                            | `"default"`          | Isolation boundary for rooms. Sent to the server only when set                |
+| `clientId`           | `string`                            | —                    | Preferred id; the server may override or ignore it                            |
+| `rooms`              | `string[]`                          | `[]`                 | Rooms joined on every (re)connect                                             |
+| `auth`               | `() => unknown \| Promise<unknown>` | —                    | Auth payload; called before _every_ (re)connect                               |
+| `autoConnect`        | `boolean`                           | `true`               | First `send()`/`subscribe()`/`publish()` starts the connection                |
+| `logger`             | `Logger \| null`                    | `createClog("ws")`   | `null` silences                                                               |
+| `reconnect`          | `boolean \| (close) => boolean`     | `true`               | Retry after a non-terminal close? `false` never; a function decides per close |
+| `reconnectDelay`     | `number`                            | `500`                | Initial backoff, ms                                                           |
+| `reconnectDelayMax`  | `number`                            | `30_000`             | Backoff ceiling, ms                                                           |
+| `terminalCloseCodes` | `number[]`                          | `[4001, 4003, 4005]` | Codes after which retrying stops                                              |
+| `pingInterval`       | `number`                            | `25_000`             | Ping cadence, ms. `0` disables                                                |
+| `pongTimeout`        | `number`                            | `10_000`             | Liveness deadline; also bounds the auth handshake                             |
+| `connectTimeout`     | `number`                            | `0`                  | Bounds the first `connect()` await. `0` waits indefinitely                    |
+| `sendTimeout`        | `number`                            | `30_000`             | Per-send deadline covering queue + flight + ack                               |
+| `outboxMaxSize`      | `number`                            | `100`                | Frames buffered while offline. `0` disables buffering                         |
+| `onOutboxDrop`       | `(frames: ClientFrame[]) => void`   | —                    | Called with evicted frames                                                    |
+| `encode` / `decode`  | `WSEncoder` / `WSDecoder`           | JSON                 | Must match the server's                                                       |
 
 `pingInterval: 0` disables the client's heartbeat, not the server's reaper: the
 reference server still closes a connection that sent nothing for `idleTimeout`
@@ -228,6 +228,16 @@ subscription rejects here. When not connected it resolves once the room is
 registered; the subscription is then established by the re-subscribe on the next
 connect, and a failure there surfaces as an `error` event.
 
+A refusal is a `WSRemoteError`: code `unsupported` from a server without rooms,
+`forbidden` from one whose `allowSubscribe` policy keeps this client out of the
+room, or whose per-connection room limit the client has reached (`details.limit`
+says which). A refused room is not held afterwards — every handler attached to
+it is dropped, including ones attached by other callers while the request was
+in flight. The same applies to a room refused by the re-subscribe after a
+reconnect (say, a permission revoked while the client was away): it is dropped
+locally, the rooms the server allowed stay, and the refusal arrives as an
+`error` event carrying `details.refused`.
+
 **Parameters**
 
 - `room` (string) — room name, scoped to this client's namespace
@@ -235,6 +245,8 @@ connect, and a failure there surfaces as an `error` event.
   room, as a `WSRoomMessage<T>`
 - `options.presence` (`PresenceHandler`, optional) — enables presence for this
   room
+
+**Throws** `WSRemoteError`, `WSTimeoutError`, `WSDisposedError`
 
 **Example**
 
@@ -275,7 +287,9 @@ buffered at all: the promise rejects immediately with `WSTerminatedError`,
 because only an explicit `connect()` leaves that state.
 
 `namespace` must equal the client's own; the server rejects anything else, so it
-is only useful for asserting the expected one.
+is only useful for asserting the expected one. A `WSRemoteError` with code
+`forbidden` is also what the server's `allowPublish` policy answers with when it
+keeps this client out of the room.
 
 A payload `encode` refuses — a `BigInt` is enough for the JSON default — rejects
 with the encoder's own error, unwrapped, and also surfaces as an `error` event.
@@ -298,6 +312,16 @@ isolation boundary deserves its own name and its own server-side check:
 
 Subscribe to a lifecycle event; see [`WSEvents`](#wsevents). The returned
 unsubscriber is `Symbol.dispose`-compatible.
+
+A handler that throws is caught and reported through the `error` event, and the
+client carries on. A throwing `error` handler itself is only logged — reporting
+it would re-enter it.
+
+`connected` fires, and the state store flips to `connected: true`, only after
+the client has re-subscribed its rooms and flushed what it buffered while
+offline. Anything a handler or a store subscriber sends therefore goes out
+behind both — a publish from `connected` lands in a room the server has already
+registered, and the client receives its own echo.
 
 #### Properties
 
@@ -482,23 +506,28 @@ Creates a mountable demino app plus the service it is wired to.
 
 **Parameters**
 
-| Name                         | Type                                              | Default                   | Description                                                                                                                                                                   |
-| ---------------------------- | ------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mountPath`                  | `string`                                          | `"/ws"`                   | Demino mount path                                                                                                                                                             |
-| `middlewares`                | `DeminoHandler[]`                                 | `[]`                      | Applied to all routes                                                                                                                                                         |
-| `options.verify`             | `(payload, req, requested) => AuthResult \| null` | —                         | Return `null` (or throw) to reject with `4001`. Absent means no authentication. `requested` is the identity the client asked for — see [below](#security-namespace-isolation) |
-| `options.allowedOrigins`     | `string[] \| (origin, req) => boolean`            | — (no check)              | Origins allowed to upgrade → `403` — see [below](#security-cross-site-websocket-hijacking)                                                                                    |
-| `options.onMessage`          | `(ctx, payload) => unknown`                       | — (**unsupported**)       | Receives every client `send()`; the return value is the reply — see [below](#messages-onmessage)                                                                              |
-| `options.allowBroadcast`     | `(ctx, room) => boolean`                          | **deny**                  | Gate for cross-namespace broadcast                                                                                                                                            |
-| `options.httpAuth`           | `DeminoHandler`                                   | —                         | Guards the HTTP routes. **Without it they are not mounted**                                                                                                                   |
-| `options.deminoOptions`      | `DeminoOptions`                                   | —                         | Passed through to `demino()`                                                                                                                                                  |
-| `options.authTimeout`        | `number`                                          | `5_000`                   | Deadline for the `auth` frame → `4002`                                                                                                                                        |
-| `options.idleTimeout`        | `number`                                          | `60_000`                  | Reap silent connections → `4008`                                                                                                                                              |
-| `options.maxFrameSize`       | `number`                                          | `262144`                  | Oversized frames → `4013`                                                                                                                                                     |
-| `options.maxFramesPerSecond` | `number`                                          | `100`                     | Rate cap → `4009`                                                                                                                                                             |
-| `options.adapter`            | `WSPubSubAdapter`                                 | `WSPubSubLocal`           | Cross-instance fan-out                                                                                                                                                        |
-| `options.logger`             | `Logger \| null`                                  | `createClog("ws:server")` | `null` silences                                                                                                                                                               |
-| `options.encode` / `.decode` | `WSEncoder` / `WSDecoder`                         | JSON                      | Must match the client's                                                                                                                                                       |
+| Name                            | Type                                              | Default                   | Description                                                                                                                                                                   |
+| ------------------------------- | ------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mountPath`                     | `string`                                          | `"/ws"`                   | Demino mount path                                                                                                                                                             |
+| `middlewares`                   | `DeminoHandler[]`                                 | `[]`                      | Applied to all routes                                                                                                                                                         |
+| `options.verify`                | `(payload, req, requested) => AuthResult \| null` | —                         | Return `null` (or throw) to reject with `4001`. Absent means no authentication. `requested` is the identity the client asked for — see [below](#security-namespace-isolation) |
+| `options.allowedOrigins`        | `string[] \| (origin, req) => boolean`            | — (no check)              | Origins allowed to upgrade → `403` — see [below](#security-cross-site-websocket-hijacking)                                                                                    |
+| `options.onMessage`             | `(ctx, payload) => unknown`                       | — (**unsupported**)       | Receives every client `send()`; the return value is the reply — see [below](#messages-onmessage)                                                                              |
+| `options.allowBroadcast`        | `(ctx, room) => boolean`                          | **deny**                  | Gate for cross-namespace broadcast                                                                                                                                            |
+| `options.allowSubscribe`        | `(ctx, room) => boolean`                          | allow                     | Gate for joining a room — see [below](#security-room-level-authorization)                                                                                                     |
+| `options.allowPublish`          | `(ctx, room) => boolean`                          | allow                     | Gate for publishing into a room — see [below](#security-room-level-authorization)                                                                                             |
+| `options.httpAuth`              | `DeminoHandler`                                   | —                         | Guards the HTTP routes. **Without it they are not mounted**                                                                                                                   |
+| `options.deminoOptions`         | `DeminoOptions`                                   | —                         | Passed through to `demino()`                                                                                                                                                  |
+| `options.authTimeout`           | `number`                                          | `5_000`                   | Deadline for the `auth` frame → `4002`                                                                                                                                        |
+| `options.idleTimeout`           | `number`                                          | `60_000`                  | Reap silent connections → `4008`                                                                                                                                              |
+| `options.maxFrameSize`          | `number`                                          | `262144`                  | Oversized frames → `4013`                                                                                                                                                     |
+| `options.maxFramesPerSecond`    | `number`                                          | `100`                     | Rate cap → `4009`                                                                                                                                                             |
+| `options.maxRoomsPerConnection` | `number`                                          | `100`                     | Rooms one connection may hold; a `sub` past it is nacked `forbidden` whole. `0` disables                                                                                      |
+| `options.maxRoomNameLength`     | `number`                                          | `256`                     | Longer room names are nacked `bad_request`. `0` disables                                                                                                                      |
+| `options.maxBufferedAmount`     | `number`                                          | `1048576`                 | Bytes queued for a socket before it is closed `4010` as a slow consumer. `0` disables                                                                                         |
+| `options.adapter`               | `WSPubSubAdapter`                                 | `WSPubSubLocal`           | Cross-instance fan-out                                                                                                                                                        |
+| `options.logger`                | `Logger \| null`                                  | `createClog("ws:server")` | `null` silences                                                                                                                                                               |
+| `options.encode` / `.decode`    | `WSEncoder` / `WSDecoder`                         | JSON                      | Must match the client's                                                                                                                                                       |
 
 **Returns** `WSApp` — `{ app: Demino, service: WSService }`
 
@@ -522,7 +551,9 @@ import { createWSApp } from "@marianmeres/ws/server";
 const { app, service } = createWSApp("/ws", [], {
 	verify: async (payload, req) => {
 		const user = await authenticate((payload as any)?.token);
-		// Returning null closes the socket with 4001.
+		// Returning null closes the socket with 4001. One live connection per
+		// user: a second tab replaces the first (4005). Append a per-tab
+		// suffix to the id to allow several.
 		return user ? { clientId: user.id, namespace: user.orgId } : null;
 	},
 	allowBroadcast: (ctx, room) => room === "announcements" && ctx.meta.admin === true,
@@ -581,8 +612,10 @@ const { app, service } = createWSApp("/ws", [], {
 #### Security: namespace isolation
 
 Namespace is the isolation boundary and `clientId` is the identity peers see in
-`from` — and a claimed id evicts whoever holds it. Both fall back to what the
-client asked for:
+`from` — and a claimed id evicts whoever holds it: the older connection is closed
+with `4005 REPLACED`, which the client treats as terminal, so the loser does not
+come back to evict the winner in turn. Both fall back to what the client asked
+for:
 
 ```
 assigned by verify  →  requested by the client  →  generated
@@ -605,6 +638,41 @@ createWSApp("/ws", [], {
 	},
 });
 ```
+
+#### Security: room-level authorization
+
+Inside a namespace every member may join and publish into any room — the
+namespace is the boundary, rooms are topics. When that is too coarse (a private
+channel, a document only its collaborators may follow), `allowSubscribe` and
+`allowPublish` draw the finer line. Both receive the
+[`WSConnectionContext`](#wsconnectioncontext) and the room, may be async, and
+default to **allow**; a throw counts as a refusal.
+
+```typescript
+createWSApp("/ws", [], {
+	verify: async (payload) => {
+		const user = await authenticate(payload);
+		return user ? { clientId: user.id, meta: { grants: user.grants } } : null;
+	},
+	allowSubscribe: (ctx, room) => (ctx.meta.grants as string[]).includes(room),
+	allowPublish: (ctx, room) => room !== "announcements" || ctx.meta.admin === true,
+});
+```
+
+`allowSubscribe` is asked once per room the connection does not already hold,
+for every `sub` — including the batch the client sends after a reconnect, so a
+permission revoked while a client was away takes effect the moment it comes
+back. Refused rooms are reported in one `nack` with code `forbidden` and
+`details: { refused: string[] }`, and the rest of the frame is applied; the
+stock client drops a refused room locally (a `subscribe()` rejects, a room
+refused on reconnect becomes an `error` event). `allowPublish` refusals are a
+plain `forbidden` nack and nothing is delivered. Neither applies to
+server-side injection (`service.publish()`, the HTTP routes) or to `broadcast`,
+which has `allowBroadcast`.
+
+A connection's rooms frames are handled one at a time, in arrival order, so a
+slow policy delays that connection's later rooms frames — never another
+connection's, and never its pongs or messages.
 
 #### Security: cross-site WebSocket hijacking
 
@@ -730,7 +798,7 @@ Everything in that table except `httpAuth` and `deminoOptions`.
 }
 ```
 
-Passed to `onMessage` and `allowBroadcast`.
+Passed to `onMessage`, `allowSubscribe`, `allowPublish` and `allowBroadcast`.
 
 ### `WSStats`
 
@@ -942,6 +1010,7 @@ string-matching messages.
 | `WSConnectionLostError` | Socket closed while the frame awaited its ack         |                   |
 | `WSOutboxDropError`     | Evicted from a full outbox                            |                   |
 | `WSRemoteError`         | Server sent a `nack` (or an `error` frame)            | `code`, `details` |
+|                         | — also a malformed one: `code` is then `"unknown"`    |                   |
 | `WSNotConnectedError`   | Sent while disconnected with `outboxMaxSize: 0`       |                   |
 | `WSDisposedError`       | Client was disposed                                   |                   |
 
@@ -983,16 +1052,23 @@ RFC 6455.
 | `AUTH_FAILED`     | 4001 | **no**               |
 | `AUTH_TIMEOUT`    | 4002 | yes                  |
 | `FORBIDDEN`       | 4003 | **no**               |
+| `REPLACED`        | 4005 | **no**               |
 | `IDLE_TIMEOUT`    | 4008 | yes                  |
 | `RATE_LIMITED`    | 4009 | yes                  |
+| `SLOW_CONSUMER`   | 4010 | yes                  |
 | `FRAME_TOO_LARGE` | 4013 | yes                  |
 | `PROTOCOL_ERROR`  | 4400 | yes                  |
 | `CLIENT_GONE`     | 4900 | n/a (local)          |
 
+`REPLACED` is what a connection receives when another one authenticates with
+its client id. It is terminal because the newcomer is live by definition:
+coming back would only evict it in turn. `SLOW_CONSUMER` is what a peer
+receives when the server's send queue for it passed `maxBufferedAmount`.
+
 ### `DEFAULT_TERMINAL_CLOSE_CODES`
 
-`[4001, 4003]` — the default for `terminalCloseCodes`. Everything _not_ listed
-reconnects, including a server-sent `1000`.
+`[4001, 4003, 4005]` — the default for `terminalCloseCodes`. Everything _not_
+listed reconnects, including a server-sent `1000`.
 
 ### `FRAME`
 
@@ -1004,8 +1080,10 @@ Frame type discriminators — the `type` field of every frame. See
 `"unauthorized" | "forbidden" | "bad_request" | "rate_limited" | "unsupported" | "internal"`
 — the standard `code` values on `WSErrorInfo` and `WSRemoteError`.
 `"unsupported"` answers a frame type the server does not implement, e.g. rooms
-against a core-only server. A server application may also use codes of its own
-when it refuses a message.
+against a core-only server. `"forbidden"` answers a denied broadcast, a room the
+`allowSubscribe`/`allowPublish` policy refuses, a publish into a foreign
+namespace, and a `sub` past `maxRoomsPerConnection`. A server application may
+also use codes of its own when it refuses a message.
 
 ### `PRESENCE`
 

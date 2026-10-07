@@ -98,10 +98,24 @@ export const CLOSE = {
 	AUTH_TIMEOUT: 4002,
 	/** Authenticated but not permitted. Terminal. */
 	FORBIDDEN: 4003,
+	/**
+	 * Another connection authenticated with this client id and took its place.
+	 * Terminal: the newcomer is live by definition, so coming back could only
+	 * evict it in turn — two tabs sharing an id would then kick each other
+	 * forever. The stock client never needs to come back after this: it opens
+	 * a replacement socket only after it has already given up on the old one.
+	 */
+	REPLACED: 4005,
 	/** Connection went silent and was reaped. Recoverable. */
 	IDLE_TIMEOUT: 4008,
 	/** Too many frames per second. Recoverable, with a longer backoff floor. */
 	RATE_LIMITED: 4009,
+	/**
+	 * The peer is not reading fast enough: the server's outgoing buffer for this
+	 * connection exceeded `maxBufferedAmount`. Recoverable — whatever was
+	 * queued is lost, which at-most-once delivery already allows for.
+	 */
+	SLOW_CONSUMER: 4010,
 	/** Frame exceeded `maxFrameSize`. Recoverable. */
 	FRAME_TOO_LARGE: 4013,
 	/** Malformed frame or codec mismatch. Recoverable (but likely a config bug). */
@@ -115,18 +129,24 @@ export const CLOSE = {
  *
  * Everything *not* in this list reconnects — including a server-sent `1000`,
  * because a graceful shutdown or rolling deploy is exactly when clients must
- * come back.
+ * come back. A replaced connection (`4005`) is terminal for a different
+ * reason: reconnecting would only evict the connection that replaced it.
  */
 export const DEFAULT_TERMINAL_CLOSE_CODES: readonly number[] = [
 	CLOSE.AUTH_FAILED,
 	CLOSE.FORBIDDEN,
+	CLOSE.REPLACED,
 ];
 
 /** Application-level error codes carried in `nack`/`error` frames. */
 export const ERROR_CODE = {
 	/** Operation attempted before the handshake completed. */
 	UNAUTHORIZED: "unauthorized",
-	/** Authenticated, but not permitted — e.g. a denied broadcast. */
+	/**
+	 * Authenticated, but not permitted — a denied broadcast, a room the
+	 * `allowSubscribe`/`allowPublish` policy refuses, a publish into a foreign
+	 * namespace, or the per-connection room limit.
+	 */
 	FORBIDDEN: "forbidden",
 	/** Malformed or nonsensical frame. */
 	BAD_REQUEST: "bad_request",

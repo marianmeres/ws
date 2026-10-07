@@ -155,6 +155,8 @@ if it ever did.
 
 **Client ids are not nicknames.** `verify` returns `nick#suffix`, with the
 suffix proposed by the tab and validated server-side. Ids are unique by
-contract — a second connection authenticating with a live id replaces it — so
-letting two tabs share one would make them kick each other forever. Keeping the
-suffix stable across reconnects is what stops presence from churning.
+contract — a second connection authenticating with a live id replaces it, and
+the replaced one ends with `4005 REPLACED`, which the client treats as terminal
+— so letting two tabs share one would log the first out the moment the second
+joined. Keeping the suffix stable across reconnects is what stops presence from
+churning.

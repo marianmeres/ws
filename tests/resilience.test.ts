@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 
 import { createWSClient } from "../src/mod.ts";
+import { CLOSE } from "../src/protocol/constants.ts";
 import type { WSRoomMessage } from "../src/protocol/frames.ts";
 import {
 	WSConnectionLostError,
@@ -8,6 +9,7 @@ import {
 	WSDisposedError,
 	WSNotConnectedError,
 	WSOutboxDropError,
+	WSRemoteError,
 	WSTerminatedError,
 	WSTimeoutError,
 } from "../src/protocol/errors.ts";
@@ -15,6 +17,7 @@ import type { ClientFrame } from "../src/protocol/frames.ts";
 import {
 	freePort,
 	sleep,
+	startBadNackServer,
 	startNoAckServer,
 	startServer,
 	startSilentServer,
@@ -713,6 +716,147 @@ Deno.test("state store emits immediately and on every change", async () => {
 		const count = states.length;
 		c.disconnect();
 		assertEquals(states.length, count, "unsubscribed observer still notified");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a replaced connection ends terminated with 4005 and does not fight back", async () => {
+	const server = startServer();
+	// Short backoff: were the loser to reconnect, it would do so many times
+	// within the window below, and the survivor would not survive.
+	const first = client(server.url, {
+		clientId: "same-id",
+		reconnectDelay: 10,
+		reconnectDelayMax: 30,
+	});
+	const second = client(server.url, {
+		clientId: "same-id",
+		reconnectDelay: 10,
+		reconnectDelayMax: 30,
+	});
+
+	try {
+		await first.connect();
+		const closed = new Promise<{ code: number; willReconnect: boolean }>((r) =>
+			first.once("close", r)
+		);
+		const terminated = new Promise<{ code: number }>((r) =>
+			first.once("terminated", r)
+		);
+
+		await second.connect();
+
+		const ev = await closed;
+		assertEquals(ev.code, CLOSE.REPLACED);
+		assertEquals(ev.willReconnect, false);
+		assertEquals((await terminated).code, CLOSE.REPLACED);
+		assertEquals(first.connectionState, "terminated");
+
+		// Several backoff periods later, the newcomer is still the one
+		// connection — the loser did not come back to evict it.
+		await sleep(250);
+		assert(second.connected, "the newcomer keeps its connection");
+		assertEquals(server.service.stats().connections, 1);
+		assertEquals(first.connectionState, "terminated");
+
+		// A later, explicit connect() is still allowed — the user may know
+		// the other tab is gone — and evicts the other side in turn.
+		await first.connect();
+		await until(() => second.connectionState === "terminated", "roles swap");
+		assertEquals(server.service.stats().connections, 1);
+	} finally {
+		first.dispose();
+		second.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a send from a connected handler or a state subscriber lands after the re-subscribe", async () => {
+	const server = startServer();
+	const c = client(server.url, { autoConnect: false });
+
+	try {
+		const seen: WSRoomMessage[] = [];
+		// Registered while idle: established by the re-subscribe step.
+		await c.subscribe("chat", (m) => seen.push(m));
+
+		let fromHandler = -1;
+		c.on("connected", () => {
+			c.publish("chat", { via: "handler" }).then((
+				r,
+			) => (fromHandler = r.recipients));
+		});
+		let fromStore = -1;
+		let armed = true;
+		c.state.subscribe((s) => {
+			if (!s.connected || !armed) return;
+			armed = false;
+			c.publish("chat", { via: "store" }).then((r) => (fromStore = r.recipients));
+		});
+
+		await c.connect();
+		await until(() => fromHandler !== -1 && fromStore !== -1, "both publishes acked");
+
+		// Had either gone out before the `sub`, the server would have had no
+		// subscriber to hand it to — and the client would miss its own echo.
+		assertEquals(fromHandler, 1);
+		assertEquals(fromStore, 1);
+		await until(() => seen.length === 2, "both echoes");
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a throwing event handler is reported as `error`, and a throwing `error` handler does not recurse", async () => {
+	const server = startServer();
+	const c = client(server.url);
+
+	try {
+		const errors: Error[] = [];
+		c.on("error", (e) => {
+			errors.push(e);
+			throw new Error("the error handler throws too");
+		});
+		c.on("connected", () => {
+			throw new Error("boom");
+		});
+
+		await c.connect();
+		assertEquals(errors.map((e) => e.message), ["boom"]);
+		// The throw cost the handler, not the connection.
+		assert(c.connected);
+		assertEquals(await c.publish("x", 1), { recipients: 0 });
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a malformed nack or error frame costs that frame, not the process", async () => {
+	const server = startBadNackServer();
+	const c = client(server.url, { sendTimeout: 2_000 });
+
+	try {
+		const errors: Error[] = [];
+		c.on("error", (e) => errors.push(e));
+
+		// `nack` without `error`: the send still gets an answer — a rejection
+		// with a usable WSRemoteError — instead of a throw out of `onmessage`.
+		const err = await assertRejects(
+			() => c.send({ op: "x" }, { ack: true }),
+			WSRemoteError,
+		);
+		assertEquals(err.code, "unknown");
+		assert(c.connected);
+
+		// `error` without `error`: an `error` event, and the connection stays.
+		await c.send({ op: "fire" });
+		await until(() => errors.length === 1, "error event");
+		assert(errors[0] instanceof WSRemoteError);
+		assert(c.connected);
 	} finally {
 		c.dispose();
 		await server.stop();

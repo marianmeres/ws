@@ -410,3 +410,115 @@ export async function rawConnect(url: string): Promise<RawSocket> {
 
 	return raw;
 }
+
+/**
+ * A server whose answers are malformed where it matters: a `nack` without
+ * `error`, an `error` frame without `error`. The reference server never sends
+ * either; a third-party one with a bug might, and the client must survive it.
+ */
+export function startBadNackServer(port = 0): {
+	url: string;
+	stop(): Promise<void>;
+} {
+	const sockets = new Set<WebSocket>();
+
+	const server = Deno.serve(
+		{ port, onListen: () => {}, hostname: "127.0.0.1" },
+		(req) => {
+			if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+				return new Response("nope", { status: 426 });
+			}
+			const { socket, response } = Deno.upgradeWebSocket(req);
+			sockets.add(socket);
+			socket.onmessage = (event) => {
+				const frame = JSON.parse(event.data);
+				if (frame.type === "auth") {
+					socket.send(
+						JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION }),
+					);
+				} else if (frame.type === "msg" && typeof frame.id === "string") {
+					socket.send(JSON.stringify({ type: "nack", id: frame.id }));
+				} else if (frame.type === "msg") {
+					socket.send(JSON.stringify({ type: "error" }));
+				} else if (frame.type === "ping") {
+					socket.send(JSON.stringify({ type: "pong" }));
+				}
+			};
+			socket.onclose = () => sockets.delete(socket);
+			return response;
+		},
+	);
+
+	const { port: actual } = server.addr as Deno.NetAddr;
+	return {
+		url: `ws://127.0.0.1:${actual}/ws`,
+		async stop() {
+			for (const socket of sockets) {
+				try {
+					socket.close();
+				} catch { /* already gone */ }
+			}
+			sockets.clear();
+			await server.shutdown();
+		},
+	};
+}
+
+/**
+ * A WebSocket peer that never reads: a raw TCP connection with the upgrade
+ * and the `auth` frame written by hand. A real `WebSocket` object drains its
+ * socket on its own, and a reader is exactly what this peer must not have.
+ */
+export async function connectNonReadingPeer(
+	url: string,
+	auth: Record<string, unknown> = {},
+): Promise<{ conn: Deno.TcpConn; close(): void }> {
+	const { hostname, port } = new URL(url);
+	const conn = await Deno.connect({ hostname, port: Number(port) });
+	const text = new TextEncoder();
+	await conn.write(text.encode(
+		`GET ${new URL(url).pathname} HTTP/1.1\r\nHost: ${hostname}\r\n` +
+			"Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+	));
+	// The 101 is the one thing this peer reads: it is small, and it proves
+	// the upgrade happened before the auth frame goes out.
+	const response = new Uint8Array(4096);
+	const n = await conn.read(response);
+	if (
+		!n ||
+		!new TextDecoder().decode(response.subarray(0, n)).startsWith("HTTP/1.1 101")
+	) {
+		conn.close();
+		throw new Error("upgrade refused");
+	}
+	await conn.write(maskedTextFrame(JSON.stringify({
+		type: "auth",
+		protocol: PROTOCOL_VERSION,
+		payload: null,
+		...auth,
+	})));
+	return {
+		conn,
+		close() {
+			try {
+				conn.close();
+			} catch { /* already gone */ }
+		},
+	};
+}
+
+/** One client-to-server text frame (RFC 6455 §5.2), masked as clients must. */
+function maskedTextFrame(text: string): Uint8Array {
+	const data = new TextEncoder().encode(text);
+	const mask = crypto.getRandomValues(new Uint8Array(4));
+	const len = data.length;
+	const header = len < 126
+		? [0x81, 0x80 | len]
+		: [0x81, 0x80 | 126, (len >> 8) & 0xff, len & 0xff];
+	const out = new Uint8Array(header.length + 4 + len);
+	out.set(header);
+	out.set(mask, header.length);
+	for (let i = 0; i < len; i++) out[header.length + 4 + i] = data[i] ^ mask[i & 3];
+	return out;
+}

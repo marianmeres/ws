@@ -653,3 +653,88 @@ Deno.test("the function form decides on its own", async () => {
 		await server.stop();
 	}
 });
+
+Deno.test("subscribe() rejects forbidden for a room the policy refuses, and the room is not held", async () => {
+	const server = startServer({ allowSubscribe: (_ctx, room) => room !== "private" });
+	const c = client(server.url);
+
+	try {
+		await c.connect();
+		const err = await assertRejects(
+			() => c.subscribe("private", () => {}),
+			WSRemoteError,
+		);
+		assertEquals(err.code, "forbidden");
+		assertEquals(err.details, { refused: ["private"] });
+		assertEquals(c.isSubscribed("private"), false);
+		assertEquals(server.service.members("private"), []);
+
+		await c.subscribe("public", () => {});
+		assertEquals(c.isSubscribed("public"), true);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("a room refused on reconnect is dropped locally and reported; the rest survive", async () => {
+	let allowed = new Set(["a", "b"]);
+	const server = startServer({ allowSubscribe: (_ctx, room) => allowed.has(room) });
+	const c = client(server.url);
+
+	try {
+		await c.connect();
+		const seenA: WSRoomMessage[] = [];
+		const seenB: WSRoomMessage[] = [];
+		await c.subscribe("a", (m) => seenA.push(m));
+		await c.subscribe("b", (m) => seenB.push(m));
+
+		// Permission to "b" is revoked while the client is away.
+		allowed = new Set(["a"]);
+		const errors: Error[] = [];
+		c.on("error", (e) => errors.push(e));
+		c.disconnect();
+		await c.connect();
+
+		await until(() => errors.length === 1, "the refusal is reported");
+		const err = errors[0];
+		assert(err instanceof WSRemoteError);
+		assertEquals(err.code, "forbidden");
+		assertEquals(err.details, { refused: ["b"] });
+
+		// "a" is live on both sides; "b" is gone on both.
+		assertEquals(c.isSubscribed("a"), true);
+		assertEquals(c.isSubscribed("b"), false);
+		assertEquals(server.service.members("a"), [c.clientId]);
+		assertEquals(server.service.members("b"), []);
+		await server.service.publish("a", { still: true });
+		await until(() => seenA.length === 1, "a still delivers");
+		assertEquals(seenB.length, 0);
+	} finally {
+		c.dispose();
+		await server.stop();
+	}
+});
+
+Deno.test("publish() rejects forbidden when allowPublish refuses", async () => {
+	const server = startServer({
+		// `meta` is whatever verify returns; here, the role the auth payload names.
+		verify: (payload) => ({ meta: { role: payload } }),
+		allowPublish: (ctx, room) => ctx.meta.role === "editor" || room === "lobby",
+	});
+	const reader = client(server.url, { auth: () => "reader" });
+	const editor = client(server.url, { auth: () => "editor" });
+
+	try {
+		await reader.connect();
+		await editor.connect();
+		const err = await assertRejects(() => reader.publish("docs", 1), WSRemoteError);
+		assertEquals(err.code, "forbidden");
+		assertEquals(await reader.publish("lobby", 1), { recipients: 0 });
+		assertEquals(await editor.publish("docs", 1), { recipients: 0 });
+	} finally {
+		reader.dispose();
+		editor.dispose();
+		await server.stop();
+	}
+});

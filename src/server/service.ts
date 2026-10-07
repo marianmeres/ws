@@ -33,8 +33,8 @@ import type { WSBroadcastEnvelope, WSPubSubAdapter } from "./adapters/abstract.t
 import { WSPubSubLocal } from "./adapters/local.ts";
 
 /**
- * What a hook knows about a connection. Passed to `onMessage` and
- * `allowBroadcast`.
+ * What a hook knows about a connection. Passed to `onMessage`,
+ * `allowSubscribe`, `allowPublish` and `allowBroadcast`.
  */
 export interface WSConnectionContext {
 	/** Assigned client id, unique across live connections. */
@@ -121,6 +121,40 @@ export interface WSServiceOptions {
 		room: string,
 	) => boolean | Promise<boolean>;
 	/**
+	 * Gate for joining a room. Called once per room the connection does not
+	 * already hold, for every `sub` — the batch the client sends after a
+	 * reconnect included, so a permission revoked while a client was away
+	 * takes effect the moment it comes back.
+	 *
+	 * **Unset means every room in the connection's namespace is open to every
+	 * member of it.** The namespace is the isolation boundary; this hook is how
+	 * an application draws finer lines inside it — a private channel, a
+	 * document only its collaborators may follow.
+	 *
+	 * Refused rooms are reported in one `nack` with code `forbidden` and
+	 * `details: { refused: string[] }`; the rest of the frame is applied. The
+	 * stock client drops a refused room locally, so a `subscribe()` rejects and
+	 * a room refused on reconnect is dropped and reported as an `error` event.
+	 *
+	 * May be async. A connection's rooms frames are handled one at a time, in
+	 * arrival order, so a slow decision delays that connection's later rooms
+	 * frames — never another connection's, and never its pongs.
+	 */
+	allowSubscribe?: (
+		ctx: WSConnectionContext,
+		room: string,
+	) => boolean | Promise<boolean>;
+	/**
+	 * Gate for publishing into a room of the connection's own namespace. Unset
+	 * means allowed. A refusal is a `nack` with code `forbidden` and nothing is
+	 * delivered. Same serialization as {@link allowSubscribe}; does not apply
+	 * to `broadcast`, which has {@link allowBroadcast}.
+	 */
+	allowPublish?: (
+		ctx: WSConnectionContext,
+		room: string,
+	) => boolean | Promise<boolean>;
+	/**
 	 * Deadline for the client's `auth` frame. Default 5_000.
 	 *
 	 * It bounds the *arrival* of the frame, not the handshake: the timer is
@@ -134,6 +168,32 @@ export interface WSServiceOptions {
 	maxFrameSize?: number;
 	/** Per-connection frame rate cap. Default 100/s. */
 	maxFramesPerSecond?: number;
+	/**
+	 * Rooms one connection may hold at once. Default 100; `0` removes the cap.
+	 *
+	 * Without it a single authenticated client can grow the room index without
+	 * bound — a frame of room names costs the server a map entry per name, and
+	 * the frame-size and rate limits still allow well over a hundred thousand
+	 * per second. A `sub` that would exceed the cap is refused whole: `nack`
+	 * `forbidden` with `details: { limit }`, nothing applied.
+	 */
+	maxRoomsPerConnection?: number;
+	/**
+	 * Longest room name accepted, in UTF-16 code units. Default 256. A `sub`,
+	 * `pub` or `broadcast` naming a longer one is `nack` `bad_request`.
+	 */
+	maxRoomNameLength?: number;
+	/**
+	 * Bytes the socket may have queued for sending before the connection is
+	 * given up on. Default 1 MiB; `0` disables the check.
+	 *
+	 * `socket.send()` never blocks: a peer that stops reading — a phone on a
+	 * bad network in a chatty room is enough — makes the server buffer
+	 * everything addressed to it, without bound. Checked after every send;
+	 * over the limit the connection is closed with
+	 * {@link CLOSE.SLOW_CONSUMER}, which the client treats as recoverable.
+	 */
+	maxBufferedAmount?: number;
 	/** Cross-instance fan-out. Default {@link WSPubSubLocal} (single instance). */
 	adapter?: WSPubSubAdapter;
 	/** `null` disables logging. Default `createClog("ws:server")`. */
@@ -161,6 +221,11 @@ interface Connection {
 	authTimer?: ReturnType<typeof setTimeout>;
 	windowStart: number;
 	windowCount: number;
+	/**
+	 * The connection's rooms frames, one after another. See `#serial` — this
+	 * is what keeps a `pub` behind the `sub` it follows once a hook may await.
+	 */
+	chain: Promise<void>;
 }
 
 const DEFAULTS = {
@@ -168,7 +233,15 @@ const DEFAULTS = {
 	idleTimeout: 60_000,
 	maxFrameSize: 256 * 1024,
 	maxFramesPerSecond: 100,
+	maxRoomsPerConnection: 100,
+	maxRoomNameLength: 256,
+	maxBufferedAmount: 1024 * 1024,
 } as const;
+
+const noop = () => {};
+
+/** A room-level policy hook: `allowSubscribe`, `allowPublish`, `allowBroadcast`. */
+type RoomPolicy = (ctx: WSConnectionContext, room: string) => boolean | Promise<boolean>;
 
 const defaultEncode: WSEncoder = (frame) => JSON.stringify(frame);
 const defaultDecode: WSDecoder = (raw) =>
@@ -194,6 +267,8 @@ export class WSService {
 			| "allowedOrigins"
 			| "onMessage"
 			| "allowBroadcast"
+			| "allowSubscribe"
+			| "allowPublish"
 			| "adapter"
 			| "logger"
 			| "encode"
@@ -204,6 +279,8 @@ export class WSService {
 	#allowedOrigins: WSServiceOptions["allowedOrigins"];
 	#onMessageHook: WSServiceOptions["onMessage"];
 	#allowBroadcast: WSServiceOptions["allowBroadcast"];
+	#allowSubscribe: WSServiceOptions["allowSubscribe"];
+	#allowPublish: WSServiceOptions["allowPublish"];
 	#adapter: WSPubSubAdapter;
 	#encode: WSEncoder;
 	#decode: WSDecoder;
@@ -239,11 +316,17 @@ export class WSService {
 			maxFrameSize: options.maxFrameSize ?? DEFAULTS.maxFrameSize,
 			maxFramesPerSecond: options.maxFramesPerSecond ??
 				DEFAULTS.maxFramesPerSecond,
+			maxRoomsPerConnection: options.maxRoomsPerConnection ??
+				DEFAULTS.maxRoomsPerConnection,
+			maxRoomNameLength: options.maxRoomNameLength ?? DEFAULTS.maxRoomNameLength,
+			maxBufferedAmount: options.maxBufferedAmount ?? DEFAULTS.maxBufferedAmount,
 		};
 		this.#verify = options.verify;
 		this.#allowedOrigins = options.allowedOrigins;
 		this.#onMessageHook = options.onMessage;
 		this.#allowBroadcast = options.allowBroadcast;
+		this.#allowSubscribe = options.allowSubscribe;
+		this.#allowPublish = options.allowPublish;
 		this.#adapter = options.adapter ?? new WSPubSubLocal();
 		this.#encode = options.encode ?? defaultEncode;
 		this.#decode = options.decode ?? defaultDecode;
@@ -302,6 +385,7 @@ export class WSService {
 			lastSeen: Date.now(),
 			windowStart: Date.now(),
 			windowCount: 0,
+			chain: Promise.resolve(),
 		};
 		this.#pending.add(conn);
 
@@ -569,21 +653,29 @@ export class WSService {
 			case FRAME.MSG:
 				return await this.#onMsg(conn, frame);
 
-			// `sub`/`unsub` are handled synchronously on purpose. The socket
-			// preserves ordering, and handling these without an await means a
-			// buffered publish that follows a re-subscribe can never overtake
-			// it and land in a room the server has not registered yet.
+			// Rooms frames are serialized per connection: each one runs after
+			// the previous has finished, hooks and all. The socket preserves
+			// arrival order, and this preserves handling order — so a buffered
+			// publish that follows a re-subscribe can never overtake it and
+			// land in a room the server has not registered yet, even while
+			// `allowSubscribe` is still deciding.
 			case FRAME.SUB:
-				return this.#onSub(conn, frame.id, frame.rooms);
+				return await this.#serial(
+					conn,
+					() => this.#onSub(conn, frame.id, frame.rooms),
+				);
 
 			case FRAME.UNSUB:
-				return this.#onUnsub(conn, frame.id, frame.rooms);
+				return await this.#serial(
+					conn,
+					() => this.#onUnsub(conn, frame.id, frame.rooms),
+				);
 
 			case FRAME.PUB:
-				return await this.#onPub(conn, frame);
+				return await this.#serial(conn, () => this.#onPub(conn, frame));
 
 			case FRAME.BROADCAST:
-				return await this.#onBroadcast(conn, frame);
+				return await this.#serial(conn, () => this.#onBroadcast(conn, frame));
 
 			// Possibly a perfectly good frame from a newer or richer protocol
 			// than this server speaks. Answering it — rather than ignoring it —
@@ -649,11 +741,13 @@ export class WSService {
 
 		// Same id reconnecting: the newcomer wins, the stale socket goes. This
 		// is what makes a reconnect after a half-open drop actually recover
-		// instead of accumulating ghosts.
+		// instead of accumulating ghosts. The code is terminal for the client:
+		// were it to come back, it would evict the newcomer, which would come
+		// back and evict it — two tabs sharing an id would loop forever.
 		const existing = this.#connections.get(id);
 		if (existing && existing !== conn) {
 			this.logger?.debug?.(`replacing existing connection ${id}`);
-			this.#close(existing, CLOSE.GOING_AWAY, "replaced by new connection");
+			this.#close(existing, CLOSE.REPLACED, "replaced by new connection");
 		}
 
 		conn.id = id;
@@ -735,7 +829,7 @@ export class WSService {
 		}
 	}
 
-	#onSub(conn: Connection, id: string, requests: unknown): void {
+	async #onSub(conn: Connection, id: string, requests: unknown): Promise<void> {
 		if (!Array.isArray(requests)) {
 			this.#nack(conn, id, {
 				code: ERROR_CODE.BAD_REQUEST,
@@ -744,14 +838,58 @@ export class WSService {
 			return;
 		}
 
-		const syncRooms: string[] = [];
-
+		// Look at every entry before applying any: a frame that trips a limit
+		// is refused whole, so the client's view and the server's cannot
+		// diverge halfway through a batch.
+		const wanted: { room: string; presence: boolean }[] = [];
 		for (const request of requests as SubRequest[]) {
 			const room = nonEmptyString(request?.room);
 			if (!room) continue;
+			if (!this.#roomNameOk(conn, id, room)) return;
+			wanted.push({ room, presence: !!request.presence });
+		}
+
+		const fresh = [...new Set(wanted.map((r) => r.room))].filter(
+			(room) => !conn.rooms.has(room),
+		);
+		const limit = this.#options.maxRoomsPerConnection;
+		if (limit > 0 && conn.rooms.size + fresh.length > limit) {
+			this.#nack(conn, id, {
+				code: ERROR_CODE.FORBIDDEN,
+				message: `room limit reached (${limit})`,
+				details: { limit },
+			});
+			return;
+		}
+
+		// Only rooms the connection does not hold yet are put to the policy:
+		// what it already holds, it was already allowed.
+		const refused: string[] = [];
+		if (this.#allowSubscribe && fresh.length) {
+			const ctx = this.#context(conn);
+			for (const room of fresh) {
+				if (
+					!(await this.#allowed(
+						this.#allowSubscribe,
+						ctx,
+						room,
+						"allowSubscribe",
+					))
+				) {
+					refused.push(room);
+				}
+			}
+			// The socket may have gone while the policy was deciding.
+			if (conn.closed) return;
+		}
+		const skip = new Set(refused);
+
+		const syncRooms: string[] = [];
+		for (const { room, presence } of wanted) {
+			if (skip.has(room)) continue;
 
 			const isNew = !conn.rooms.has(room);
-			conn.rooms.set(room, !!request.presence);
+			conn.rooms.set(room, presence);
 			this.#indexAdd(room, conn.namespace, conn.id);
 
 			// Announce to the others first, so by the time the joiner gets its
@@ -759,11 +897,11 @@ export class WSService {
 			if (isNew) {
 				this.#notifyPresence(room, conn.namespace, PRESENCE.JOIN, conn.id);
 			}
-			if (request.presence) syncRooms.push(room);
+			if (presence) syncRooms.push(room);
 		}
 
-		// Sync goes out before the ack, so presence is already settled by the
-		// time the caller's `subscribe()` resolves.
+		// Sync goes out before the answer, so presence is already settled by
+		// the time the caller's `subscribe()` resolves.
 		for (const room of syncRooms) {
 			this.#send(conn, {
 				type: FRAME.PRESENCE,
@@ -776,6 +914,17 @@ export class WSService {
 			});
 		}
 
+		// One answer per frame. A partial refusal is still a refusal — the
+		// client needs to know which rooms it does not hold — but the rooms
+		// that were allowed are registered and stay so.
+		if (refused.length) {
+			this.#nack(conn, id, {
+				code: ERROR_CODE.FORBIDDEN,
+				message: `subscription refused: ${refused.join(", ")}`,
+				details: { refused },
+			});
+			return;
+		}
 		this.#send(conn, { type: FRAME.ACK, id });
 	}
 
@@ -808,6 +957,7 @@ export class WSService {
 			});
 			return;
 		}
+		if (!this.#roomNameOk(conn, frame.id, room)) return;
 
 		if (frame.namespace && typeof frame.namespace !== "string") {
 			this.#nack(conn, frame.id, {
@@ -828,6 +978,23 @@ export class WSService {
 			return;
 		}
 
+		if (this.#allowPublish) {
+			const allowed = await this.#allowed(
+				this.#allowPublish,
+				this.#context(conn),
+				room,
+				"allowPublish",
+			);
+			if (conn.closed) return;
+			if (!allowed) {
+				this.#nack(conn, frame.id, {
+					code: ERROR_CODE.FORBIDDEN,
+					message: "publish not permitted",
+				});
+				return;
+			}
+		}
+
 		const message: WSRoomMessage = {
 			room,
 			namespace,
@@ -837,7 +1004,10 @@ export class WSService {
 		};
 		const recipients = this.#deliverLocal(namespace, message);
 		this.#send(conn, { type: FRAME.ACK, id: frame.id, recipients });
-		await this.#propagate({ namespace, message }, recipients);
+		// Not awaited: this frame holds the connection's rooms frames behind
+		// it (`#serial`), and a round trip to a peer instance per publish is
+		// not something the next frame should wait for. It never rejects.
+		void this.#propagate({ namespace, message }, recipients);
 	}
 
 	async #onBroadcast(
@@ -852,16 +1022,17 @@ export class WSService {
 			});
 			return;
 		}
+		if (!this.#roomNameOk(conn, frame.id, room)) return;
 
-		let allowed = false;
-		try {
-			allowed = this.#allowBroadcast
-				? await this.#allowBroadcast(this.#context(conn), room)
-				: false;
-		} catch (e) {
-			this.logger?.debug?.(`allowBroadcast threw: ${e}`);
-			allowed = false;
-		}
+		const allowed = this.#allowBroadcast
+			? await this.#allowed(
+				this.#allowBroadcast,
+				this.#context(conn),
+				room,
+				"allowBroadcast",
+			)
+			: false;
+		if (conn.closed) return;
 
 		if (!allowed) {
 			this.#nack(conn, frame.id, {
@@ -880,7 +1051,55 @@ export class WSService {
 		};
 		const recipients = this.#deliverLocal(null, message);
 		this.#send(conn, { type: FRAME.ACK, id: frame.id, recipients });
-		await this.#propagate({ namespace: null, message }, recipients);
+		void this.#propagate({ namespace: null, message }, recipients);
+	}
+
+	/**
+	 * Runs one rooms-frame handler after every earlier rooms frame of the
+	 * same connection has finished — hooks included.
+	 *
+	 * This is the ordering guarantee of PROTOCOL.md §5.3 ("have the rooms
+	 * from a `sub` registered before you look at the next frame") in the one
+	 * place the socket's own ordering is not enough: `onmessage` fires per
+	 * frame whether or not the previous handler is still awaiting a policy.
+	 * A throw ends that frame only — `#onMessage` answers it — and the next
+	 * frame still gets its turn. Nothing runs for a connection that closed
+	 * while waiting.
+	 */
+	#serial(conn: Connection, run: () => void | Promise<void>): Promise<void> {
+		const turn = conn.chain.then(() => (conn.closed ? undefined : run()));
+		conn.chain = turn.catch(noop);
+		return turn;
+	}
+
+	/**
+	 * Asks a room policy and treats a throw as a refusal: a hook that fails is
+	 * an application bug, and failing closed is the only safe reading of it.
+	 */
+	async #allowed(
+		policy: RoomPolicy,
+		ctx: WSConnectionContext,
+		room: string,
+		name: string,
+	): Promise<boolean> {
+		try {
+			return !!(await policy(ctx, room));
+		} catch (e) {
+			this.logger?.debug?.(`${name} threw: ${e}`);
+			return false;
+		}
+	}
+
+	/** @returns whether the name is within `maxRoomNameLength`; nacks when not */
+	#roomNameOk(conn: Connection, id: string, room: string): boolean {
+		const limit = this.#options.maxRoomNameLength;
+		if (limit <= 0 || room.length <= limit) return true;
+		this.#nack(conn, id, {
+			code: ERROR_CODE.BAD_REQUEST,
+			message: `room name too long (max ${limit})`,
+			details: { limit },
+		});
+		return false;
 	}
 
 	/**
@@ -1065,11 +1284,23 @@ export class WSService {
 		if (conn.socket.readyState !== WebSocket.OPEN) return false;
 		try {
 			conn.socket.send(wire);
-			return true;
 		} catch (e) {
 			this.logger?.debug?.(`send failed (${conn.id}): ${e}`);
 			return false;
 		}
+
+		// `send()` only queued it. A peer that has stopped reading lets that
+		// queue grow without bound, so the check is here, on the only path
+		// that grows it — and it costs a property read.
+		const limit = this.#options.maxBufferedAmount;
+		const queued = conn.socket.bufferedAmount;
+		if (limit > 0 && typeof queued === "number" && queued > limit) {
+			this.logger?.warn?.(
+				`closing slow consumer ${conn.id}: ${queued} bytes queued (limit ${limit})`,
+			);
+			this.#close(conn, CLOSE.SLOW_CONSUMER, "send buffer exceeded");
+		}
+		return true;
 	}
 
 	#close(conn: Connection, code: number, reason: string): void {

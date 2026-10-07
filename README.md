@@ -111,6 +111,7 @@ import { createWSApp, WSRemoteError } from "@marianmeres/ws/server";
 const { app, service } = createWSApp("/ws", [], {
 	verify: async (payload) => {
 		const user = await authenticate(payload); // null closes with 4001
+		// One live connection per user: a second tab replaces the first.
 		return user ? { clientId: user.id } : null;
 	},
 	// Every ws.send() lands here. The return value is the reply for { ack: true }.
@@ -180,8 +181,13 @@ const { app, service } = createWSApp("/ws", [], {
 		const user = await authenticate(payload?.token);
 		// Returning null closes the socket with a terminal code.
 		if (!user || !user.orgs.includes(requested.namespace)) return null;
-		return { clientId: user.id, namespace: requested.namespace };
+		// `user.id#tab` rather than `user.id`: ids are unique per connection,
+		// and a second connection with the same id replaces the first.
+		const tab = requested.clientId ?? crypto.randomUUID();
+		return { clientId: `${user.id}#${tab}`, namespace: requested.namespace };
 	},
+	// Rooms are open to every member of the namespace unless you say otherwise.
+	allowSubscribe: (ctx, room) => canRead(ctx.meta, room),
 });
 
 // Push into a room from anywhere in your app.
@@ -193,7 +199,15 @@ Deno.serve(app);
 Namespace is the isolation boundary, and it falls back to what the client asked
 for when `verify` returns none — so in a multi-tenant deployment `verify` must
 return `namespace` and `clientId`, validating `requested` rather than trusting
-it.
+it. Inside a namespace every member may join and publish into any room until
+`allowSubscribe` / `allowPublish` say otherwise; a refused `subscribe()` rejects
+with code `forbidden`, and a room a client is no longer allowed into when it
+reconnects is dropped and reported as an `error` event.
+
+Client ids are unique per connection: a second connection authenticating with a
+live id replaces the first, which ends with `4005 REPLACED` — terminal, so the
+loser does not come back to evict the winner in turn. `user.id` alone therefore
+means one live connection per user; append a per-tab suffix to allow several.
 
 ### Either way
 
@@ -276,6 +290,8 @@ namespaces can subscribe to identically named rooms without ever seeing each
 other's messages. A client may only publish into its own namespace.
 
 **Room** — a channel within a namespace. Subscribe to receive its messages.
+Open to every member of the namespace unless the server's `allowSubscribe` /
+`allowPublish` hooks say otherwise.
 
 **Broadcast** — the one operation that crosses namespaces. It is a separate
 method rather than a flag on `publish()` precisely because crossing an isolation
@@ -291,7 +307,7 @@ handlers receive.
 
 **Reconnect classification.** Everything reconnects except a local
 `disconnect()` and an explicit terminal close code (`4001 AUTH_FAILED`,
-`4003 FORBIDDEN` by default). A server-sent `1000 Normal Closure` _does_
+`4003 FORBIDDEN` and `4005 REPLACED` by default). A server-sent `1000 Normal Closure` _does_
 reconnect — a graceful shutdown or rolling deploy is exactly when clients must
 come back. When reconnecting is pointless for your application rather than for
 the protocol — a server that forgets the session with its socket — set
@@ -319,6 +335,18 @@ behind an infinite retry.
 **A server that does not do rooms says so.** Against a core-only server,
 `subscribe()` and `publish()` reject at once with `WSRemoteError` code
 `unsupported` — they do not time out.
+
+**What a connected handler sends goes out after the re-subscribe.** On every
+(re)connect the client re-subscribes its rooms, flushes what it buffered, and
+only then emits `connected` and flips the state store — so a publish issued from
+either lands in a room the server has already registered, and the client gets
+its own echo.
+
+**The server bounds what one connection can cost.** A connection may hold 100
+rooms (`maxRoomsPerConnection`), a room name is at most 256 characters
+(`maxRoomNameLength`), and a peer that stops reading is closed with
+`4010 SLOW_CONSUMER` once 1 MiB is queued for it (`maxBufferedAmount`). All three
+are configurable; `0` disables each.
 
 **`disconnect()` is resumable; `dispose()` is terminal.** Handlers, rooms and
 buffered sends survive a `disconnect()`, so a later `connect()` picks up where

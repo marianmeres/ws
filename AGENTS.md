@@ -95,12 +95,21 @@ invites not awaiting, and it can still reject (queue timeout, outbox drop,
 terminal close). Removing that makes an ignored send fatal in Deno/Node; a
 resilience test fails if you do.
 
-**Ordering on reconnect is load-bearing.** `#onHello` must re-subscribe _before_
-flushing the outbox (which holds `pub`, `broadcast` and `msg` frames alike), and
-the server must handle `sub`/`unsub` **synchronously**.
-Together these guarantee a buffered publish cannot land in a room the server has
-not registered yet. There is a test that fails if you break it
-(`buffered publishes flush *after* re-subscribe`).
+**Ordering on reconnect is load-bearing.** `#onHello` must re-subscribe, _then_
+flush the outbox (which holds `pub`, `broadcast` and `msg` frames alike), and
+only _then_ go `open`, emit `connected` and settle `connect()` — the event bus
+and the state store are synchronous, so anything a `connected` handler or a
+store subscriber sends must find the `sub` already on the wire. On the server,
+a connection's rooms frames (`sub`/`unsub`/`pub`/`broadcast`) are handled **one
+at a time, in arrival order** (`#serial`, a per-connection promise chain): the
+socket orders arrival, the chain orders handling, and an `allowSubscribe` that
+awaits cannot let the `pub` behind it overtake. Together these guarantee a
+buffered publish cannot land in a room the server has not registered yet. Tests
+fail if you break any of it (`buffered publishes flush *after* re-subscribe`,
+`a send from a connected handler … lands after the re-subscribe`, `an async
+allowSubscribe still keeps a following pub behind the sub`). Inside a serialized
+handler, do not await the adapter (`#propagate`): a peer round trip per publish
+is not something the next frame should wait for.
 
 **`sub`/`unsub` bypass the outbox.** They are replayed wholesale by the
 re-subscribe step, so buffering them too would apply them twice.
@@ -124,10 +133,35 @@ unencodable — and like a reply, that is answered `internal` rather than leavin
 the client to wait out its deadline for a `nack` that never left.
 
 **`onMessage` is not serialized.** It is called in arrival order but not awaited
-before the next frame, like every other async path in the service. The Python
-servers in PROTOCOL.md do serialize (a per-connection worker) — both are
+before the next frame — unlike the rooms frames, which are. The Python servers
+in PROTOCOL.md do serialize messages (a per-connection worker) — both are
 documented as such; do not "fix" either to match the other without updating
 PROTOCOL.md §3.2.
+
+**The client's inbound dispatch is contained.** `#onMessage` wraps `#dispatch`
+in a try/catch that ends in `#fail`, and `toErrorInfo` normalises whatever a
+`nack`/`error` frame carries. A throw out of `socket.onmessage` is an uncaught
+exception, fatal in Deno and Node — and a third-party server (PROTOCOL.md
+exists so people write them) is where a malformed frame comes from. Likewise
+both pubsub buses carry an `onError` that routes a throwing user handler to the
+`error` event; a throwing `error` handler is only logged, or reporting it would
+re-enter it.
+
+**A replaced connection is closed with `4005 REPLACED`, terminal by default.**
+Newcomer-wins is what recovers a half-open drop, but the loser must not come
+back: it would evict the newcomer, which would come back and evict it — two
+tabs sharing an id looped forever when this was 1001. The stock client never
+needs to reconnect after it, because it opens a replacement socket only after
+superseding the old one by generation. Do not move it back to a reconnecting
+code.
+
+**The server bounds what one connection can cost.** `maxRoomsPerConnection`
+(100), `maxRoomNameLength` (256) and `maxBufferedAmount` (1 MiB) are on by
+default and refuse or close rather than grow: a `sub` past the cap is nacked
+whole, a long name is `bad_request`, and a socket whose `bufferedAmount` passes
+the limit is closed `4010 SLOW_CONSUMER` from `#sendEncoded` — the one path
+that grows it. `0` disables each. Without them one authenticated client, or one
+client that merely stops reading, grows server memory without bound.
 
 **`reconnect` and `terminalCloseCodes` are different knobs; keep them so.** A
 terminal code is a _failure_: `terminated` state, error log, `terminated` event,
@@ -155,12 +189,19 @@ cancels the reconnect that replaced it.
 
 **Safe defaults are deny.** `allowBroadcast` denies; HTTP injection routes are
 not mounted without `httpAuth`. Do not "helpfully" relax either. The documented
-exception: `clientId` and `namespace` fall back to what the client asked for
+exceptions: `clientId` and `namespace` fall back to what the client asked for
 (assigned → requested → generated), so a multi-tenant `verify` must return both.
 Its third argument carries the client's proposals so they can be validated there
-instead of being duplicated into the auth payload. `allowedOrigins` is the other
-exception — opt-in, because a default allow-list would break every non-browser
-deployment; unset means no check at all.
+instead of being duplicated into the auth payload. `allowedOrigins` is opt-in,
+because a default allow-list would break every non-browser deployment; unset
+means no check at all. And `allowSubscribe`/`allowPublish` unset means every
+room in the namespace is open to every member of it — the namespace is the
+isolation boundary, these hooks draw finer lines inside it, and a default deny
+would make every room unusable. A `sub` refusal is partial: the allowed rooms
+are registered, the refused ones named in `details.refused`, and the client
+drops those locally (`refusedRooms`) so no handler waits forever. A policy that
+throws is a refusal (`#allowed`). Rooms a connection already holds are not put
+to the policy again.
 
 **Delivery is at-most-once.** Transmitted-but-unacked sends are never resent.
 If that changes, the server needs deduplication first.
@@ -195,7 +236,7 @@ run `deno publish` then the npm build.
 
 ## Before Making Changes
 
-1. `deno task test` — 92 tests, mostly real sockets against a real server:
+1. `deno task test` — 105 tests, mostly real sockets against a real server:
    `unit`, `integration`, `resilience`, `core` (messages: a core-only server,
    `onMessage`, `service.send`), `protocol` (server input hardening, raw
    sockets) and `codec` (custom encode/decode, binary frames)
@@ -233,6 +274,10 @@ run `deno publish` then the npm build.
   presence does not
 - Node/Bun cannot run the server (`Deno.upgradeWebSocket`)
 - Origin checking is opt-in via `allowedOrigins`; unset means no check
+- `maxBufferedAmount` bounds one connection; there is no aggregate memory cap
+- Presence `join`/`leave` carries the full member list to every presence
+  subscriber, so a large presence room is quadratic — presence is opt-in per
+  room for that reason
 
 ## Documentation Index
 

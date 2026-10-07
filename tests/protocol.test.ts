@@ -10,7 +10,14 @@ import { assert, assertEquals, assertNotEquals } from "@std/assert";
 
 import { CLOSE, ERROR_CODE, PROTOCOL_VERSION } from "../src/protocol/constants.ts";
 import type { WSFrame } from "../src/protocol/frames.ts";
-import { rawConnect, sleep, startServer, until } from "./_helpers.ts";
+import type { Logger } from "@marianmeres/clog";
+import {
+	connectNonReadingPeer,
+	rawConnect,
+	sleep,
+	startServer,
+	until,
+} from "./_helpers.ts";
 
 Deno.test("a non-array `rooms` on sub is a bad_request, not a crash", async () => {
 	const server = startServer();
@@ -269,6 +276,230 @@ Deno.test("an unexpected handler throw closes the socket, not the process", asyn
 		assertEquals(server.service.stats().connections, 0);
 	} finally {
 		await a.close();
+		await server.stop();
+	}
+});
+
+Deno.test("a sub past maxRoomsPerConnection is refused whole; re-subscribing is free", async () => {
+	const server = startServer({ maxRoomsPerConnection: 3 });
+	const a = await rawConnect(server.url);
+
+	try {
+		const hello = await a.auth();
+		a.send({ type: "sub", id: "s1", rooms: [{ room: "a" }, { room: "b" }] });
+		await a.waitFor((f) => f.type === "ack" && f.id === "s1", "ack s1");
+
+		// Two held plus two more is four: nothing of this frame is applied.
+		a.send({ type: "sub", id: "s2", rooms: [{ room: "c" }, { room: "d" }] });
+		const nack = await a.waitFor(
+			(f) => f.type === "nack" && f.id === "s2",
+			"nack s2",
+		);
+		assertEquals(nack.error?.code, ERROR_CODE.FORBIDDEN);
+		assertEquals(nack.error?.details, { limit: 3 });
+		assertEquals(server.service.members("c"), []);
+		assertEquals(server.service.members("d"), []);
+
+		// A room already held does not count again; a third fits exactly.
+		a.send({
+			type: "sub",
+			id: "s3",
+			rooms: [{ room: "a" }, { room: "a" }, { room: "c" }],
+		});
+		await a.waitFor((f) => f.type === "ack" && f.id === "s3", "ack s3");
+		assertEquals(server.service.members("c"), [hello.clientId]);
+
+		a.send({ type: "sub", id: "s4", rooms: [{ room: "e" }] });
+		await a.waitFor((f) => f.type === "nack" && f.id === "s4", "nack s4");
+
+		// Leaving one makes room for one.
+		a.send({ type: "unsub", id: "u", rooms: ["a"] });
+		await a.waitFor((f) => f.type === "ack" && f.id === "u", "ack u");
+		a.send({ type: "sub", id: "s5", rooms: [{ room: "e" }] });
+		await a.waitFor((f) => f.type === "ack" && f.id === "s5", "ack s5");
+		assertEquals(a.closed, null);
+	} finally {
+		await a.close();
+		await server.stop();
+	}
+});
+
+Deno.test("a room name over maxRoomNameLength is a bad_request on sub, pub and broadcast", async () => {
+	const server = startServer({ maxRoomNameLength: 8, allowBroadcast: () => true });
+	const a = await rawConnect(server.url);
+	const long = "x".repeat(9);
+
+	try {
+		await a.auth();
+		a.send({ type: "sub", id: "s", rooms: [{ room: "fine" }, { room: long }] });
+		const s = await a.waitFor((f) => f.type === "nack" && f.id === "s", "nack s");
+		assertEquals(s.error?.code, ERROR_CODE.BAD_REQUEST);
+		assertEquals(s.error?.details, { limit: 8 });
+		// Refused whole: the well-formed entry before it was not applied either.
+		assertEquals(server.service.members("fine"), []);
+
+		a.send({ type: "pub", id: "p", room: long, payload: 1 });
+		const p = await a.waitFor((f) => f.type === "nack" && f.id === "p", "nack p");
+		assertEquals(p.error?.code, ERROR_CODE.BAD_REQUEST);
+
+		a.send({ type: "broadcast", id: "b", room: long, payload: 1 });
+		const b = await a.waitFor((f) => f.type === "nack" && f.id === "b", "nack b");
+		assertEquals(b.error?.code, ERROR_CODE.BAD_REQUEST);
+
+		a.send({ type: "sub", id: "ok", rooms: [{ room: "x".repeat(8) }] });
+		await a.waitFor((f) => f.type === "ack" && f.id === "ok", "ack ok");
+		assertEquals(a.closed, null);
+	} finally {
+		await a.close();
+		await server.stop();
+	}
+});
+
+Deno.test("allowSubscribe: refused rooms are named, the rest are applied, a throw refuses", async () => {
+	const server = startServer({
+		allowSubscribe: (_ctx, room) => {
+			if (room === "boom") throw new Error("policy bug");
+			return !room.startsWith("private");
+		},
+	});
+	const a = await rawConnect(server.url);
+
+	try {
+		const hello = await a.auth();
+		a.send({
+			type: "sub",
+			id: "s",
+			rooms: [
+				{ room: "public", presence: true },
+				{ room: "private-1" },
+				{ room: "boom" },
+				{ room: "private-2" },
+			],
+		});
+		const nack = await a.waitFor((f) => f.type === "nack" && f.id === "s", "nack s");
+		assertEquals(nack.error?.code, ERROR_CODE.FORBIDDEN);
+		assertEquals(nack.error?.details, {
+			refused: ["private-1", "boom", "private-2"],
+		});
+
+		// The allowed room is live — its presence sync even preceded the nack.
+		assertEquals(server.service.members("public"), [hello.clientId]);
+		assertEquals(server.service.members("private-1"), []);
+		assertEquals(server.service.members("boom"), []);
+		const sync = a.frames.find((f) => f.type === "presence");
+		assertEquals(sync?.room, "public");
+		assert(a.frames.indexOf(sync!) < a.frames.indexOf(nack));
+
+		// A room already held is not put to the policy again: a re-sub for
+		// presence on it is acked even if the policy would now refuse.
+		a.send({ type: "sub", id: "again", rooms: [{ room: "public", presence: true }] });
+		await a.waitFor((f) => f.type === "ack" && f.id === "again", "ack again");
+	} finally {
+		await a.close();
+		await server.stop();
+	}
+});
+
+Deno.test("an async allowSubscribe still keeps a following pub behind the sub", async () => {
+	const server = startServer({
+		allowSubscribe: async () => {
+			await sleep(60);
+			return true;
+		},
+	});
+	const a = await rawConnect(server.url);
+
+	try {
+		await a.auth();
+		// Back to back, as the client does after every reconnect: the sub's
+		// policy is still deciding when the pub arrives.
+		a.send({ type: "sub", id: "s", rooms: [{ room: "r" }] });
+		a.send({ type: "pub", id: "p", room: "r", payload: { late: true } });
+
+		const ack = await a.waitFor((f) => f.type === "ack" && f.id === "p", "ack p");
+		assertEquals(ack.recipients, 1, "the pub waited for the sub to be registered");
+		const msg = await a.waitFor(
+			(f) => f.type === "msg" && f.room === "r",
+			"own echo",
+		);
+		assertEquals(msg.payload, { late: true });
+		// And the sub was answered first.
+		assert(
+			a.frames.findIndex((f) => f.id === "s") <
+				a.frames.findIndex((f) => f.id === "p"),
+		);
+	} finally {
+		await a.close();
+		await server.stop();
+	}
+});
+
+Deno.test("allowPublish: a refused pub is nacked forbidden and delivers nothing", async () => {
+	const server = startServer({ allowPublish: (_ctx, room) => room !== "readonly" });
+	const a = await rawConnect(server.url);
+	const b = await rawConnect(server.url);
+
+	try {
+		await a.auth();
+		await b.auth();
+		a.send({ type: "sub", id: "s", rooms: [{ room: "readonly" }, { room: "open" }] });
+		await a.waitFor((f) => f.type === "ack" && f.id === "s", "ack s");
+
+		b.send({ type: "pub", id: "p1", room: "readonly", payload: 1 });
+		const nack = await b.waitFor(
+			(f) => f.type === "nack" && f.id === "p1",
+			"nack p1",
+		);
+		assertEquals(nack.error?.code, ERROR_CODE.FORBIDDEN);
+
+		b.send({ type: "pub", id: "p2", room: "open", payload: 2 });
+		const ack = await b.waitFor((f) => f.type === "ack" && f.id === "p2", "ack p2");
+		assertEquals(ack.recipients, 1);
+
+		await a.waitFor((f) => f.type === "msg" && f.room === "open", "open delivery");
+		assertEquals(a.frames.filter((f) => f.type === "msg").length, 1);
+	} finally {
+		await a.close();
+		await b.close();
+		await server.stop();
+	}
+});
+
+Deno.test("a peer that stops reading is closed as a slow consumer, not buffered forever", async () => {
+	const warnings: string[] = [];
+	const server = startServer({
+		maxBufferedAmount: 256 * 1024,
+		logger: { warn: (m: string) => warnings.push(String(m)) } as unknown as Logger,
+	});
+	const peer = await connectNonReadingPeer(server.url, { clientId: "sloth" });
+
+	try {
+		await until(() => server.service.stats().connections === 1, "authenticated");
+
+		// The peer never reads again. The kernel absorbs the first few hundred
+		// KiB; after that the server's own queue grows — until it does not.
+		const chunk = "x".repeat(64 * 1024);
+		let sends = 0;
+		await until(
+			() => {
+				if (server.service.stats().connections === 0) return true;
+				server.service.send("sloth", chunk);
+				sends++;
+				return false;
+			},
+			"slow consumer reaped",
+			5_000,
+			5,
+		);
+
+		assertEquals(server.service.stats().connections, 0);
+		assert(sends < 200, `gave up after ${sends} sends, not never`);
+		assert(
+			warnings.some((w) => w.includes("slow consumer sloth")),
+			`warned about the slow consumer: ${warnings.join(" | ")}`,
+		);
+	} finally {
+		peer.close();
 		await server.stop();
 	}
 });

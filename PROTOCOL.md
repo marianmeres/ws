@@ -25,7 +25,7 @@ Both Python servers (sections 8 and 9) pass the conformance script in Appendix
 A, which drives the real client against them. Use them as the executable half of
 this specification.
 
-Written against `@marianmeres/ws` 0.5.0, **protocol version 2**. The normative
+Written against `@marianmeres/ws` 0.7.0, **protocol version 2**. The normative
 definitions live in the package's `src/protocol/` (`constants.ts`, `frames.ts`),
 also published dependency-free as `@marianmeres/ws/protocol`.
 
@@ -42,9 +42,10 @@ Seven rules. Everything else in the core is detail.
 2. The first frame the client sends is `auth`, carrying the application's
    credentials in `payload`. Reply `{"type": "hello", "protocol": 2}` within
    **10 s**, or the client drops the socket and retries.
-3. Reject authentication by closing with code **4001**. That, and 4003, are the
-   only codes after which the client stops reconnecting. Every other close code
-   — including a plain 1000 — makes it reconnect.
+3. Reject authentication by closing with code **4001**. That, 4003, and 4005
+   (rooms, rule 13) are the only codes after which the client stops
+   reconnecting. Every other close code — including a plain 1000 — makes it
+   reconnect.
 4. A client message is `{"type": "msg", "payload": …}`. **Without an `id`** it
    is fire-and-forget: handle it, send nothing back. **With an `id`** the client
    is waiting: answer with exactly one `ack` — optionally carrying a reply in
@@ -73,7 +74,12 @@ Seven rules. Everything else in the core is detail.
     without waiting for the ack — if a `pub` overtakes the `sub`, it lands in a
     room the server has not registered yet.
 13. When a second connection authenticates with a client id that is already
-    connected, close the old one with 1001 and keep the new one.
+    connected, close the old one with **4005** and keep the new one. The client
+    treats 4005 as terminal, so the old one does not come back to evict the new.
+14. Rooms are open to every member of their namespace unless your policy says
+    otherwise: refuse a `sub` with `nack` `forbidden` naming the refused rooms
+    in `details.refused` (the rest of the frame still applies), a `pub` with a
+    plain `forbidden`.
 
 ---
 
@@ -302,14 +308,16 @@ against a core-only server rejects at once with `WSRemoteError` code
 | Code | Name              | Sent by | Meaning                                             | Client reaction               |
 | ---- | ----------------- | ------- | --------------------------------------------------- | ----------------------------- |
 | 1000 | `NORMAL`          | server  | Normal closure, e.g. restart                        | reconnects                    |
-| 1001 | `GOING_AWAY`      | server  | Shutdown, replaced connection                       | reconnects                    |
+| 1001 | `GOING_AWAY`      | server  | Shutdown                                            | reconnects                    |
 | 1006 | `ABNORMAL`        | —       | No close handshake (network drop)                   | reconnects                    |
 | 1011 | `INTERNAL_ERROR`  | server  | Unexpected server-side condition                    | reconnects                    |
 | 4001 | `AUTH_FAILED`     | server  | Authentication rejected                             | **terminal** — stops retrying |
 | 4002 | `AUTH_TIMEOUT`    | both    | No `auth` in time / no `hello` in time              | reconnects                    |
 | 4003 | `FORBIDDEN`       | server  | Authenticated but not permitted                     | **terminal** — stops retrying |
+| 4005 | `REPLACED`        | server  | Another connection took this client id (5.2)        | **terminal** — stops retrying |
 | 4008 | `IDLE_TIMEOUT`    | both    | Silent connection reaped / pong deadline            | reconnects                    |
 | 4009 | `RATE_LIMITED`    | server  | Too many frames per second                          | reconnects                    |
+| 4010 | `SLOW_CONSUMER`   | server  | Peer not reading; its send queue passed the limit   | reconnects                    |
 | 4013 | `FRAME_TOO_LARGE` | server  | Frame exceeded the size limit                       | reconnects                    |
 | 4400 | `PROTOCOL_ERROR`  | both    | Malformed frame; client-side, its `auth` hook threw | reconnects                    |
 | 4900 | `CLIENT_GONE`     | client  | Application called `disconnect()`/`dispose()`       | n/a — deliberate              |
@@ -333,15 +341,15 @@ also 5.2).
 
 ### 4.1 Client → server
 
-| `type`      | Layer | Fields                                           | Reply                                              |
-| ----------- | ----- | ------------------------------------------------ | -------------------------------------------------- |
-| `auth`      | core  | `protocol`, `payload`, `clientId?`, `namespace?` | `hello`, or close 4001/4003                        |
-| `msg`       | core  | `payload`, `id?`                                 | with `id`: `ack` (with an optional reply) / `nack` |
-| `ping`      | core  | —                                                | `pong`                                             |
-| `sub`       | rooms | `id`, `rooms: [{room, presence?}]`               | `presence` sync (per presence room), `ack`         |
-| `unsub`     | rooms | `id`, `rooms: [string]`                          | `ack`                                              |
-| `pub`       | rooms | `id`, `room`, `payload`, `namespace?`            | `ack` with `recipients`, or `nack`                 |
-| `broadcast` | rooms | `id`, `room`, `payload`                          | `ack` with `recipients`, or `nack`                 |
+| `type`      | Layer | Fields                                           | Reply                                               |
+| ----------- | ----- | ------------------------------------------------ | --------------------------------------------------- |
+| `auth`      | core  | `protocol`, `payload`, `clientId?`, `namespace?` | `hello`, or close 4001/4003                         |
+| `msg`       | core  | `payload`, `id?`                                 | with `id`: `ack` (with an optional reply) / `nack`  |
+| `ping`      | core  | —                                                | `pong`                                              |
+| `sub`       | rooms | `id`, `rooms: [{room, presence?}]`               | `presence` sync (per presence room), `ack` / `nack` |
+| `unsub`     | rooms | `id`, `rooms: [string]`                          | `ack`                                               |
+| `pub`       | rooms | `id`, `room`, `payload`, `namespace?`            | `ack` with `recipients`, or `nack`                  |
+| `broadcast` | rooms | `id`, `room`, `payload`                          | `ack` with `recipients`, or `nack`                  |
 
 A core-only server answers every `rooms` frame with `nack` `unsupported` (3.4).
 
@@ -366,7 +374,9 @@ A core-only server answers every `rooms` frame with `nack` `unsupported` (3.4).
 **`sub`** — join one or more rooms in the connection's namespace. Idempotent:
 re-subscribing an already joined room is legal and is how the client turns
 presence on for a room it already holds. `presence` may be `true`, `false` or
-absent; the latest `sub` wins for that flag.
+absent; the latest `sub` wins for that flag. A room the server's policy refuses
+is reported in the `nack`'s `details.refused` while the rest of the frame still
+applies (5.5).
 
 ```json
 {
@@ -534,18 +544,26 @@ or join any namespace.
 ### 5.2 One connection per client id
 
 When a connection authenticates with an id that is already registered: close the
-existing connection with **1001** (reason, e.g., `replaced by new connection`),
-remove it from every room — emitting `leave` presence events — and register the
-newcomer. Make sure the old socket's close handler does not remove the _new_
-registration when it eventually fires.
+existing connection with **4005** `REPLACED` (reason, e.g.,
+`replaced by new connection`), remove it from every room — emitting `leave`
+presence events — and register the newcomer. Make sure the old socket's close
+handler does not remove the _new_ registration when it eventually fires.
 
 Why: after a half-open drop (laptop lid, mobile handover) the client reconnects
 with the same id while the server still believes the old socket is alive.
 Newcomer-wins is what makes that recover instead of accumulating ghosts.
 
-Consequence: ids must be unique per connection **by contract**. Two tabs sharing
-an id will evict each other forever, because 1001 is a reconnecting code. The
-usual scheme is `"<user-id>#<per-tab-suffix>"`.
+Why 4005 and not 1001: the client treats 4005 as terminal, and the replaced
+connection must not come back. The newcomer is live by definition, so a
+reconnect could only evict it — and with a reconnecting code two tabs sharing an
+id evicted each other forever, every few hundred milliseconds. The stock client
+never needs to reconnect after being replaced: it opens the replacement socket
+only after it has already given up on the old one, so the 4005 reaches a socket
+it no longer listens to.
+
+Consequence: ids are unique per connection **by contract**. `"<user-id>"` alone
+means one live connection per user — a second tab logs the first out. To let
+one user hold several, use `"<user-id>#<per-tab-suffix>"`.
 
 Whenever a connection closes, for any reason: remove it from every room, send
 `leave` to the presence subscribers of those rooms, and forget it — but only
@@ -566,7 +584,15 @@ and have the rooms from a `sub` registered before you look at the next frame. A
 design that handles frames concurrently (a task per frame) violates this and
 loses the flushed publishes. Handling `sub`/`unsub`/`pub`/`broadcast` inline in
 the read loop is the simplest correct choice; the Python reference does that,
-and queues only `msg` frames for its message worker.
+and queues only `msg` frames for its message worker. Mind that the obligation
+covers your policy hooks too: a `sub` whose authorization is still awaiting a
+database must still hold the `pub` behind it. In a design where frames are
+dispatched as they arrive (the Deno reference), that takes an explicit
+per-connection queue for the rooms frames.
+
+The client, for its part, emits `connected` — and resolves `connect()` — only
+after both steps are on the wire, so nothing the application sends in reaction
+to being connected can overtake them either.
 
 A reconnect is a brand-new connection: presence subscribers of each room see a
 `leave` for the old socket followed by a `join` for the new one.
@@ -583,7 +609,10 @@ connection lives in exactly one namespace, fixed at `hello`.
 Handling `pub`:
 
 1. If the frame carries `namespace` and it differs from the connection's, reply
-   `nack` with code `forbidden`. Nothing is delivered.
+   `nack` with code `forbidden`. Nothing is delivered. The same answer, with a
+   message such as `publish not permitted`, when your policy does not let this
+   sender publish into this room (the reference calls the hook
+   `allowPublish`; unset, every room is open to every member of the namespace).
 2. Build the message: `room` from the frame, `namespace` = the connection's,
    `from` = the connection's client id, `payload` verbatim, `timestamp` = now in
    epoch milliseconds.
@@ -624,20 +653,39 @@ every subscriber, presence or not.
 
 On `sub` of room `R` by client `C` in namespace `N`:
 
-1. Add `C` to the index for `(R, N)`; remember whether `C` wants presence
-   (latest `sub` wins).
-2. If `C` was not already a member: send `presence` `join` (`clientId: C`,
+1. Look at every entry before applying any. A room name over your length limit
+   is `nack` `bad_request` for the whole frame; a frame that would take `C`
+   past your per-connection room limit is `nack` `forbidden` with
+   `details: { "limit": n }` for the whole frame. Nothing applied either way
+   (section 7 has the reference values).
+2. For every room `C` does not already hold, ask your policy whether `C` may
+   join it (the reference calls the hook `allowSubscribe`; unset, every room is
+   open to every member of the namespace). Collect the refused ones. A room `C`
+   already holds is not asked about again.
+3. For each room that was not refused: add `C` to the index for `(R, N)`;
+   remember whether `C` wants presence (latest `sub` wins).
+4. If `C` was not already a member: send `presence` `join` (`clientId: C`,
    `members` including `C`) to every **other** member of `(R, N)` that wants
    presence.
-3. If `C` asked for presence: send `presence` `sync` (`clientId: null`, full
+5. If `C` asked for presence: send `presence` `sync` (`clientId: null`, full
    `members`) to `C`. Also on a re-subscribe of a room `C` already held — that is
    how the client gets a snapshot when it turns presence on late, and after every
    reconnect.
-4. Send `ack`.
+6. Send `ack` — or, when anything was refused in step 2, one `nack` with code
+   `forbidden` and `details: { "refused": [rooms] }`. The rooms that were
+   allowed stay registered either way: a refusal is partial, and the client
+   must learn which rooms it does not hold.
 
-That order — deltas to the others, then the snapshot, then the ack — is
-deliberate. The snapshot precedes the ack so that the client's `subscribe()`
+That order — deltas to the others, then the snapshot, then the answer — is
+deliberate. The snapshot precedes the answer so that the client's `subscribe()`
 resolves with membership already populated.
+
+The stock client acts on `details.refused`: it drops those rooms locally, so a
+`subscribe()` of one room rejects with `forbidden`, and a room refused in the
+batch after a reconnect (a permission revoked while the client was away) is
+dropped and reported as an `error` event while the others stay live. A `nack`
+without `details.refused` leaves the client holding every room in the frame, so
+always name them.
 
 On `unsub` of `R` by `C`, and on any close of `C`'s connection: remove `C` from
 `(R, N)`, then send `presence` `leave` (`clientId: C`, `members` without `C`) to
@@ -675,15 +723,15 @@ when there is something to send.
 }
 ```
 
-| `code`         | Layer | Use it for                                                                     |
-| -------------- | ----- | ------------------------------------------------------------------------------ |
-| `unauthorized` | core  | Any non-`auth` frame before the handshake completed                            |
-| `bad_request`  | core  | Malformed frame: missing `type`; with rooms, missing `room`, non-array `rooms` |
-| `unsupported`  | core  | A frame type this server does not implement (3.4)                              |
-| `rate_limited` | core  | Frame rate cap exceeded                                                        |
-| `internal`     | core  | Unexpected server-side failure — never with the exception's text               |
-| `forbidden`    | rooms | Publishing into a foreign namespace; a denied broadcast                        |
-| _your own_     | core  | Refusing a client `msg` for an application reason (`not_found`, …)             |
+| `code`         | Layer | Use it for                                                                                                                                                                    |
+| -------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unauthorized` | core  | Any non-`auth` frame before the handshake completed                                                                                                                           |
+| `bad_request`  | core  | Malformed frame: missing `type`; with rooms, missing `room`, non-array `rooms`, a room name over the length limit                                                             |
+| `unsupported`  | core  | A frame type this server does not implement (3.4)                                                                                                                             |
+| `rate_limited` | core  | Frame rate cap exceeded                                                                                                                                                       |
+| `internal`     | core  | Unexpected server-side failure — never with the exception's text                                                                                                              |
+| `forbidden`    | rooms | Publishing into a foreign namespace; a denied broadcast; a room the policy refuses (`details.refused` names them on a `sub`); the per-connection room limit (`details.limit`) |
+| _your own_     | core  | Refusing a client `msg` for an application reason (`not_found`, …)                                                                                                            |
 
 Reference behaviour for malformed input:
 
@@ -696,8 +744,10 @@ Reference behaviour for malformed input:
   `id`, `error` when not — and keep the socket. It is an application failure,
   not a broken connection. Log the details; do not send them.
 - `sub`/`unsub` whose `rooms` is not an array, or `pub`/`broadcast` without a
-  non-empty string `room`: send `nack` `bad_request`, keep the socket. Malformed
-  entries _inside_ a well-formed `rooms` array are skipped silently.
+  non-empty string `room`, or any of them naming a room over the length limit:
+  send `nack` `bad_request`, keep the socket. Malformed entries _inside_ a
+  well-formed `rooms` array are skipped silently; an over-long name refuses the
+  whole frame, because the stock client can send one and must hear about it.
 - An unexpected failure in the server's own frame handling (not the
   application's handler): send `error` `internal`, then close with **1011**. The
   connection's bookkeeping may be half-applied; 1011 is recoverable, so the
@@ -708,19 +758,29 @@ Reference behaviour for malformed input:
 ## 7. Limits
 
 These are the reference servers' values. Implementing them is recommended, not
-required; if you do, reuse the close codes. All of them are recoverable, so the
-client reconnects.
+required; if you do, reuse the close codes and error codes. Every close here is
+recoverable, so the client reconnects; the two `nack`s keep the socket.
 
-| Limit               | Reference | Close code             |
-| ------------------- | --------- | ---------------------- |
-| Time to send `auth` | 5 s       | 4002 `AUTH_TIMEOUT`    |
-| Idle (no frame)     | 60 s      | 4008 `IDLE_TIMEOUT`    |
-| Frame size          | 256 KiB   | 4013 `FRAME_TOO_LARGE` |
-| Frames per second   | 100       | 4009 `RATE_LIMITED`    |
+| Limit                     | Reference | Answer                                    |
+| ------------------------- | --------- | ----------------------------------------- |
+| Time to send `auth`       | 5 s       | close 4002 `AUTH_TIMEOUT`                 |
+| Idle (no frame)           | 60 s      | close 4008 `IDLE_TIMEOUT`                 |
+| Frame size                | 256 KiB   | close 4013 `FRAME_TOO_LARGE`              |
+| Frames per second         | 100       | close 4009 `RATE_LIMITED`                 |
+| Rooms per connection      | 100       | `nack` `forbidden`, `details.limit` (5.5) |
+| Room name length          | 256       | `nack` `bad_request`, `details.limit`     |
+| Bytes queued for a socket | 1 MiB     | close 4010 `SLOW_CONSUMER`                |
+
+The last one is the only defence against a peer that stops reading: `send` on a
+WebSocket never blocks, so without it the server buffers everything addressed to
+a stalled connection, without bound. The Deno reference checks the socket's
+`bufferedAmount` after every send. A server whose sends await the transport
+(the Python ones below) is stalled by such a peer instead — see the notes after
+section 9.
 
 The core server in section 8 implements the first two and leaves frame size to
 the `websockets` library (`max_size`, 1 MiB by default, closing with 1009 —
-also recoverable).
+also recoverable). Rooms limits are the full server's.
 
 ---
 
@@ -763,7 +823,7 @@ ws.send({ op: "push", data: 1 }); // fire-and-forget
 const reply = await ws.send({ op: "echo", n: 1 }, { ack: true }); // { op: "echo", n: 1 }
 ```
 
-It was verified against the real client (`@marianmeres/ws` 0.6.0) with the
+It was verified against the real client (`@marianmeres/ws` 0.7.0) with the
 script in Appendix A: all 11 core checks pass, on `websockets` 17.2 and Python
 3.11 with deprecation warnings promoted to errors.
 
@@ -812,8 +872,9 @@ log = logging.getLogger("ws")
 
 PROTOCOL_VERSION = 2
 
-# Close codes. The client stops reconnecting after 4001 and 4003, and only
-# after those: every other code, a plain 1000 included, makes it come back.
+# Close codes. The client stops reconnecting after 4001, 4003 and 4005 (the
+# last one belongs to the rooms extension; a core server never sends it), and
+# only after those: every other code, a plain 1000 included, makes it come back.
 CLOSE_AUTH_FAILED = 4001  # bad credentials                 -> client gives up
 CLOSE_AUTH_TIMEOUT = 4002  # no `auth` frame in time         -> client retries
 CLOSE_FORBIDDEN = 4003  # valid credentials, not allowed    -> client gives up
@@ -1148,8 +1209,8 @@ python ws_server.py                                       # ws://127.0.0.1:8765/
 WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2 python ws_server.py   # timeouts Appendix A expects
 ```
 
-It was verified against the real client (`@marianmeres/ws` 0.6.0) with the
-script in Appendix A and `WS_ROOMS=1`: all 17 checks pass, on `websockets` 17.2
+It was verified against the real client (`@marianmeres/ws` 0.7.0) with the
+script in Appendix A and `WS_ROOMS=1`: all 18 checks pass, on `websockets` 17.2
 and Python 3.11 with deprecation warnings promoted to errors.
 
 ```python
@@ -1187,11 +1248,12 @@ PROTOCOL_VERSION = 2
 DEFAULT_NAMESPACE = "default"
 
 # Close codes. 4xxx is the application range (RFC 6455). The client treats
-# 4001 and 4003 as terminal and reconnects after everything else.
+# 4001, 4003 and 4005 as terminal and reconnects after everything else.
 CLOSE_GOING_AWAY = 1001
 CLOSE_AUTH_FAILED = 4001
 CLOSE_AUTH_TIMEOUT = 4002
 CLOSE_FORBIDDEN = 4003
+CLOSE_REPLACED = 4005
 CLOSE_IDLE_TIMEOUT = 4008
 CLOSE_RATE_LIMITED = 4009
 CLOSE_FRAME_TOO_LARGE = 4013
@@ -1251,7 +1313,8 @@ class Conn:
 
 
 Verify = Callable[[Any, ServerConnection], Awaitable[Optional[AuthResult]]]
-AllowBroadcast = Callable[[Conn, str], Awaitable[bool]]
+# A room policy: may this connection do this to this room? A throw is a refusal.
+RoomPolicy = Callable[[Conn, str], Awaitable[bool]]
 # Returns the reply for an acknowledged message; None means "no reply".
 OnMessage = Callable[[Conn, Any], Awaitable[Any]]
 
@@ -1264,19 +1327,27 @@ class Hub:
         *,
         verify: Optional[Verify] = None,  # None accepts everyone: development only
         on_message: Optional[OnMessage] = None,  # None refuses every `msg`: unsupported
-        allow_broadcast: Optional[AllowBroadcast] = None,  # None denies: the safe default
+        allow_broadcast: Optional[RoomPolicy] = None,  # None denies: the safe default
+        allow_subscribe: Optional[RoomPolicy] = None,  # None allows: rooms are open to the namespace
+        allow_publish: Optional[RoomPolicy] = None,  # None allows
         auth_timeout: float = 5.0,
         idle_timeout: float = 60.0,
         max_frame_size: int = 256 * 1024,
         max_frames_per_second: int = 100,
+        max_rooms_per_connection: int = 100,  # 0 removes the cap
+        max_room_name_length: int = 256,  # 0 removes the cap
     ) -> None:
         self.verify = verify
         self.on_message = on_message
         self.allow_broadcast = allow_broadcast
+        self.allow_subscribe = allow_subscribe
+        self.allow_publish = allow_publish
         self.auth_timeout = auth_timeout
         self.idle_timeout = idle_timeout
         self.max_frame_size = max_frame_size
         self.max_frames_per_second = max_frames_per_second
+        self.max_rooms_per_connection = max_rooms_per_connection
+        self.max_room_name_length = max_room_name_length
         self.conns: dict[str, Conn] = {}  # authenticated, by client id
         self.index: dict[str, dict[str, set[str]]] = {}  # room -> namespace -> ids
         self._tasks: set[asyncio.Task] = set()
@@ -1422,10 +1493,11 @@ class Hub:
 
         # Same id already connected: the newcomer wins and the stale socket goes.
         # This is what lets a reconnect after a half-open drop recover instead
-        # of leaving ghosts behind.
+        # of leaving ghosts behind. 4005 is terminal for the client: the loser
+        # must not come back, or two tabs sharing an id evict each other forever.
         existing = self.conns.get(client_id)
         if existing is not None and existing is not conn:
-            await self._close(existing, CLOSE_GOING_AWAY, "replaced by new connection")
+            await self._close(existing, CLOSE_REPLACED, "replaced by new connection")
 
         conn.id = client_id
         conn.namespace = namespace
@@ -1486,13 +1558,39 @@ class Hub:
         if not isinstance(rooms, list):
             await self._nack(conn, frame.get("id"), "bad_request", "rooms must be an array")
             return
-        sync_rooms: list[str] = []
+
+        # Look at every entry before applying any: a frame that trips a limit
+        # is refused whole, so the two sides cannot diverge halfway through.
+        wanted: list[tuple[str, bool]] = []
         for req in rooms:
             room = req.get("room") if isinstance(req, dict) else None
             if not isinstance(room, str) or not room:
                 continue
+            if not await self._room_name_ok(conn, frame.get("id"), room):
+                return
+            wanted.append((room, bool(req.get("presence"))))
+
+        fresh = [r for r in dict.fromkeys(room for room, _ in wanted) if r not in conn.rooms]
+        limit = self.max_rooms_per_connection
+        if limit > 0 and len(conn.rooms) + len(fresh) > limit:
+            await self._nack(
+                conn, frame.get("id"), "forbidden", f"room limit reached ({limit})", {"limit": limit}
+            )
+            return
+
+        # Only rooms the connection does not hold yet are put to the policy:
+        # what it already holds, it was already allowed.
+        refused: list[str] = []
+        if self.allow_subscribe is not None:
+            for room in fresh:
+                if not await self._allowed(self.allow_subscribe, conn, room):
+                    refused.append(room)
+
+        sync_rooms: list[str] = []
+        for room, wants_presence in wanted:
+            if room in refused:
+                continue
             is_new = room not in conn.rooms
-            wants_presence = bool(req.get("presence"))
             conn.rooms[room] = wants_presence
             self.index.setdefault(room, {}).setdefault(conn.namespace, set()).add(conn.id)
             # Tell the others first, so everyone agrees on the membership by
@@ -1502,8 +1600,8 @@ class Hub:
             if wants_presence:
                 sync_rooms.append(room)
 
-        # The snapshot goes out before the ack, so presence is settled by the
-        # time the client's subscribe() resolves.
+        # The snapshot goes out before the answer, so presence is settled by
+        # the time the client's subscribe() resolves.
         for room in sync_rooms:
             await self._send(
                 conn,
@@ -1517,6 +1615,19 @@ class Hub:
                     "timestamp": now_ms(),
                 },
             )
+
+        # One answer per frame. The allowed rooms are registered either way;
+        # a partial refusal is still a refusal, and the client needs the names
+        # to drop those rooms locally.
+        if refused:
+            await self._nack(
+                conn,
+                frame.get("id"),
+                "forbidden",
+                "subscription refused: " + ", ".join(refused),
+                {"refused": refused},
+            )
+            return
         await self._send(conn, {"type": "ack", "id": frame.get("id")})
 
     async def _on_unsub(self, conn: Conn, frame: dict) -> None:
@@ -1538,6 +1649,8 @@ class Hub:
         if not isinstance(room, str) or not room:
             await self._nack(conn, frame.get("id"), "bad_request", "missing room")
             return
+        if not await self._room_name_ok(conn, frame.get("id"), room):
+            return
         # A client may only publish into its own namespace.
         requested = frame.get("namespace")
         if requested and requested != conn.namespace:
@@ -1547,6 +1660,11 @@ class Hub:
                 "forbidden",
                 f'cannot publish into namespace "{requested}"',
             )
+            return
+        if self.allow_publish is not None and not await self._allowed(
+            self.allow_publish, conn, room
+        ):
+            await self._nack(conn, frame.get("id"), "forbidden", "publish not permitted")
             return
         message = {
             "room": room,
@@ -1563,12 +1681,11 @@ class Hub:
         if not isinstance(room, str) or not room:
             await self._nack(conn, frame.get("id"), "bad_request", "missing room")
             return
-        allowed = False
-        if self.allow_broadcast is not None:
-            try:
-                allowed = bool(await self.allow_broadcast(conn, room))
-            except Exception:
-                allowed = False
+        if not await self._room_name_ok(conn, frame.get("id"), room):
+            return
+        allowed = self.allow_broadcast is not None and await self._allowed(
+            self.allow_broadcast, conn, room
+        )
         if not allowed:
             await self._nack(conn, frame.get("id"), "forbidden", "broadcast not permitted")
             return
@@ -1581,6 +1698,25 @@ class Hub:
         }
         recipients = await self._deliver(None, message)
         await self._send(conn, {"type": "ack", "id": frame.get("id"), "recipients": recipients})
+
+    async def _allowed(self, policy: RoomPolicy, conn: Conn, room: str) -> bool:
+        """Asks a room policy. A policy that fails is an application bug, and
+        failing closed is the only safe reading of it."""
+        try:
+            return bool(await policy(conn, room))
+        except Exception:
+            log.exception("room policy failed")
+            return False
+
+    async def _room_name_ok(self, conn: Conn, id_: Any, room: str) -> bool:
+        """Nacks `bad_request` and returns False for a room name over the limit."""
+        limit = self.max_room_name_length
+        if limit <= 0 or len(room) <= limit:
+            return True
+        await self._nack(
+            conn, id_, "bad_request", f"room name too long (max {limit})", {"limit": limit}
+        )
+        return False
 
     async def _deliver(self, namespace: Optional[str], message: dict) -> int:
         """Delivers to every subscriber of the room. `None` crosses all namespaces."""
@@ -1690,10 +1826,13 @@ class Hub:
     async def _error(self, conn: Conn, code: str, message: str) -> None:
         await self._send(conn, {"type": "error", "error": {"code": code, "message": message}})
 
-    async def _nack(self, conn: Conn, id_: Any, code: str, message: str) -> None:
-        await self._send(
-            conn, {"type": "nack", "id": id_, "error": {"code": code, "message": message}}
-        )
+    async def _nack(
+        self, conn: Conn, id_: Any, code: str, message: str, details: Any = None
+    ) -> None:
+        error: dict = {"code": code, "message": message}
+        if details is not None:
+            error["details"] = details
+        await self._send(conn, {"type": "nack", "id": id_, "error": error})
 
     async def _refuse(
         self, conn: Conn, id_: Any, code: str, message: str, details: Any = None
@@ -1753,12 +1892,19 @@ async def allow_broadcast(conn: Conn, room: str) -> bool:
     return room == "announcements"
 
 
+async def allow_subscribe(conn: Conn, room: str) -> bool:
+    """Rooms are open to every member of the namespace unless you say
+    otherwise. Here one room is staff only — and nobody is staff."""
+    return room != "staff-only"
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     hub = Hub(
         verify=verify,
         on_message=on_message,
         allow_broadcast=allow_broadcast,
+        allow_subscribe=allow_subscribe,
         auth_timeout=float(os.environ.get("WS_AUTH_TIMEOUT", 5)),
         idle_timeout=float(os.environ.get("WS_IDLE_TIMEOUT", 60)),
     )
@@ -1776,7 +1922,11 @@ Notes on the design choices, in the order they matter:
 
 - **One `recv` loop per connection, every rooms frame fully handled before the
   next is read.** This is what guarantees rule 12 (a `sub` is registered before
-  the `pub` that follows it) with no extra machinery.
+  the `pub` that follows it) with no extra machinery — the policy hooks
+  included, since they are awaited inside the loop.
+- **Room policies fail closed.** A hook that raises is a refusal, logged with
+  its traceback. A `sub` is answered once: `ack`, or one `nack` naming every
+  refused room in `details.refused` while the allowed ones stay registered.
 - **`msg` frames are the exception** — queued for a per-connection worker, as in
   the core server, so that a slow `on_message` delays neither pongs nor room
   traffic. Messages stay ordered among themselves; their order relative to room
@@ -1792,7 +1942,11 @@ Notes on the design choices, in the order they matter:
   `finally` can both call it.
 - **Sends are awaited inline**, so a slow reader can stall the publisher that is
   fanning out to it. Good enough for a reference; for production put an outgoing
-  queue with a writer task per connection, keeping per-connection order.
+  queue with a writer task per connection, keeping per-connection order — and
+  bound that queue, closing with 4010 `SLOW_CONSUMER` when it overflows, as the
+  Deno reference does with the socket's `bufferedAmount`. Either a stalled peer
+  stalls you, or you buffer for it; the bound is what keeps the second choice
+  from being unbounded.
 - **Single instance, in memory.** Horizontal scaling needs a fan-out between
   instances (Redis pub/sub or similar) and a shared view of presence. Local
   delivery stays each instance's own job, which is why `recipients` is
@@ -1847,9 +2001,9 @@ timeouts (auth 1 s, idle 2 s); the Python examples read them from
 `WS_AUTH_TIMEOUT` and `WS_IDLE_TIMEOUT`.
 
 Core checks always run. With `WS_ROOMS=1` the rooms checks run as well — they
-also expect broadcast to be allowed into `announcements` only, the policy in the
-section 9 example. Without it the script instead checks that rooms are refused
-as `unsupported`.
+also expect broadcast to be allowed into `announcements` only and subscribing to
+`staff-only` to be refused, the policies in the section 9 example. Without it
+the script instead checks that rooms are refused as `unsupported`.
 
 ```bash
 WS_URL=ws://127.0.0.1:8765/ws deno run -A conformance.ts              # core server
@@ -1869,7 +2023,7 @@ WS_URL=ws://127.0.0.1:8765/ws WS_ROOMS=1 deno run -A conformance.ts   # with roo
  * { op: "echo" } replies with the payload, { op: "push", data } pushes `data`
  * back as a direct message, anything else is refused with code "unknown_op"
  * and details { op }. With rooms, broadcast must be allowed into
- * "announcements" only.
+ * "announcements" only, and subscribing to "staff-only" must be refused.
  *
  * Two checks need short server timeouts: WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2.
  */
@@ -1880,7 +2034,7 @@ import {
 	WSRemoteError,
 	type WSRoomMessage,
 	WSTerminatedError,
-} from "jsr:@marianmeres/ws@^0.6.0";
+} from "jsr:@marianmeres/ws@^0.7.0";
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@^1";
 
 const URL = Deno.env.get("WS_URL") ?? "ws://127.0.0.1:8765/ws";
@@ -2230,8 +2384,12 @@ if (ROOMS) {
 		}
 	});
 
-	await test("rooms: same clientId again — newcomer wins, old socket closed 1001", async () => {
-		const d1 = client({ clientId: "dave" });
+	await test("rooms: same clientId again — newcomer wins, old socket closed 4005, terminal", async () => {
+		const d1 = client({
+			clientId: "dave",
+			reconnectDelay: 10,
+			reconnectDelayMax: 30,
+		});
 		const d2 = client({ clientId: "dave" });
 		try {
 			await d1.connect();
@@ -2240,15 +2398,61 @@ if (ROOMS) {
 			);
 			await d2.connect();
 			const ev = await closeEv;
-			d1.dispose();
-			assertEquals(ev.code, 1001);
-			assertEquals(ev.willReconnect, true);
+			assertEquals(ev.code, 4005);
+			assertEquals(ev.willReconnect, false);
+			assertEquals(d1.connectionState, "terminated");
+			// Several backoff periods later the loser has not come back.
+			await sleep(200);
+			assert(d2.connected, "the newcomer keeps the id");
+			assertEquals(d1.connectionState, "terminated");
 			const { recipients } = await d2.publish("x", 1);
 			assertEquals(recipients, 0);
 		} finally {
 			d1.dispose();
 			d2.dispose();
 		}
+	});
+
+	await test("rooms: a room the policy refuses -> nack forbidden naming it; the rest of the frame applies", async () => {
+		const f = client({ clientId: "frank" });
+		try {
+			await f.connect();
+			const err = await assertRejects(
+				() => f.subscribe("staff-only", () => {}),
+				WSRemoteError,
+			);
+			assertEquals(err.code, "forbidden");
+			assertEquals(err.details, { refused: ["staff-only"] });
+			assertEquals(f.isSubscribed("staff-only"), false);
+		} finally {
+			f.dispose();
+		}
+		// A batch with one refused room: the allowed one is registered anyway.
+		const r = await raw();
+		r.send({ type: "auth", protocol: 2, payload: auth() });
+		await until(() => r.frames.some((f) => f.type === "hello"), "hello");
+		r.send({
+			type: "sub",
+			id: "s",
+			rooms: [{ room: "lobby" }, { room: "staff-only" }],
+		});
+		await until(
+			() => r.frames.some((f) => f.type === "nack" && f.id === "s"),
+			"nack",
+		);
+		const nack = r.frames.find((f) => f.type === "nack")!;
+		assertEquals((nack.error as Record<string, unknown>).code, "forbidden");
+		assertEquals((nack.error as Record<string, unknown>).details, {
+			refused: ["staff-only"],
+		});
+		r.send({ type: "pub", id: "p", room: "lobby", payload: 1 });
+		await until(() => r.frames.some((f) => f.type === "ack" && f.id === "p"), "ack");
+		assertEquals(
+			r.frames.find((f) => f.type === "ack" && f.id === "p")!.recipients,
+			1,
+		);
+		r.ws.close();
+		await r.closed;
 	});
 
 	await test("rooms: after a reconnect, re-subscribe lands before the flush (needs WS_IDLE_TIMEOUT=2)", async () => {
@@ -2316,14 +2520,20 @@ Identity
 - [ ] `hello` carries `clientId` and `namespace`
 - [ ] Server-assigned id/namespace override the client's proposal; otherwise the
       proposal is honoured; otherwise generated / `"default"`
-- [ ] A duplicate client id evicts the older connection with 1001 and does not
+- [ ] A duplicate client id evicts the older connection with 4005 and does not
       lose the newer registration when the old socket's close fires
 
 Rooms and messages
 
-- [ ] Rooms frames of one connection are handled in arrival order
-- [ ] `sub` registers rooms, re-subscribing is harmless, and it is always
-      acknowledged with `ack {id}`
+- [ ] Rooms frames of one connection are handled in arrival order — policy
+      hooks included: a `pub` never overtakes the `sub` before it
+- [ ] `sub` registers rooms, re-subscribing is harmless, and it is answered
+      with exactly one `ack {id}` — or one `nack` `forbidden` whose
+      `details.refused` names the rooms the policy refused, with the others
+      registered regardless
+- [ ] A `sub` past the per-connection room limit is nacked `forbidden` whole,
+      with `details.limit`; an over-long room name is `bad_request`
+- [ ] `pub` into a room the policy refuses is nacked `forbidden`
 - [ ] `unsub` is acknowledged; unknown rooms are ignored
 - [ ] `pub` delivers `msg` to every subscriber of `(room, namespace)`, the
       publisher included, and acks with `recipients`

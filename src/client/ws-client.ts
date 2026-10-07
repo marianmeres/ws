@@ -28,6 +28,7 @@ import type {
 	SubRequest,
 	WSDecoder,
 	WSEncoder,
+	WSErrorInfo,
 	WSMessage,
 	WSPresenceEvent,
 	WSPublishResult,
@@ -229,7 +230,12 @@ export interface WSClientOptions<TAuth = unknown> {
 	reconnectDelay?: number;
 	/** Reconnect delay ceiling in ms. Default 30_000. */
 	reconnectDelayMax?: number;
-	/** Close codes after which retrying stops. Default `[4001, 4003]`. */
+	/**
+	 * Close codes after which retrying stops. Default `[4001, 4003, 4005]`:
+	 * authentication failed, forbidden, and replaced by another connection
+	 * with the same client id — coming back after that would only evict the
+	 * connection that replaced this one.
+	 */
 	terminalCloseCodes?: number[];
 
 	/** Ping cadence in ms. `0` disables. Default 25_000. */
@@ -274,6 +280,34 @@ const defaultDecode: WSDecoder = (raw) =>
 	JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw));
 
 const noop = () => {};
+
+/**
+ * Lifts whatever a `nack`/`error` frame carried as `error` into a usable
+ * `WSErrorInfo`. The reference server always sends a well-formed one, but a
+ * third-party server is where bugs land first, and a missing `message` must
+ * not become a throw out of `onmessage` — fatal in Deno and Node.
+ */
+function toErrorInfo(raw: unknown): WSErrorInfo {
+	const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+	return {
+		code: typeof o.code === "string" && o.code ? o.code : "unknown",
+		message: typeof o.message === "string" ? o.message : "malformed error frame",
+		...(o.details === undefined ? {} : { details: o.details }),
+	};
+}
+
+/**
+ * The rooms a `sub` refusal names in `details.refused`, when it names any.
+ * A server that refuses a room (its `allowSubscribe` policy) reports it there;
+ * the client must stop holding such a room, or its handlers wait forever for
+ * messages that will never come.
+ */
+function refusedRooms(error: unknown): string[] {
+	if (!(error instanceof WSRemoteError)) return [];
+	const details = error.details as { refused?: unknown } | null | undefined;
+	const refused = details && typeof details === "object" ? details.refused : undefined;
+	return Array.isArray(refused) ? refused.filter((r) => typeof r === "string") : [];
+}
 
 /** Idempotent, `using`-compatible unsubscriber. */
 function makeUnsubscriber(fn: () => void): Unsubscriber {
@@ -350,8 +384,17 @@ export class WSClient<TAuth = unknown> {
 	#outbox: Outbox;
 	#heartbeat: Heartbeat;
 
-	#bus = createPubSub<Record<string, unknown>>();
-	#stateBus = createPubSub<Record<string, unknown>>();
+	/**
+	 * A throwing handler is reported through `error` like any other failure
+	 * the client survives — except a throwing `error` handler, which is only
+	 * logged, or reporting it would re-enter the very handler that threw.
+	 */
+	#bus = createPubSub<Record<string, unknown>>({
+		onError: (error, topic) => this.#handlerThrew(error, topic),
+	});
+	#stateBus = createPubSub<Record<string, unknown>>({
+		onError: (error) => this.#handlerThrew(error, "state"),
+	});
 
 	#reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	#handshakeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -524,7 +567,8 @@ export class WSClient<TAuth = unknown> {
 	 * Subscribes to a lifecycle event. See {@link WSEvents}.
 	 *
 	 * @param event - event name
-	 * @param cb - handler; a throw here is caught and reported as `error`
+	 * @param cb - handler; a throw here is caught and reported as `error` — a
+	 * throwing `error` handler itself is only logged
 	 * @returns detaches the handler; also `Symbol.dispose`-compatible
 	 */
 	on<K extends keyof WSEvents>(
@@ -670,7 +714,10 @@ export class WSClient<TAuth = unknown> {
 	 * @returns detaches this handler; also `Symbol.dispose`-compatible, and
 	 * idempotent, so calling it twice is harmless
 	 * @throws {WSRemoteError} when connected and the server refuses — with code
-	 * `unsupported` when it does not implement rooms at all
+	 * `unsupported` when it does not implement rooms at all, `forbidden` when
+	 * its policy does not admit this client to the room or the client holds
+	 * as many rooms as the server allows. A refused room is not held
+	 * afterwards: every handler attached to it is dropped
 	 * @throws {WSDisposedError} when the client was disposed
 	 *
 	 * @example
@@ -722,7 +769,10 @@ export class WSClient<TAuth = unknown> {
 			} catch (e) {
 				// Keep local state honest: if the server refused, we are not
 				// subscribed, and pretending otherwise would silently swallow
-				// every message the caller expects.
+				// every message the caller expects. A room the server names as
+				// refused goes entirely — including handlers another caller
+				// attached meanwhile, which were never going to hear anything.
+				for (const refused of refusedRooms(e)) this.#rooms.removeRoom(refused);
 				this.#rooms.remove(room, messageHandler, presenceHandler);
 				throw e;
 			}
@@ -889,7 +939,9 @@ export class WSClient<TAuth = unknown> {
 	 * @throws {WSNotConnectedError} sent while offline with `outboxMaxSize: 0`
 	 * @throws {WSTerminatedError} sent after a terminal close, which only an
 	 * explicit `connect()` recovers from — rejected at once, not buffered
-	 * @throws {WSRemoteError} the server rejected it with a `nack`
+	 * @throws {WSRemoteError} the server rejected it with a `nack` — code
+	 * `forbidden` when its `allowPublish` policy keeps this client out of the
+	 * room, or the namespace is not the client's own
 	 */
 	publish<T = unknown>(
 		room: string,
@@ -1121,6 +1173,17 @@ export class WSClient<TAuth = unknown> {
 			return;
 		}
 
+		// Nothing below may throw out of `onmessage`: in Deno and Node that
+		// is an uncaught exception, and the process goes with it. A frame
+		// this client cannot make sense of costs that frame, not the process.
+		try {
+			this.#dispatch(frame);
+		} catch (e) {
+			this.#fail(e, `handling a "${frame.type}" frame failed`);
+		}
+	}
+
+	#dispatch(frame: ServerFrame): void {
 		switch (frame.type) {
 			case FRAME.HELLO:
 				this.#onHello(frame.clientId, frame.namespace, frame.protocol);
@@ -1131,7 +1194,7 @@ export class WSClient<TAuth = unknown> {
 				break;
 
 			case FRAME.NACK:
-				this.#outbox.fail(frame.id, new WSRemoteError(frame.error));
+				this.#outbox.fail(frame.id, new WSRemoteError(toErrorInfo(frame.error)));
 				break;
 
 			case FRAME.MSG: {
@@ -1164,7 +1227,7 @@ export class WSClient<TAuth = unknown> {
 				break;
 
 			case FRAME.ERROR:
-				this.#fail(new WSRemoteError(frame.error), "server error");
+				this.#fail(new WSRemoteError(toErrorInfo(frame.error)), "server error");
 				break;
 
 			default:
@@ -1193,6 +1256,32 @@ export class WSClient<TAuth = unknown> {
 		this.#attempt = 0;
 		this.#lastError = null;
 
+		// Order matters and is not cosmetic: re-subscribe, then flush, and
+		// only then announce. The socket preserves ordering, so the server
+		// registers the rooms before it sees any buffered publish destined
+		// for them — and anything a `connected` handler or a state-store
+		// subscriber sends lands after both, because neither has fired yet.
+		// (`connect()` resolves later still, on a microtask.)
+		const requests: SubRequest[] = this.#rooms.subRequests();
+		if (requests.length) {
+			this.#sendControl({
+				type: FRAME.SUB,
+				id: this.#nextId(),
+				rooms: requests,
+			}).catch((e) => {
+				// A room the server now refuses is not held — its handlers
+				// would otherwise wait forever. The rooms it allowed stay.
+				for (const room of refusedRooms(e)) this.#rooms.removeRoom(room);
+				this.#fail(e, "re-subscribe failed");
+			});
+		}
+
+		const buffered = this.#outbox.drain();
+		if (buffered.length) {
+			this.logger?.debug?.(`flushing ${buffered.length} buffered frame(s)`);
+			for (const { id, frame } of buffered) this.#transmit(id, frame);
+		}
+
 		if (!this.#setState("open")) return;
 
 		this.logger?.debug?.(
@@ -1203,24 +1292,6 @@ export class WSClient<TAuth = unknown> {
 		this.#emit("connected", { clientId: this.#clientId, namespace: this.namespace });
 		this.#heartbeat.start();
 		this.#settleConnect(null);
-
-		// Order matters and is not cosmetic: re-subscribe first, then flush.
-		// The socket preserves ordering, so the server registers the rooms
-		// before it sees any buffered publish destined for them.
-		const requests: SubRequest[] = this.#rooms.subRequests();
-		if (requests.length) {
-			this.#sendControl({
-				type: FRAME.SUB,
-				id: this.#nextId(),
-				rooms: requests,
-			}).catch((e) => this.#fail(e, "re-subscribe failed"));
-		}
-
-		const buffered = this.#outbox.drain();
-		if (buffered.length) {
-			this.logger?.debug?.(`flushing ${buffered.length} buffered frame(s)`);
-			for (const { id, frame } of buffered) this.#transmit(id, frame);
-		}
 	}
 
 	#onClose(code: number, reason: string): void {
@@ -1456,6 +1527,19 @@ export class WSClient<TAuth = unknown> {
 		this.logger?.error?.(`${context}: ${err.message}`);
 		this.#emit("error", err);
 		return err;
+	}
+
+	/**
+	 * A user handler threw. Reported as `error` — unless it *was* an `error`
+	 * handler, in which case reporting would re-enter it: logged instead.
+	 */
+	#handlerThrew(error: Error, topic: string): void {
+		if (topic === "error") {
+			this.#lastError = error;
+			this.logger?.error?.(`"error" handler threw: ${error.message}`);
+			return;
+		}
+		this.#fail(error, `"${topic}" handler threw`);
 	}
 }
 
