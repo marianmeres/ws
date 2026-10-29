@@ -36,10 +36,11 @@ npm install @marianmeres/ws
 deno add jsr:@marianmeres/ws
 ```
 
-> **npm ships the client only.** The reference server needs
-> `Deno.upgradeWebSocket`, so it exists solely as `jsr:@marianmeres/ws/server`.
-> The client is fully runtime-agnostic, so npm consumers lose nothing they could
-> have used.
+> **npm ships the client only, for now.** The reference server exists as
+> `jsr:@marianmeres/ws/server`. It runs under any demino 2.0 adapter —
+> `@marianmeres/demino/deno`, or `@marianmeres/demino/node` with the optional
+> `ws` package — and a bare `Deno.serve(app)` host still works through
+> `Deno.upgradeWebSocket`. The client is fully runtime-agnostic.
 
 ## Two ways to use it
 
@@ -358,7 +359,8 @@ See [API.md](API.md) for complete API documentation.
 
 ## Protocol
 
-The reference server is Deno-only; the protocol is not.
+The reference server is built on demino; the protocol needs nothing but a
+WebSocket.
 [PROTOCOL.md](PROTOCOL.md) specifies the wire format frame by frame, core first
 and the rooms extension after it — with complete Python servers for both (a
 core-only one, and the full reference) and a conformance script that drives the

@@ -2,11 +2,15 @@
  * Reference server — a demino app implementing the whole wire protocol: the
  * core (messages between client and server) and the rooms extension.
  *
- * Deno-first: it uses `Deno.upgradeWebSocket`. Import it from
+ * Runs under any demino 2.0 adapter — `@marianmeres/demino/deno`, or
+ * `@marianmeres/demino/node` with the optional `ws` package — through the
+ * `info.upgradeWebSocket` it provides; a bare `Deno.serve(app)` host still
+ * works through `Deno.upgradeWebSocket`. Import it from
  * `@marianmeres/ws/server` so `demino` never reaches a browser bundle.
  *
  * @example
  * ```ts
+ * import { serve } from "@marianmeres/demino/deno"; // or "@marianmeres/demino/node"
  * import { createWSApp } from "@marianmeres/ws/server";
  *
  * const { app, service } = createWSApp("/ws", [], {
@@ -21,7 +25,7 @@
  *     // Rooms are open to every member of the namespace unless you say so.
  *     allowSubscribe: (ctx, room) => canRead(ctx.meta, room),
  * });
- * Deno.serve(app);
+ * await serve(app, { port: 8000 });
  * ```
  *
  * @module
@@ -32,6 +36,7 @@ import {
 	demino,
 	type DeminoHandler,
 	type DeminoOptions,
+	type DeminoServeInfo,
 } from "@marianmeres/demino";
 import { WSService, type WSServiceOptions } from "./service.ts";
 
@@ -45,6 +50,7 @@ export {
 	WSService,
 	type WSServiceOptions,
 	type WSStats,
+	type WSUpgradeWebSocket,
 } from "./service.ts";
 
 /** Configuration for {@link createWSApp}. */
@@ -115,7 +121,7 @@ export function createWSApp(
 	const app = demino(mountPath, middlewares, options.deminoOptions);
 	const { httpAuth } = options;
 
-	app.get("/", (req: Request) => {
+	app.get("/", (req: Request, info: DeminoServeInfo) => {
 		// A plain GET here is almost always a misconfigured client, so say so
 		// rather than letting upgradeWebSocket throw an opaque error.
 		if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -124,7 +130,9 @@ export function createWSApp(
 				headers: { upgrade: "websocket" },
 			});
 		}
-		return service.handleUpgrade(req);
+		// The adapter's capability; absent under a bare `Deno.serve(app)`,
+		// where the service falls back to `Deno.upgradeWebSocket`.
+		return service.handleUpgrade(req, info.upgradeWebSocket);
 	});
 
 	if (httpAuth) {

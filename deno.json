@@ -22,7 +22,7 @@
 	},
 	"imports": {
 		"@marianmeres/clog": "jsr:@marianmeres/clog@^3.21.0",
-		"@marianmeres/demino": "jsr:@marianmeres/demino@^1.17.0",
+		"@marianmeres/demino": "jsr:@marianmeres/demino@^2.0.0-rc.1",
 		"@marianmeres/design-tokens": "jsr:@marianmeres/design-tokens@^1.20.0",
 		"@marianmeres/npmbuild": "jsr:@marianmeres/npmbuild@^1.16.0",
 		"@marianmeres/pubsub": "jsr:@marianmeres/pubsub@^3.0.0",
