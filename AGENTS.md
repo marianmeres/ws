@@ -277,9 +277,12 @@ run `deno publish` then the npm build.
    `src/` ships; entry points `mod`, `protocol`, `server`), installs the packed
    copy with `@marianmeres/demino` and `ws` into a temp project, and on Node
    serves `createWSApp()` through `@marianmeres/demino/node` for the
-   package's own client to authenticate and echo. `ws` is demino's optional
-   peer, never a dependency here; a new runtime import in `src/` is added to
-   `dependencies` in `scripts/build-npm.ts`
+   package's own client to authenticate and echo. `@marianmeres/demino` is an
+   optional peer (plus a devDependency for the build's `tsc`), so the host's
+   demino and the server's are one copy and a client-only install has none —
+   the smoke checks both; `ws` is demino's optional peer, never a dependency
+   here. Any other new runtime import in `src/` is added to `dependencies` in
+   `scripts/build-npm.ts`
 7. Adding or changing a public export? Update `API.md` — it documents **all**
    of them, and that completeness is the contract
 8. Changing the client or server API? Run `deno task example` and click through

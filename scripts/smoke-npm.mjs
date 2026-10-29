@@ -4,12 +4,15 @@
  *
  * In a throw-away project under the OS temp dir it runs
  * `npm install --install-links <.npm-dist>` - a packed copy, as a consumer
- * gets it, not a symlink into this repo - plus `@marianmeres/demino` (the range
- * the package itself depends on) and `ws` (the range demino's Node adapter
- * declares as its optional peer), and then, on Node, inside that project:
+ * gets it, not a symlink into this repo - alone first, then
+ * `@marianmeres/demino` (the range of the package's optional peer) and `ws`
+ * (the range demino's Node adapter declares as its optional peer), and then,
+ * on Node, inside that project:
  *
  *  - checks the installed package.json: the three `exports` keys, the runtime
- *    dependencies, no `ws` among them, `engines.node`;
+ *    dependencies, `@marianmeres/demino` an optional peer and neither it nor
+ *    `ws` a dependency, `engines.node`; and that the client-only install left
+ *    demino out;
  *  - imports every subpath;
  *  - `createWSApp()` served through `@marianmeres/demino/node`, driven by the
  *    package's own client: authenticates, echoes through `onMessage`, shuts
@@ -40,7 +43,6 @@ const DEMINO = "@marianmeres/demino";
 const EXPECTED_EXPORTS = [".", "./protocol", "./server"];
 const EXPECTED_DEPENDENCIES = [
 	"@marianmeres/clog",
-	DEMINO,
 	"@marianmeres/pubsub",
 	"@marianmeres/ticker",
 	"@marianmeres/uid",
@@ -131,11 +133,22 @@ function checkInstalledManifest(dir) {
 	for (const name of EXPECTED_DEPENDENCIES) {
 		check(name in (pkg.dependencies ?? {}), `runtime dependency "${name}" missing`);
 	}
-	check(!("ws" in (pkg.dependencies ?? {})), `"ws" must not be a runtime dependency`);
+	for (const name of ["ws", DEMINO]) {
+		check(
+			!(name in (pkg.dependencies ?? {})),
+			`"${name}" must not be a runtime dependency`,
+		);
+	}
+	check(
+		typeof pkg.peerDependencies?.[DEMINO] === "string" &&
+			pkg.peerDependenciesMeta?.[DEMINO]?.optional === true,
+		`${DEMINO} must be an optional peer`,
+	);
 	check(typeof pkg.engines?.node === "string", "engines.node missing");
+	const peer = `${DEMINO} ${pkg.peerDependencies[DEMINO]} (optional peer)`;
 	console.log(
 		`smoke: ${pkg.name}@${pkg.version} - exports ${exportKeys.length}/${EXPECTED_EXPORTS.length}, ` +
-			`${DEMINO} ${pkg.dependencies[DEMINO]}, engines.node ${pkg.engines.node}`,
+			`${peer}, engines.node ${pkg.engines.node}`,
 	);
 }
 
@@ -143,10 +156,10 @@ check(
 	existsSync(join(DIST, "package.json")),
 	`${DIST} has no package.json - run \`deno task npm:build\` first`,
 );
-const deminoRange = readManifest(DIST).dependencies?.[DEMINO];
+const deminoRange = readManifest(DIST).peerDependencies?.[DEMINO];
 check(
 	typeof deminoRange === "string",
-	`${DIST}/package.json does not depend on ${DEMINO}`,
+	`${DIST}/package.json declares no ${DEMINO} peer`,
 );
 
 // `--install-links` on every install: without it a later `npm install` re-links
@@ -169,10 +182,23 @@ try {
 			"\t",
 		),
 	);
-	// demino at the package's own range, so the consumer's copy and the one
-	// `./server` imports dedupe into one, as they do for a real consumer
-	run("npm", [...npmInstall, DIST, `${DEMINO}@${deminoRange}`], project);
+	// the package alone, as a client-only consumer installs it: an optional
+	// peer is not installed, so no demino may appear
+	run("npm", [...npmInstall, DIST], project);
 	checkInstalledManifest(join(project, "node_modules", PKG));
+	check(
+		!existsSync(join(project, "node_modules", DEMINO)),
+		`a client-only install pulled in ${DEMINO}`,
+	);
+	run(process.execPath, [
+		"--input-type=module",
+		"-e",
+		`const m = await import("${PKG}"); if (typeof m.createWSClient !== "function") process.exit(1);`,
+	], project);
+	console.log(`smoke: client-only install has no ${DEMINO}, and the client imports`);
+
+	// then demino at the peer range, as whoever imports `./server` installs it
+	run("npm", [...npmInstall, `${DEMINO}@${deminoRange}`], project);
 
 	const deminoManifest = readManifest(join(project, "node_modules", DEMINO));
 	const wsRange = deminoManifest.peerDependencies?.ws;
