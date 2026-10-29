@@ -36,11 +36,16 @@ npm install @marianmeres/ws
 deno add jsr:@marianmeres/ws
 ```
 
-> **npm ships the client only, for now.** The reference server exists as
-> `jsr:@marianmeres/ws/server`. It runs under any demino 2.0 adapter —
-> `@marianmeres/demino/deno`, or `@marianmeres/demino/node` with the optional
-> `ws` package — and a bare `Deno.serve(app)` host still works through
-> `Deno.upgradeWebSocket`. The client is fully runtime-agnostic.
+The reference server is `@marianmeres/ws/server` on both registries. It runs
+under any demino 2.0 adapter — `@marianmeres/demino/deno`, or
+`@marianmeres/demino/node` with the optional `ws` package — and a bare
+`Deno.serve(app)` host still works through `Deno.upgradeWebSocket`. On Node:
+
+```bash
+npm install @marianmeres/ws @marianmeres/demino ws
+```
+
+The client is fully runtime-agnostic and needs none of that.
 
 ## Two ways to use it
 

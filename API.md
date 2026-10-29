@@ -497,8 +497,8 @@ component and any other store-compatible consumer works too:
 
 ## Server
 
-Import from `@marianmeres/ws/server`. **JSR only** for now — the npm package
-ships the client alone.
+Import from `@marianmeres/ws/server` (JSR and npm; on npm it depends on
+`@marianmeres/demino`).
 
 It runs under any demino 2.0 adapter — `@marianmeres/demino/deno`, or
 `@marianmeres/demino/node` with the optional `ws` package installed — through

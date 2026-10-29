@@ -43,6 +43,10 @@ src/
 └── server/
     └── adapters/          # cross-instance fan-out seam (local only today)
 
+scripts/
+├── build-npm.ts           # `deno task npm:build` -> .npm-dist/
+└── smoke-npm.mjs          # `deno task npm:smoke`: the packed package, on Node
+
 example/                   # standalone reference app — `deno task example`
 ├── server.ts              # demino apps: /ws (createWSApp), /api, / (static)
 ├── history.ts             # WSPubSubAdapter decorator -> in-memory backlog
@@ -269,9 +273,13 @@ run `deno publish` then the npm build.
    `WS_ROOMS=1`
 5. Touching reconnect, outbox or heartbeat? Read `tests/resilience.test.ts`
    first — those tests encode the failure modes the design exists to handle
-6. `deno task npm:build` if packaging changed (npm ships the **client only**;
-   the server is excluded via `sourceFiles`) — a new file under
-   `src/client/` or `src/protocol/` must be added to `sourceFiles` by hand
+6. `deno task npm:smoke` if packaging changed — it runs `npm:build` (all of
+   `src/` ships; entry points `mod`, `protocol`, `server`), installs the packed
+   copy with `@marianmeres/demino` and `ws` into a temp project, and on Node
+   serves `createWSApp()` through `@marianmeres/demino/node` for the
+   package's own client to authenticate and echo. `ws` is demino's optional
+   peer, never a dependency here; a new runtime import in `src/` is added to
+   `dependencies` in `scripts/build-npm.ts`
 7. Adding or changing a public export? Update `API.md` — it documents **all**
    of them, and that completeness is the contract
 8. Changing the client or server API? Run `deno task example` and click through
@@ -287,10 +295,8 @@ run `deno publish` then the npm build.
 - Only `WSPubSubLocal` exists — Redis/Deno-KV adapters are an unimplemented seam
 - Presence is scoped to `(room, namespace)`; broadcast crosses namespaces but
   presence does not
-- npm does not ship `./server` yet (JSR only), although the server itself runs
-  on Node through `@marianmeres/demino/node` with `ws` installed. Bun is not a
-  demino 2.0 runtime; with no upgrade function and no `Deno` global,
-  `handleUpgrade` throws
+- Bun is not a demino 2.0 runtime; with no upgrade function and no `Deno`
+  global, `handleUpgrade` throws
 - Origin checking is opt-in via `allowedOrigins`; unset means no check
 - `maxBufferedAmount` bounds one connection; there is no aggregate memory cap
 - Presence `join`/`leave` carries the full member list to every presence

@@ -3,39 +3,33 @@ import { npmBuild, versionizeDeps } from "@marianmeres/npmbuild";
 const denoJson = JSON.parse(Deno.readTextFileSync("deno.json"));
 
 /**
- * The npm package ships the **client only**.
+ * The npm package ships all three entry points: the client (`.`), the wire
+ * definitions (`./protocol`) and the reference server (`./server`).
  *
- * The reference server is Deno-only by construction — it needs
- * `Deno.upgradeWebSocket` and `@marianmeres/demino` — so there is nothing
- * coherent to publish for Node. Shipping a subpath that cannot compile, let
- * alone run, would be worse than not shipping it: `jsr:@marianmeres/ws/server`
- * remains the one way to get it.
+ * Nothing under `src/` is Deno-bound any more — the server upgrades through
+ * demino 2.0's `info.upgradeWebSocket` — so the whole `src/` tree ships
+ * (npmbuild's default when `sourceFiles` is omitted).
  *
- * The client itself is runtime-agnostic (`WebSocket` is a global everywhere it
- * targets), so npm consumers lose nothing they could have used.
+ * `@marianmeres/demino` is a runtime dependency because `./server` builds a
+ * demino app. `ws` is not: it is the optional peer of
+ * `@marianmeres/demino/node`, installed by whoever serves through that
+ * adapter (`deno task npm:smoke` does exactly that).
  */
 await npmBuild({
 	name: denoJson.name,
 	version: denoJson.version,
 	repository: denoJson.name.replace(/^@/, ""),
-	sourceFiles: [
-		"mod.ts",
-		"protocol.ts",
-		"protocol/mod.ts",
-		"protocol/constants.ts",
-		"protocol/frames.ts",
-		"protocol/errors.ts",
-		"client/ws-client.ts",
-		"client/backoff.ts",
-		"client/heartbeat.ts",
-		"client/outbox.ts",
-		"client/rooms.ts",
-	],
 	dependencies: versionizeDeps([
 		"@marianmeres/clog",
+		"@marianmeres/demino",
 		"@marianmeres/pubsub",
 		"@marianmeres/ticker",
 		"@marianmeres/uid",
 	], denoJson),
-	entryPoints: ["mod", "protocol"],
+	entryPoints: ["mod", "protocol", "server"],
+	packageJsonOverrides: {
+		// the client uses the global `WebSocket` (unflagged in Node 22), and so
+		// does `@marianmeres/demino`, which declares the same floor
+		engines: { node: ">=22" },
+	},
 });
