@@ -2,11 +2,11 @@
 
 Three entry points:
 
-| Import                     | Contains                                   | Runtime   |
-| -------------------------- | ------------------------------------------ | --------- |
-| `@marianmeres/ws`          | the client, plus everything from protocol  | any       |
-| `@marianmeres/ws/server`   | the reference server, plus `WSRemoteError` | Deno only |
-| `@marianmeres/ws/protocol` | wire definitions only, dependency-free     | any       |
+| Import                     | Contains                                   | Runtime                                    |
+| -------------------------- | ------------------------------------------ | ------------------------------------------ |
+| `@marianmeres/ws`          | the client, plus everything from protocol  | any                                        |
+| `@marianmeres/ws/server`   | the reference server, plus `WSRemoteError` | any demino 2.0 adapter (Deno; Node + `ws`) |
+| `@marianmeres/ws/protocol` | wire definitions only, dependency-free     | any                                        |
 
 ---
 
@@ -497,8 +497,22 @@ component and any other store-compatible consumer works too:
 
 ## Server
 
-Import from `@marianmeres/ws/server`. **JSR only** — it needs
-`Deno.upgradeWebSocket`, so the npm package ships the client alone.
+Import from `@marianmeres/ws/server` (JSR and npm; on npm `@marianmeres/demino`
+is an optional peer dependency — install it next to this package).
+
+It runs under any demino 2.0 adapter — `@marianmeres/demino/deno`, or
+`@marianmeres/demino/node` with the optional `ws` package installed — through
+the `info.upgradeWebSocket` the adapter provides. A bare `Deno.serve(app)` host
+still works, through `Deno.upgradeWebSocket`. With neither (Node without a
+demino adapter), the upgrade route throws.
+
+```typescript
+import { serve } from "@marianmeres/demino/node"; // or "@marianmeres/demino/deno"
+import { createWSApp } from "@marianmeres/ws/server";
+
+const { app } = createWSApp("/ws", [], { verify: (payload) => check(payload) });
+await serve(app, { port: 8000 });
+```
 
 ### `createWSApp(mountPath?, middlewares?, options?)`
 
@@ -709,14 +723,27 @@ site's page cannot read your token, only ride your cookies.
 
 Owns every connection, direct messages, the room index, presence and delivery.
 Usable standalone
-— `new WSService(options)`, driven from any `Deno.serve` handler — or through
-`createWSApp`, which mounts it as a demino app.
+— `new WSService(options)`, driven from any handler that can hand it an upgrade
+function — or through `createWSApp`, which mounts it as a demino app.
 
-##### `handleUpgrade(request): Response`
+##### `handleUpgrade(request, upgrade?): Response`
 
 Upgrades an HTTP request and takes ownership of the socket. Return the 101
 response from your route handler unmodified. With `allowedOrigins` set, a
 disallowed request is answered `403` instead and nothing is upgraded.
+
+`upgrade` is the runtime's upgrade function — a
+[`WSUpgradeWebSocket`](#wsupgradewebsocket), such as demino 2.0's
+`info.upgradeWebSocket` (which `createWSApp` passes). Omitted, it defaults to
+`Deno.upgradeWebSocket` when the runtime has one; with neither, it throws an
+`Error` naming the fix. A request that is not a valid upgrade throws the
+upgrade function's `TypeError`. The socket's `binaryType` is set to
+`"arraybuffer"`, so `decode` receives `string | ArrayBuffer` on every runtime.
+
+```typescript
+// demino 2.0, by hand
+app.get("/socket", (req, info) => service.handleUpgrade(req, info.upgradeWebSocket));
+```
 
 ##### `send(clientId, payload): boolean`
 
@@ -810,6 +837,19 @@ Passed to `onMessage`, `allowSubscribe`, `allowPublish` and `allowBroadcast`.
 	namespaces: Record<string, number>; // connections per namespace
 }
 ```
+
+### `WSUpgradeWebSocket`
+
+```typescript
+type WSUpgradeWebSocket = (
+	req: Request,
+	options?: { protocol?: string; idleTimeout?: number },
+) => { socket: WebSocket; response: Response };
+```
+
+A Deno-shaped WebSocket upgrade: what both `Deno.upgradeWebSocket` and demino
+2.0's `info.upgradeWebSocket` are. Typed structurally, so `WSService` depends on
+neither. Taken by [`handleUpgrade`](#handleupgraderequest-upgrade-response).
 
 ### `WSPubSubAdapter`
 

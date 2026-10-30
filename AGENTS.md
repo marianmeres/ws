@@ -9,7 +9,7 @@ reference server implementing both.
 
 ```yaml
 name: "@marianmeres/ws"
-runtime: "deno (primary), browser/node/bun/workers (client)"
+runtime: "client: browser/deno/node/bun/workers; server: any demino 2.0 adapter (deno, node + ws)"
 entry: "./src/mod.ts"
 exports: [".", "./server", "./protocol"]
 test: "deno task test"
@@ -42,6 +42,10 @@ src/
 ├── client/
 └── server/
     └── adapters/          # cross-instance fan-out seam (local only today)
+
+scripts/
+├── build-npm.ts           # `deno task npm:build` -> .npm-dist/
+└── smoke-npm.mjs          # `deno task npm:smoke`: the packed package, on Node
 
 example/                   # standalone reference app — `deno task example`
 ├── server.ts              # demino apps: /ws (createWSApp), /api, / (static)
@@ -206,6 +210,20 @@ to the policy again.
 **Delivery is at-most-once.** Transmitted-but-unacked sends are never resent.
 If that changes, the server needs deduplication first.
 
+**The upgrade is the runtime's, handed in.** `handleUpgrade(req, upgrade?)` takes
+a Deno-shaped upgrade function (`WSUpgradeWebSocket`); the `createWSApp` route
+passes demino 2.0's `info.upgradeWebSocket`, which the `/deno` and `/node` (via
+`ws`) adapters fill. Without one it falls back to `Deno.upgradeWebSocket`, read
+per call (`denoUpgrade()`), which keeps a bare `Deno.serve(app)` — every demino
+1.x host, and most of the test suite (`startServer`) — working. That fallback
+is the **only** `Deno` reference allowed in `src/server/`; everything else
+there uses the standard `WebSocket` surface only. The socket's `binaryType` is
+set to `"arraybuffer"` right after the upgrade, because `#onMessage` decodes
+`string | ArrayBuffer` and a runtime default (`ws`: `nodebuffer`) is not a
+contract. `tests/adapters.test.ts` runs the server through both adapters, Node's
+on Deno's `node:http` compat, and counts the capability's calls so a silent
+fallback cannot pass for the adapter path.
+
 ## Publishing (JSR + npm)
 
 This package publishes to **both** JSR and npm, and JSR's constraints are the
@@ -236,10 +254,11 @@ run `deno publish` then the npm build.
 
 ## Before Making Changes
 
-1. `deno task test` — 105 tests, mostly real sockets against a real server:
+1. `deno task test` — 111 tests, mostly real sockets against a real server:
    `unit`, `integration`, `resilience`, `core` (messages: a core-only server,
    `onMessage`, `service.send`), `protocol` (server input hardening, raw
-   sockets) and `codec` (custom encode/decode, binary frames)
+   sockets), `codec` (custom encode/decode, binary frames) and `adapters` (the
+   upgrade contract; the server through demino's Deno and Node adapters)
 2. `deno lint && deno fmt --check && deno check src/mod.ts src/server.ts src/protocol.ts`
 3. Touched a public signature? `deno doc --lint src/mod.ts src/server.ts
    src/protocol.ts` **and** `deno publish --dry-run --allow-dirty`
@@ -254,9 +273,16 @@ run `deno publish` then the npm build.
    `WS_ROOMS=1`
 5. Touching reconnect, outbox or heartbeat? Read `tests/resilience.test.ts`
    first — those tests encode the failure modes the design exists to handle
-6. `deno task npm:build` if packaging changed (npm ships the **client only**;
-   the server is Deno-only and excluded via `sourceFiles`) — a new file under
-   `src/client/` or `src/protocol/` must be added to `sourceFiles` by hand
+6. `deno task npm:smoke` if packaging changed — it runs `npm:build` (all of
+   `src/` ships; entry points `mod`, `protocol`, `server`), installs the packed
+   copy with `@marianmeres/demino` and `ws` into a temp project, and on Node
+   serves `createWSApp()` through `@marianmeres/demino/node` for the
+   package's own client to authenticate and echo. `@marianmeres/demino` is an
+   optional peer (plus a devDependency for the build's `tsc`), so the host's
+   demino and the server's are one copy and a client-only install has none —
+   the smoke checks both; `ws` is demino's optional peer, never a dependency
+   here. Any other new runtime import in `src/` is added to `dependencies` in
+   `scripts/build-npm.ts`
 7. Adding or changing a public export? Update `API.md` — it documents **all**
    of them, and that completeness is the contract
 8. Changing the client or server API? Run `deno task example` and click through
@@ -272,7 +298,8 @@ run `deno publish` then the npm build.
 - Only `WSPubSubLocal` exists — Redis/Deno-KV adapters are an unimplemented seam
 - Presence is scoped to `(room, namespace)`; broadcast crosses namespaces but
   presence does not
-- Node/Bun cannot run the server (`Deno.upgradeWebSocket`)
+- Bun is not a demino 2.0 runtime; with no upgrade function and no `Deno`
+  global, `handleUpgrade` throws
 - Origin checking is opt-in via `allowedOrigins`; unset means no check
 - `maxBufferedAmount` bounds one connection; there is no aggregate memory cap
 - Presence `join`/`leave` carries the full member list to every presence

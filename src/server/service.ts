@@ -59,6 +59,16 @@ export interface WSStats {
 	namespaces: Record<string, number>;
 }
 
+/**
+ * A Deno-shaped WebSocket upgrade: what `Deno.upgradeWebSocket` and demino
+ * 2.0's `info.upgradeWebSocket` both are. Typed here, structurally, so the
+ * service depends on neither.
+ */
+export type WSUpgradeWebSocket = (
+	req: Request,
+	options?: { protocol?: string; idleTimeout?: number },
+) => { socket: WebSocket; response: Response };
+
 /** Configuration for {@link WSService}. */
 export interface WSServiceOptions {
 	/**
@@ -253,11 +263,25 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 /**
+ * `Deno.upgradeWebSocket`, when the runtime has one — the fallback for a host
+ * that hands no upgrade function over: a bare `Deno.serve(app)`, and every
+ * demino 1.x host. The one `Deno` reference left in the server; it goes once
+ * no 1.x host remains. Read per call, not at import.
+ */
+function denoUpgrade(): WSUpgradeWebSocket | undefined {
+	const deno = (globalThis as unknown as {
+		Deno?: { upgradeWebSocket?: WSUpgradeWebSocket };
+	}).Deno;
+	return deno?.upgradeWebSocket?.bind(deno);
+}
+
+/**
  * Owns every connection, the room index, and message delivery — direct
  * messages to one connection (core) as well as room fan-out (rooms extension).
  *
- * Usable standalone (drive it from any `Deno.serve` handler) or through
- * `createWSApp`, which mounts it as a demino app.
+ * Usable standalone (drive it from any handler that can hand it an upgrade
+ * function — see {@link WSService.handleUpgrade}) or through `createWSApp`,
+ * which mounts it as a demino app.
  */
 export class WSService {
 	#options: Required<
@@ -353,24 +377,44 @@ export class WSService {
 	 * Returns the 101 response, which must be returned from the route handler
 	 * unmodified.
 	 *
-	 * Deno-only: backed by `Deno.upgradeWebSocket`.
+	 * The upgrade itself is the runtime's: pass `upgrade` — demino 2.0's
+	 * `info.upgradeWebSocket`, which its `/deno` and `/node` (with the `ws`
+	 * package) adapters provide, and which `createWSApp` passes on. Without
+	 * it, `Deno.upgradeWebSocket` is used when the runtime has one, which is
+	 * what keeps a bare `Deno.serve(app)` host working.
 	 *
 	 * When {@link WSServiceOptions.allowedOrigins} is set and the request's
 	 * `Origin` is not allowed, nothing is upgraded and a `403` comes back
 	 * instead — `verify` is never reached.
 	 *
 	 * @param request - the upgrade request
+	 * @param upgrade - the runtime's upgrade function; default `Deno.upgradeWebSocket`
 	 * @returns the 101 response to hand straight back to the runtime, or `403`
 	 * @throws {TypeError} when the request is not a valid upgrade
+	 * @throws {Error} when there is no upgrade function at all: none passed, and
+	 * no `Deno` global (Node without a demino adapter)
 	 */
-	handleUpgrade(request: Request): Response {
+	handleUpgrade(request: Request, upgrade?: WSUpgradeWebSocket): Response {
 		const origin = request.headers.get("origin");
 		if (!this.#originAllowed(origin, request)) {
 			this.logger?.debug?.(`upgrade rejected, origin: ${origin}`);
 			return new Response("Origin not allowed", { status: 403 });
 		}
 
-		const { socket, response } = Deno.upgradeWebSocket(request);
+		const upgradeWebSocket = upgrade ?? denoUpgrade();
+		if (!upgradeWebSocket) {
+			throw new Error(
+				"WebSocket upgrade capability missing: serve the app through a " +
+					"@marianmeres/demino adapter (@marianmeres/demino/deno, or /node " +
+					"with the `ws` package), or pass an upgrade function to handleUpgrade()",
+			);
+		}
+
+		const { socket, response } = upgradeWebSocket(request);
+		// `#onMessage` takes `string | ArrayBuffer`. Deno's default (probed:
+		// 2.9) and demino's Node adapter already agree; this makes it a
+		// guarantee rather than a coincidence of whichever runtime is under it.
+		socket.binaryType = "arraybuffer";
 
 		const conn: Connection = {
 			id: base36(12),

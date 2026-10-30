@@ -14,6 +14,7 @@
 		"example:watch": "deno run -A jsr:@marianmeres/deno-build --root example/client --outdir example/public/dist --watch --watch-dir src --watch-dir example",
 		"example:styles": "deno run -A example/build-styles.ts",
 		"npm:build": "deno run -A scripts/build-npm.ts",
+		"npm:smoke": "deno task npm:build && node scripts/smoke-npm.mjs",
 		"npm:publish": "deno run -A scripts/build-npm.ts && cd ./.npm-dist && npm publish --access=public",
 		"release": "deno run -A jsr:@marianmeres/release",
 		"publish": "deno publish && deno task npm:publish",
@@ -22,7 +23,7 @@
 	},
 	"imports": {
 		"@marianmeres/clog": "jsr:@marianmeres/clog@^3.21.0",
-		"@marianmeres/demino": "jsr:@marianmeres/demino@^1.17.0",
+		"@marianmeres/demino": "jsr:@marianmeres/demino@^2.0.0",
 		"@marianmeres/design-tokens": "jsr:@marianmeres/design-tokens@^1.20.0",
 		"@marianmeres/npmbuild": "jsr:@marianmeres/npmbuild@^1.16.0",
 		"@marianmeres/pubsub": "jsr:@marianmeres/pubsub@^3.0.0",
