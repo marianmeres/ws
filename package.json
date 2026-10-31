@@ -1,6 +1,6 @@
 {
   "name": "@marianmeres/ws",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "WebSocket client with reconnect, half-open detection and buffered sends, for plain messages or namespaces, rooms and presence, plus a demino-mountable reference server.",
   "license": "MIT",
   "author": "Marian Meres",
