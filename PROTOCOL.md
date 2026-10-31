@@ -1,9 +1,9 @@
 # Wire protocol and server implementation guide
 
-`@marianmeres/ws` ships a client that runs anywhere and a reference server that
-runs only on Deno. This document describes the wire protocol precisely enough to
-implement a compatible server in **any language**, so that the stock client works
-against it unchanged.
+`@marianmeres/ws` ships a client that runs anywhere and a TypeScript reference
+server (Node, or Deno). This document describes the wire protocol precisely
+enough to implement a compatible server in **any language**, so that the stock
+client works against it unchanged.
 
 The protocol has two layers:
 
@@ -587,7 +587,7 @@ the read loop is the simplest correct choice; the Python reference does that,
 and queues only `msg` frames for its message worker. Mind that the obligation
 covers your policy hooks too: a `sub` whose authorization is still awaiting a
 database must still hold the `pub` behind it. In a design where frames are
-dispatched as they arrive (the Deno reference), that takes an explicit
+dispatched as they arrive (the TypeScript reference), that takes an explicit
 per-connection queue for the rooms frames.
 
 The client, for its part, emits `connected` — and resolves `connect()` — only
@@ -773,10 +773,10 @@ recoverable, so the client reconnects; the two `nack`s keep the socket.
 
 The last one is the only defence against a peer that stops reading: `send` on a
 WebSocket never blocks, so without it the server buffers everything addressed to
-a stalled connection, without bound. The Deno reference checks the socket's
-`bufferedAmount` after every send. A server whose sends await the transport
-(the Python ones below) is stalled by such a peer instead — see the notes after
-section 9.
+a stalled connection, without bound. The TypeScript reference checks the
+socket's `bufferedAmount` after every send. A server whose sends await the
+transport (the Python ones below) is stalled by such a peer instead — see the
+notes after section 9.
 
 The core server in section 8 implements the first two and leaves frame size to
 the `websockets` library (`max_size`, 1 MiB by default, closing with 1009 —
@@ -1944,9 +1944,9 @@ Notes on the design choices, in the order they matter:
   fanning out to it. Good enough for a reference; for production put an outgoing
   queue with a writer task per connection, keeping per-connection order — and
   bound that queue, closing with 4010 `SLOW_CONSUMER` when it overflows, as the
-  Deno reference does with the socket's `bufferedAmount`. Either a stalled peer
-  stalls you, or you buffer for it; the bound is what keeps the second choice
-  from being unbounded.
+  TypeScript reference does with the socket's `bufferedAmount`. Either a stalled
+  peer stalls you, or you buffer for it; the bound is what keeps the second
+  choice from being unbounded.
 - **Single instance, in memory.** Horizontal scaling needs a fan-out between
   instances (Redis pub/sub or similar) and a shared view of presence. Local
   delivery stays each instance's own job, which is why `recipients` is
@@ -1989,8 +1989,9 @@ header should stay allowed unless you knowingly demand one.
 
 ## Appendix A — conformance script
 
-Drives the real client against your server. Requires [Deno](https://deno.com)
-and network access to fetch the client from JSR; nothing to install.
+Drives the real client against your server. Requires [Node](https://nodejs.org)
+22.18+ (it runs the TypeScript as is) and the client from npm — in an empty
+directory, `npm install @marianmeres/ws`.
 
 It expects the server to accept the auth payload `{ "token": "dev-secret" }`
 and reject other tokens with 4001, and to answer messages the way both Python
@@ -2006,8 +2007,8 @@ also expect broadcast to be allowed into `announcements` only and subscribing to
 the script instead checks that rooms are refused as `unsupported`.
 
 ```bash
-WS_URL=ws://127.0.0.1:8765/ws deno run -A conformance.ts              # core server
-WS_URL=ws://127.0.0.1:8765/ws WS_ROOMS=1 deno run -A conformance.ts   # with rooms
+WS_URL=ws://127.0.0.1:8765/ws node conformance.ts              # core server
+WS_URL=ws://127.0.0.1:8765/ws WS_ROOMS=1 node conformance.ts   # with rooms
 ```
 
 ```typescript
@@ -2027,6 +2028,7 @@ WS_URL=ws://127.0.0.1:8765/ws WS_ROOMS=1 deno run -A conformance.ts   # with roo
  *
  * Two checks need short server timeouts: WS_AUTH_TIMEOUT=1 WS_IDLE_TIMEOUT=2.
  */
+import assert from "node:assert/strict";
 import {
 	createWSClient,
 	type WSMessage,
@@ -2034,11 +2036,10 @@ import {
 	WSRemoteError,
 	type WSRoomMessage,
 	WSTerminatedError,
-} from "jsr:@marianmeres/ws@^0.7.0";
-import { assert, assertEquals, assertRejects } from "jsr:@std/assert@^1";
+} from "@marianmeres/ws";
 
-const URL = Deno.env.get("WS_URL") ?? "ws://127.0.0.1:8765/ws";
-const ROOMS = Deno.env.get("WS_ROOMS") === "1";
+const URL = process.env.WS_URL ?? "ws://127.0.0.1:8765/ws";
+const ROOMS = process.env.WS_ROOMS === "1";
 const auth = () => ({ token: "dev-secret", user: "smoke" });
 const client = (o: Record<string, unknown> = {}) =>
 	createWSClient({ url: URL, logger: null, pingInterval: 0, auth, ...o });
@@ -2051,7 +2052,21 @@ async function until(fn: () => boolean, label: string, ms = 4000) {
 		await sleep(20);
 	}
 }
-let passed = 0, failed = 0;
+/** Asserts that `fn` rejects with an `ErrorClass`, and hands the error back. */
+async function rejects<E extends Error>(
+	fn: () => Promise<unknown>,
+	ErrorClass: new (...args: never[]) => E,
+): Promise<E> {
+	try {
+		await fn();
+	} catch (e) {
+		assert.ok(e instanceof ErrorClass, `expected ${ErrorClass.name}, got ${e}`);
+		return e;
+	}
+	assert.fail(`expected a rejection with ${ErrorClass.name}`);
+}
+let passed = 0,
+	failed = 0;
 async function test(name: string, fn: () => Promise<void>) {
 	try {
 		await fn();
@@ -2067,9 +2082,9 @@ async function test(name: string, fn: () => Promise<void>) {
 async function raw() {
 	const ws = new WebSocket(URL);
 	const frames: Record<string, unknown>[] = [];
-	const closed = new Promise<CloseEvent>((r) => ws.onclose = r);
+	const closed = new Promise<CloseEvent>((r) => (ws.onclose = r));
 	ws.onmessage = (e) => frames.push(JSON.parse(e.data));
-	await new Promise((r) => ws.onopen = r);
+	await new Promise((r) => (ws.onopen = r));
 	return { ws, frames, closed, send: (f: unknown) => ws.send(JSON.stringify(f)) };
 }
 
@@ -2079,26 +2094,26 @@ await test("core: pre-auth frame -> error unauthorized; hello; bad json -> 4400"
 	const r = await raw();
 	r.send({ type: "ping" });
 	await until(() => r.frames.length === 1, "error frame");
-	assertEquals(r.frames[0].type, "error");
-	assertEquals((r.frames[0].error as Record<string, unknown>).code, "unauthorized");
+	assert.deepEqual(r.frames[0].type, "error");
+	assert.deepEqual((r.frames[0].error as Record<string, unknown>).code, "unauthorized");
 	r.send({ type: "auth", protocol: 2, payload: auth() });
 	await until(() => r.frames.length === 2, "hello");
-	assertEquals(r.frames[1].type, "hello");
-	assertEquals(r.frames[1].protocol, 2);
+	assert.deepEqual(r.frames[1].type, "hello");
+	assert.deepEqual(r.frames[1].protocol, 2);
 	r.send({ type: "ping" });
 	await until(() => r.frames.length === 3, "pong");
-	assertEquals(r.frames[2], { type: "pong" });
+	assert.deepEqual(r.frames[2], { type: "pong" });
 	r.ws.send("not json");
 	const ev = await r.closed;
-	assertEquals(ev.code, 4400);
-	assertEquals(r.frames[3].type, "error");
+	assert.deepEqual(ev.code, 4400);
+	assert.deepEqual(r.frames[3].type, "error");
 });
 
 await test("core: send with ack resolves with the server's reply", async () => {
 	const c = client();
 	try {
 		const reply = await c.send({ op: "echo", n: 1 }, { ack: true });
-		assertEquals(reply, { op: "echo", n: 1 });
+		assert.deepEqual(reply, { op: "echo", n: 1 });
 	} finally {
 		c.dispose();
 	}
@@ -2109,10 +2124,13 @@ await test("core: fire-and-forget send; the push arrives as a direct message", a
 	try {
 		const got: WSMessage[] = [];
 		c.on("message", (m) => got.push(m));
-		assertEquals(await c.send({ op: "push", data: { hello: "there" } }), undefined);
+		assert.deepEqual(
+			await c.send({ op: "push", data: { hello: "there" } }),
+			undefined,
+		);
 		await until(() => got.length === 1, "pushed message");
-		assertEquals(got[0].payload, { hello: "there" });
-		assertEquals(got[0].room, undefined, "a direct message has no room");
+		assert.deepEqual(got[0].payload, { hello: "there" });
+		assert.deepEqual(got[0].room, undefined, "a direct message has no room");
 	} finally {
 		c.dispose();
 	}
@@ -2121,13 +2139,13 @@ await test("core: fire-and-forget send; the push arrives as a direct message", a
 await test("core: a refused message rejects with the server's code; socket stays", async () => {
 	const c = client();
 	try {
-		const err = await assertRejects(
+		const err = await rejects(
 			() => c.send({ op: "nope" }, { ack: true }),
 			WSRemoteError,
 		);
-		assertEquals(err.code, "unknown_op");
+		assert.deepEqual(err.code, "unknown_op");
 		assert(c.connected);
-		assertEquals(await c.send({ op: "echo" }, { ack: true }), { op: "echo" });
+		assert.deepEqual(await c.send({ op: "echo" }, { ack: true }), { op: "echo" });
 	} finally {
 		c.dispose();
 	}
@@ -2136,12 +2154,12 @@ await test("core: a refused message rejects with the server's code; socket stays
 await test("core: a refusal's details reach the application, untouched", async () => {
 	const c = client();
 	try {
-		const err = await assertRejects(
+		const err = await rejects(
 			() => c.send({ op: "nope" }, { ack: true }),
 			WSRemoteError,
 		);
-		assertEquals(err.code, "unknown_op");
-		assertEquals(err.details, { op: "nope" });
+		assert.deepEqual(err.code, "unknown_op");
+		assert.deepEqual(err.details, { op: "nope" });
 	} finally {
 		c.dispose();
 	}
@@ -2154,12 +2172,12 @@ await test("core: unknown frame -> nack unsupported with an id, error without", 
 	r.send({ type: "teleport", id: "t1" });
 	await until(() => r.frames.some((f) => f.type === "nack"), "nack");
 	const nack = r.frames.find((f) => f.type === "nack")!;
-	assertEquals(nack.id, "t1");
-	assertEquals((nack.error as Record<string, unknown>).code, "unsupported");
+	assert.deepEqual(nack.id, "t1");
+	assert.deepEqual((nack.error as Record<string, unknown>).code, "unsupported");
 	r.send({ type: "teleport" });
 	await until(() => r.frames.some((f) => f.type === "error"), "error");
 	const error = r.frames.find((f) => f.type === "error")!;
-	assertEquals((error.error as Record<string, unknown>).code, "unsupported");
+	assert.deepEqual((error.error as Record<string, unknown>).code, "unsupported");
 	r.ws.close();
 	await r.closed;
 });
@@ -2167,7 +2185,7 @@ await test("core: unknown frame -> nack unsupported with an id, error without", 
 await test("core: heartbeat — ping is answered, connection stays up", async () => {
 	const hb = client({ pingInterval: 200, pongTimeout: 400 });
 	let closed = false;
-	hb.on("close", () => closed = true);
+	hb.on("close", () => (closed = true));
 	try {
 		await hb.connect();
 		await sleep(1500);
@@ -2180,9 +2198,9 @@ await test("core: heartbeat — ping is answered, connection stays up", async ()
 await test("core: auth failure closes with 4001 and the client gives up", async () => {
 	const bad = client({ auth: () => ({ token: "wrong" }) });
 	try {
-		const err = await assertRejects(() => bad.connect(), WSTerminatedError);
-		assertEquals(err.code, 4001);
-		assertEquals(bad.connectionState, "terminated");
+		const err = await rejects(() => bad.connect(), WSTerminatedError);
+		assert.deepEqual(err.code, 4001);
+		assert.deepEqual(bad.connectionState, "terminated");
 	} finally {
 		bad.dispose();
 	}
@@ -2191,7 +2209,7 @@ await test("core: auth failure closes with 4001 and the client gives up", async 
 await test("core: no auth frame -> closed 4002 (needs WS_AUTH_TIMEOUT=1)", async () => {
 	const r = await raw();
 	const ev = await r.closed;
-	assertEquals(ev.code, 4002);
+	assert.deepEqual(ev.code, 4002);
 });
 
 await test("core: idle reap 4008, then a send buffered meanwhile is flushed (needs WS_IDLE_TIMEOUT=2)", async () => {
@@ -2199,13 +2217,13 @@ await test("core: idle reap 4008, then a send buffered meanwhile is flushed (nee
 	try {
 		await c.connect();
 		const ev = await new Promise<{ code: number; willReconnect: boolean }>((r) =>
-			c.on("close", r)
+			c.on("close", r),
 		);
-		assertEquals(ev.code, 4008);
-		assertEquals(ev.willReconnect, true);
+		assert.deepEqual(ev.code, 4008);
+		assert.deepEqual(ev.willReconnect, true);
 		// Buffered while reconnecting, flushed once the new socket says hello.
 		const reply = await c.send({ op: "echo", late: true }, { ack: true });
-		assertEquals(reply, { op: "echo", late: true });
+		assert.deepEqual(reply, { op: "echo", late: true });
 	} finally {
 		c.dispose();
 	}
@@ -2217,11 +2235,8 @@ if (!ROOMS) {
 		try {
 			await c.connect();
 			const t0 = Date.now();
-			const err = await assertRejects(
-				() => c.subscribe("r", () => {}),
-				WSRemoteError,
-			);
-			assertEquals(err.code, "unsupported");
+			const err = await rejects(() => c.subscribe("r", () => {}), WSRemoteError);
+			assert.deepEqual(err.code, "unsupported");
 			assert(Date.now() - t0 < 2_000, "answered, not timed out");
 		} finally {
 			c.dispose();
@@ -2238,13 +2253,13 @@ if (ROOMS) {
 		try {
 			await a.connect();
 			await b.connect();
-			assertEquals(a.clientId, "alice");
-			assertEquals(a.namespace, "default");
+			assert.deepEqual(a.clientId, "alice");
+			assert.deepEqual(a.namespace, "default");
 			assert(
 				typeof b.clientId === "string" && b.clientId.length > 0,
 				"generated id",
 			);
-			assertEquals(b.namespace, "org-2");
+			assert.deepEqual(b.namespace, "org-2");
 		} finally {
 			a.dispose();
 			b.dispose();
@@ -2262,9 +2277,9 @@ if (ROOMS) {
 				presence: (e) => aliceEv.push(e),
 			});
 			await until(() => aliceEv.length === 1, "alice sync");
-			assertEquals(aliceEv[0].event, "sync");
-			assertEquals(aliceEv[0].clientId, null);
-			assertEquals(aliceEv[0].members, ["alice"]);
+			assert.deepEqual(aliceEv[0].event, "sync");
+			assert.deepEqual(aliceEv[0].clientId, null);
+			assert.deepEqual(aliceEv[0].members, ["alice"]);
 
 			await bob.connect();
 			const bobEv: WSPresenceEvent[] = [];
@@ -2273,18 +2288,18 @@ if (ROOMS) {
 				presence: (e) => bobEv.push(e),
 			});
 			await until(() => bobEv.length === 1, "bob sync");
-			assertEquals(bobEv[0].members.sort(), ["alice", "bob"]);
+			assert.deepEqual(bobEv[0].members.sort(), ["alice", "bob"]);
 			await until(() => aliceEv.length === 2, "alice sees join");
-			assertEquals(aliceEv[1].event, "join");
-			assertEquals(aliceEv[1].clientId, "bob");
+			assert.deepEqual(aliceEv[1].event, "join");
+			assert.deepEqual(aliceEv[1].clientId, "bob");
 
 			const { recipients } = await bob.publish("room", { text: "hi" });
-			assertEquals(recipients, 2, "sender is echoed too");
+			assert.deepEqual(recipients, 2, "sender is echoed too");
 			await until(() => aliceMsgs.length === 1 && bobMsgs.length === 1, "delivery");
-			assertEquals(aliceMsgs[0].payload, { text: "hi" });
-			assertEquals(aliceMsgs[0].room, "room");
-			assertEquals(aliceMsgs[0].namespace, "default");
-			assertEquals(aliceMsgs[0].from, "bob");
+			assert.deepEqual(aliceMsgs[0].payload, { text: "hi" });
+			assert.deepEqual(aliceMsgs[0].room, "room");
+			assert.deepEqual(aliceMsgs[0].namespace, "default");
+			assert.deepEqual(aliceMsgs[0].from, "bob");
 			assert(
 				Number.isInteger(aliceMsgs[0].timestamp) && aliceMsgs[0].timestamp > 1e12,
 			);
@@ -2294,13 +2309,13 @@ if (ROOMS) {
 			await alice.subscribe("plain", () => {});
 			await alice.subscribe("plain", () => {}, { presence: (e) => pEv.push(e) });
 			await until(() => pEv.length === 1, "sync after presence upgrade");
-			assertEquals(pEv[0].members, ["alice"]);
+			assert.deepEqual(pEv[0].members, ["alice"]);
 
 			bob.dispose();
 			await until(() => aliceEv.length === 3, "alice sees leave");
-			assertEquals(aliceEv[2].event, "leave");
-			assertEquals(aliceEv[2].clientId, "bob");
-			assertEquals(aliceEv[2].members, ["alice"]);
+			assert.deepEqual(aliceEv[2].event, "leave");
+			assert.deepEqual(aliceEv[2].clientId, "bob");
+			assert.deepEqual(aliceEv[2].members, ["alice"]);
 		} finally {
 			alice.dispose();
 			bob.dispose();
@@ -2320,12 +2335,12 @@ if (ROOMS) {
 			await until(() => bEv.length === 2, "bob sees alice join");
 			await a.unsubscribe("u");
 			await until(() => bEv.length === 3, "bob sees alice leave");
-			assertEquals(bEv[2].event, "leave");
-			assertEquals(bEv[2].members, ["bob"]);
+			assert.deepEqual(bEv[2].event, "leave");
+			assert.deepEqual(bEv[2].members, ["bob"]);
 			const { recipients } = await b.publish("u", 1);
-			assertEquals(recipients, 1);
+			assert.deepEqual(recipients, 1);
 			await sleep(200);
-			assertEquals(aMsgs.length, 0);
+			assert.deepEqual(aMsgs.length, 0);
 		} finally {
 			a.dispose();
 			b.dispose();
@@ -2342,14 +2357,11 @@ if (ROOMS) {
 			await c.subscribe("room", (m) => cMsgs.push(m));
 			await a.subscribe("room", () => {});
 			const { recipients } = await a.publish("room", { x: 1 });
-			assertEquals(recipients, 1);
+			assert.deepEqual(recipients, 1);
 			await sleep(200);
-			assertEquals(cMsgs.length, 0);
-			const err = await assertRejects(
-				() => a.publish("room", 1, "org-2"),
-				WSRemoteError,
-			);
-			assertEquals(err.code, "forbidden");
+			assert.deepEqual(cMsgs.length, 0);
+			const err = await rejects(() => a.publish("room", 1, "org-2"), WSRemoteError);
+			assert.deepEqual(err.code, "forbidden");
 		} finally {
 			a.dispose();
 			c.dispose();
@@ -2362,22 +2374,26 @@ if (ROOMS) {
 		try {
 			await a.connect();
 			await c.connect();
-			const err = await assertRejects(() => a.broadcast("room", 1), WSRemoteError);
-			assertEquals(err.code, "forbidden");
+			const err = await rejects(() => a.broadcast("room", 1), WSRemoteError);
+			assert.deepEqual(err.code, "forbidden");
 
 			const cMsgs: WSRoomMessage[] = [];
 			const aMsgs: WSRoomMessage[] = [];
 			await c.subscribe("announcements", (m) => cMsgs.push(m));
 			await a.subscribe("announcements", (m) => aMsgs.push(m));
 			const { recipients } = await a.broadcast("announcements", { text: "all" });
-			assertEquals(recipients, 2);
+			assert.deepEqual(recipients, 2);
 			await until(
 				() => cMsgs.length === 1 && aMsgs.length === 1,
 				"broadcast delivery",
 			);
-			assertEquals(cMsgs[0].namespace, "org-2", "receiver sees its own namespace");
-			assertEquals(aMsgs[0].namespace, "default");
-			assertEquals(cMsgs[0].from, "alice");
+			assert.deepEqual(
+				cMsgs[0].namespace,
+				"org-2",
+				"receiver sees its own namespace",
+			);
+			assert.deepEqual(aMsgs[0].namespace, "default");
+			assert.deepEqual(cMsgs[0].from, "alice");
 		} finally {
 			a.dispose();
 			c.dispose();
@@ -2394,19 +2410,19 @@ if (ROOMS) {
 		try {
 			await d1.connect();
 			const closeEv = new Promise<{ code: number; willReconnect: boolean }>((r) =>
-				d1.on("close", r)
+				d1.on("close", r),
 			);
 			await d2.connect();
 			const ev = await closeEv;
-			assertEquals(ev.code, 4005);
-			assertEquals(ev.willReconnect, false);
-			assertEquals(d1.connectionState, "terminated");
+			assert.deepEqual(ev.code, 4005);
+			assert.deepEqual(ev.willReconnect, false);
+			assert.deepEqual(d1.connectionState, "terminated");
 			// Several backoff periods later the loser has not come back.
 			await sleep(200);
 			assert(d2.connected, "the newcomer keeps the id");
-			assertEquals(d1.connectionState, "terminated");
+			assert.deepEqual(d1.connectionState, "terminated");
 			const { recipients } = await d2.publish("x", 1);
-			assertEquals(recipients, 0);
+			assert.deepEqual(recipients, 0);
 		} finally {
 			d1.dispose();
 			d2.dispose();
@@ -2417,13 +2433,13 @@ if (ROOMS) {
 		const f = client({ clientId: "frank" });
 		try {
 			await f.connect();
-			const err = await assertRejects(
+			const err = await rejects(
 				() => f.subscribe("staff-only", () => {}),
 				WSRemoteError,
 			);
-			assertEquals(err.code, "forbidden");
-			assertEquals(err.details, { refused: ["staff-only"] });
-			assertEquals(f.isSubscribed("staff-only"), false);
+			assert.deepEqual(err.code, "forbidden");
+			assert.deepEqual(err.details, { refused: ["staff-only"] });
+			assert.deepEqual(f.isSubscribed("staff-only"), false);
 		} finally {
 			f.dispose();
 		}
@@ -2441,13 +2457,13 @@ if (ROOMS) {
 			"nack",
 		);
 		const nack = r.frames.find((f) => f.type === "nack")!;
-		assertEquals((nack.error as Record<string, unknown>).code, "forbidden");
-		assertEquals((nack.error as Record<string, unknown>).details, {
+		assert.deepEqual((nack.error as Record<string, unknown>).code, "forbidden");
+		assert.deepEqual((nack.error as Record<string, unknown>).details, {
 			refused: ["staff-only"],
 		});
 		r.send({ type: "pub", id: "p", room: "lobby", payload: 1 });
 		await until(() => r.frames.some((f) => f.type === "ack" && f.id === "p"), "ack");
-		assertEquals(
+		assert.deepEqual(
 			r.frames.find((f) => f.type === "ack" && f.id === "p")!.recipients,
 			1,
 		);
@@ -2462,12 +2478,12 @@ if (ROOMS) {
 			const msgs: WSRoomMessage[] = [];
 			await e.subscribe("r", (m) => msgs.push(m));
 			const ev = await new Promise<{ code: number }>((r) => e.on("close", r));
-			assertEquals(ev.code, 4008);
+			assert.deepEqual(ev.code, 4008);
 			// buffered while reconnecting; must land in the re-subscribed room
 			const { recipients } = await e.publish("r", { late: true });
-			assertEquals(recipients, 1);
+			assert.deepEqual(recipients, 1);
 			await until(() => msgs.length === 1, "buffered publish delivered");
-			assertEquals(msgs[0].payload, { late: true });
+			assert.deepEqual(msgs[0].payload, { late: true });
 		} finally {
 			e.dispose();
 		}
@@ -2475,7 +2491,7 @@ if (ROOMS) {
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
-Deno.exit(failed ? 1 : 0);
+process.exit(failed ? 1 : 0);
 ```
 
 ---
@@ -2487,7 +2503,7 @@ Deno.exit(failed ? 1 : 0);
 Handshake
 
 - [ ] `auth` is accepted as the first frame; `hello` with `protocol: 2` goes out
-      well within 10 s
+  well within 10 s
 - [ ] Rejected credentials close with 4001; "not allowed" closes with 4003
 - [ ] No `auth` within your deadline closes with 4002
 - [ ] Non-`auth` frames before authentication get `error` `unauthorized`
@@ -2497,15 +2513,15 @@ Messages
 
 - [ ] A `msg` without `id` is handled and answered with nothing
 - [ ] A `msg` with `id` is answered with exactly one `ack` or `nack` echoing it;
-      the `ack` carries the reply in `payload`, or no `payload` at all
+  the `ack` carries the reply in `payload`, or no `payload` at all
 - [ ] A refusal is a `nack` with a meaningful `code`; a crash is `internal`,
-      without internals in the message, and the socket stays open
+  without internals in the message, and the socket stays open
 - [ ] `error.details`, when the application supplies any, is passed through
-      unchanged — and omitted, not `null`, when it supplies none
+  unchanged — and omitted, not `null`, when it supplies none
 - [ ] A direct message to the client is `{"type": "msg", "payload": …}`, with no
-      `room`
+  `room`
 - [ ] Unknown frame types get `nack` `unsupported` with an `id`, `error`
-      `unsupported` without; the socket stays open
+  `unsupported` without; the socket stays open
 
 Liveness and closing
 
@@ -2519,40 +2535,40 @@ Identity
 
 - [ ] `hello` carries `clientId` and `namespace`
 - [ ] Server-assigned id/namespace override the client's proposal; otherwise the
-      proposal is honoured; otherwise generated / `"default"`
+  proposal is honoured; otherwise generated / `"default"`
 - [ ] A duplicate client id evicts the older connection with 4005 and does not
-      lose the newer registration when the old socket's close fires
+  lose the newer registration when the old socket's close fires
 
 Rooms and messages
 
 - [ ] Rooms frames of one connection are handled in arrival order — policy
-      hooks included: a `pub` never overtakes the `sub` before it
+  hooks included: a `pub` never overtakes the `sub` before it
 - [ ] `sub` registers rooms, re-subscribing is harmless, and it is answered
-      with exactly one `ack {id}` — or one `nack` `forbidden` whose
-      `details.refused` names the rooms the policy refused, with the others
-      registered regardless
+  with exactly one `ack {id}` — or one `nack` `forbidden` whose
+  `details.refused` names the rooms the policy refused, with the others
+  registered regardless
 - [ ] A `sub` past the per-connection room limit is nacked `forbidden` whole,
-      with `details.limit`; an over-long room name is `bad_request`
+  with `details.limit`; an over-long room name is `bad_request`
 - [ ] `pub` into a room the policy refuses is nacked `forbidden`
 - [ ] `unsub` is acknowledged; unknown rooms are ignored
 - [ ] `pub` delivers `msg` to every subscriber of `(room, namespace)`, the
-      publisher included, and acks with `recipients`
+  publisher included, and acks with `recipients`
 - [ ] A delivered `msg` carries `room`, `namespace`, `from`, `payload`
-      (untouched), `timestamp` (integer epoch ms)
+  (untouched), `timestamp` (integer epoch ms)
 - [ ] `pub` with a foreign `namespace` is nacked `forbidden`
 - [ ] `pub` without a `room` and `sub`/`unsub` with a non-array `rooms` are
-      answered `nack` `bad_request` without closing the socket
+  answered `nack` `bad_request` without closing the socket
 - [ ] `broadcast` is nacked `forbidden` unless allowed; when allowed, every
-      receiver sees its own namespace
+  receiver sees its own namespace
 
 Presence
 
 - [ ] `sub` with `presence: true` yields a `sync` (before the `ack`) with the
-      full membership
+  full membership
 - [ ] Other presence subscribers get `join` on a new member and `leave` on
-      `unsub` and on disconnect, with `members` reflecting the state after the
-      event
+  `unsub` and on disconnect, with `members` reflecting the state after the
+  event
 - [ ] Subscribers without presence are counted in `members` but receive no
-      presence frames
+  presence frames
 - [ ] Closing a connection for any reason removes it from all rooms and emits
-      `leave` events
+  `leave` events

@@ -1,8 +1,8 @@
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import assert from "node:assert/strict";
+import { test } from "node:test";
 
 import { createWSClient } from "../src/mod.ts";
 import { CLOSE } from "../src/protocol/constants.ts";
-import type { WSRoomMessage } from "../src/protocol/frames.ts";
 import {
 	WSConnectionLostError,
 	WSConnectTimeoutError,
@@ -13,9 +13,10 @@ import {
 	WSTerminatedError,
 	WSTimeoutError,
 } from "../src/protocol/errors.ts";
-import type { ClientFrame } from "../src/protocol/frames.ts";
+import type { ClientFrame, WSRoomMessage } from "../src/protocol/frames.ts";
 import {
 	freePort,
+	rejection,
 	sleep,
 	startBadNackServer,
 	startNoAckServer,
@@ -27,9 +28,9 @@ import {
 const client = (url: string, options: Record<string, unknown> = {}) =>
 	createWSClient({ url, logger: null, pingInterval: 0, ...options });
 
-Deno.test("reconnects after the server dies, and re-subscribes", async () => {
-	const port = freePort();
-	let server = startServer({}, port);
+test("reconnects after the server dies, and re-subscribes", async () => {
+	const port = await freePort();
+	let server = await startServer({}, port);
 	const c = client(server.url, { reconnectDelay: 30, reconnectDelayMax: 120 });
 
 	try {
@@ -40,7 +41,7 @@ Deno.test("reconnects after the server dies, and re-subscribes", async () => {
 		await server.stop();
 		await until(() => !c.connected, "client notices the drop");
 
-		server = startServer({}, port);
+		server = await startServer({}, port);
 		await until(() => c.connected, "client reconnects", 8_000);
 
 		// The room must be re-established without the caller doing anything.
@@ -51,16 +52,16 @@ Deno.test("reconnects after the server dies, and re-subscribes", async () => {
 
 		await server.service.publish("chat", { text: "after restart" });
 		await until(() => seen.length === 1, "delivery resumes");
-		assertEquals(seen[0].payload, { text: "after restart" });
+		assert.deepEqual(seen[0].payload, { text: "after restart" });
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("buffered publishes flush *after* re-subscribe, not before", async () => {
-	const port = freePort();
-	let server = startServer({}, port);
+test("buffered publishes flush *after* re-subscribe, not before", async () => {
+	const port = await freePort();
+	let server = await startServer({}, port);
 	const c = client(server.url, { reconnectDelay: 30, reconnectDelayMax: 120 });
 
 	try {
@@ -74,25 +75,25 @@ Deno.test("buffered publishes flush *after* re-subscribe, not before", async () 
 		// Issued while there is no connection at all.
 		const pending = c.publish("chat", { text: "buffered" });
 
-		server = startServer({}, port);
+		server = await startServer({}, port);
 
 		// This assertion is the whole point: a recipient count of 1 can only
 		// happen if the re-subscribe reached the server *before* the flushed
 		// publish did. Flush-first would score 0 and deliver to nobody.
 		const { recipients } = await pending;
-		assertEquals(recipients, 1, "publish overtook its own re-subscribe");
+		assert.deepEqual(recipients, 1, "publish overtook its own re-subscribe");
 
 		await until(() => seen.length === 1, "buffered message is delivered");
-		assertEquals(seen[0].payload, { text: "buffered" });
+		assert.deepEqual(seen[0].payload, { text: "buffered" });
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("a sub lost to a dropped socket resolves and keeps its room", async () => {
-	const port = freePort();
-	let server = startServer({}, port);
+test("a sub lost to a dropped socket resolves and keeps its room", async () => {
+	const port = await freePort();
+	let server = await startServer({}, port);
 	// A short deadline on purpose: if the lost `sub` were left to its timeout,
 	// this test would fail in 400ms instead of hanging for the default 30s.
 	const c = client(server.url, {
@@ -115,9 +116,9 @@ Deno.test("a sub lost to a dropped socket resolves and keeps its room", async ()
 		// detaches the handler — behind the back of a reconnect that had already
 		// re-subscribed the room.
 		await subscribed;
-		assertEquals(c.rooms, ["chat"]);
+		assert.deepEqual(c.rooms, ["chat"]);
 
-		server = startServer({}, port);
+		server = await startServer({}, port);
 		await until(() => c.connected, "client reconnects", 8_000);
 		await until(
 			() => server.service.members("chat").length === 1,
@@ -132,19 +133,16 @@ Deno.test("a sub lost to a dropped socket resolves and keeps its room", async ()
 	}
 });
 
-Deno.test("an in-flight publish rejects at the close, not at the timeout", async () => {
+test("an in-flight publish rejects at the close, not at the timeout", async () => {
 	// This server closes the socket instead of acking the `pub`.
-	const noAck = startNoAckServer();
+	const noAck = await startNoAckServer();
 	const c = client(noAck.url, { sendTimeout: 10_000, reconnectDelay: 10_000 });
 
 	try {
 		await c.connect();
 
 		const started = Date.now();
-		await assertRejects(
-			() => c.publish("chat", { n: 1 }),
-			WSConnectionLostError,
-		);
+		await rejection(() => c.publish("chat", { n: 1 }), WSConnectionLostError);
 		const elapsed = Date.now() - started;
 		assert(
 			elapsed < 2_000,
@@ -156,16 +154,16 @@ Deno.test("an in-flight publish rejects at the close, not at the timeout", async
 	}
 });
 
-Deno.test("an in-flight acked send rejects at the close; an unacked one already resolved", async () => {
+test("an in-flight acked send rejects at the close; an unacked one already resolved", async () => {
 	// This server closes the socket instead of answering the `msg`.
-	const noAck = startNoAckServer();
+	const noAck = await startNoAckServer();
 	const c = client(noAck.url, { sendTimeout: 10_000, reconnectDelay: 10_000 });
 
 	try {
 		await c.connect();
 
 		const started = Date.now();
-		await assertRejects(() => c.send({ n: 1 }, { ack: true }), WSConnectionLostError);
+		await rejection(() => c.send({ n: 1 }, { ack: true }), WSConnectionLostError);
 		const elapsed = Date.now() - started;
 		assert(
 			elapsed < 2_000,
@@ -177,13 +175,13 @@ Deno.test("an in-flight acked send rejects at the close; an unacked one already 
 	}
 });
 
-Deno.test("a send buffered while offline resolves once flushed, and arrives", async () => {
-	const port = freePort();
+test("a send buffered while offline resolves once flushed, and arrives", async () => {
+	const port = await freePort();
 	const received: unknown[] = [];
 	const options = {
 		onMessage: (_: unknown, payload: unknown) => void received.push(payload),
 	};
-	let server = startServer(options, port);
+	let server = await startServer(options, port);
 	const c = client(server.url, { reconnectDelay: 30, reconnectDelayMax: 120 });
 
 	try {
@@ -194,24 +192,24 @@ Deno.test("a send buffered while offline resolves once flushed, and arrives", as
 		// Issued while there is no connection at all: nothing can be written,
 		// so neither can resolve yet.
 		let settled = false;
-		const fire = c.send({ n: 1 }).then(() => settled = true);
+		const fire = c.send({ n: 1 }).then(() => (settled = true));
 		const ask = c.send({ n: 2 }, { ack: true });
 		await sleep(100);
-		assertEquals(settled, false, "resolved before it was ever written");
+		assert.deepEqual(settled, false, "resolved before it was ever written");
 
-		server = startServer(options, port);
+		server = await startServer(options, port);
 		await fire;
 		await ask;
-		assertEquals(received, [{ n: 1 }, { n: 2 }], "flushed in order");
+		assert.deepEqual(received, [{ n: 1 }, { n: 2 }], "flushed in order");
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("an ignored fire-and-forget send that fails is not an unhandled rejection", async () => {
+test("an ignored fire-and-forget send that fails is not an unhandled rejection", async () => {
 	// Nothing listens on this port, so the send can only time out in the queue.
-	const c = client(`ws://127.0.0.1:${freePort()}/ws`, {
+	const c = client(`ws://127.0.0.1:${await freePort()}/ws`, {
 		sendTimeout: 50,
 		reconnectDelay: 10_000,
 	});
@@ -224,28 +222,28 @@ Deno.test("an ignored fire-and-forget send that fails is not an unhandled reject
 		await sleep(150);
 
 		// Awaiting one still reports the failure.
-		await assertRejects(() => c.send({ n: 2 }), WSTimeoutError);
+		await rejection(() => c.send({ n: 2 }), WSTimeoutError);
 	} finally {
 		c.dispose();
 	}
 });
 
-Deno.test("a publish after a terminal close rejects at once", async () => {
-	const server = startServer({ verify: () => null });
+test("a publish after a terminal close rejects at once", async () => {
+	const server = await startServer({ verify: () => null });
 	const c = client(server.url, { sendTimeout: 10_000 });
 
 	try {
-		await assertRejects(() => c.connect(), WSTerminatedError);
-		assertEquals(c.connectionState, "terminated");
+		await rejection(() => c.connect(), WSTerminatedError);
+		assert.deepEqual(c.connectionState, "terminated");
 
 		// Nothing restarts from `terminated`, so buffering this frame would
 		// hand the caller a timeout 10s later instead of the actual reason.
 		const started = Date.now();
-		const error = await assertRejects(
+		const error = await rejection(
 			() => c.publish("chat", { n: 1 }),
 			WSTerminatedError,
 		);
-		assertEquals(error.code, 4001);
+		assert.deepEqual(error.code, 4001);
 		const elapsed = Date.now() - started;
 		assert(elapsed < 1_000, `waited ${elapsed}ms for an answer already known`);
 	} finally {
@@ -254,8 +252,8 @@ Deno.test("a publish after a terminal close rejects at once", async () => {
 	}
 });
 
-Deno.test("a payload that cannot be encoded rejects with the encoder's error", async () => {
-	const server = startServer();
+test("a payload that cannot be encoded rejects with the encoder's error", async () => {
+	const server = await startServer();
 	const c = client(server.url, { sendTimeout: 10_000 });
 
 	try {
@@ -266,10 +264,7 @@ Deno.test("a payload that cannot be encoded rejects with the encoder's error", a
 
 		// The frame never left, so no ack was ever requested — waiting for one
 		// would report a timeout and hide the real cause.
-		const error = await assertRejects(
-			() => c.publish("chat", { big: 10n }),
-			Error,
-		);
+		const error = await rejection(() => c.publish("chat", { big: 10n }), Error);
 		assert(
 			!(error instanceof WSTimeoutError),
 			`expected the encoder's error, got ${error.constructor.name}`,
@@ -278,18 +273,18 @@ Deno.test("a payload that cannot be encoded rejects with the encoder's error", a
 			/BigInt/i.test(error.message),
 			`message should name the culprit, got "${error.message}"`,
 		);
-		assertEquals(errors.length, 1, "still surfaces as an error event");
+		assert.deepEqual(errors.length, 1, "still surfaces as an error event");
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("detects a half-open connection via the pong deadline", async () => {
+test("detects a half-open connection via the pong deadline", async () => {
 	// The server completes the handshake and then answers nothing — no pong,
 	// no close frame. Without an application-level probe the client would sit
 	// here looking connected, forever.
-	const silent = startSilentServer();
+	const silent = await startSilentServer();
 	const c = client(silent.url, {
 		pingInterval: 80,
 		pongTimeout: 120,
@@ -305,7 +300,7 @@ Deno.test("detects a half-open connection via the pong deadline", async () => {
 		assert(c.connected, "handshake should succeed before going silent");
 
 		await until(() => closes.length >= 2, "half-open detected repeatedly", 6_000);
-		assertEquals(closes[0].code, 4008);
+		assert.deepEqual(closes[0].code, 4008);
 		assert(closes[0].willReconnect, "a dead socket must be retried");
 	} finally {
 		c.dispose();
@@ -313,8 +308,8 @@ Deno.test("detects a half-open connection via the pong deadline", async () => {
 	}
 });
 
-Deno.test("server reaps a connection that stops pinging", async () => {
-	const server = startServer({ idleTimeout: 400 });
+test("server reaps a connection that stops pinging", async () => {
+	const server = await startServer({ idleTimeout: 400 });
 	// pingInterval 0 makes this client a zombie by construction.
 	const c = client(server.url, { pingInterval: 0, reconnectDelay: 10_000 });
 
@@ -325,7 +320,7 @@ Deno.test("server reaps a connection that stops pinging", async () => {
 		await c.connect();
 		await until(() => closes.length >= 1, "server reaps the zombie", 5_000);
 
-		assertEquals(closes[0].code, 4008);
+		assert.deepEqual(closes[0].code, 4008);
 		assert(closes[0].willReconnect, "an idle reap is recoverable, not terminal");
 	} finally {
 		c.dispose();
@@ -333,8 +328,8 @@ Deno.test("server reaps a connection that stops pinging", async () => {
 	}
 });
 
-Deno.test("a local disconnect() emits close 4900, willReconnect false", async () => {
-	const server = startServer();
+test("a local disconnect() emits close 4900, willReconnect false", async () => {
+	const server = await startServer();
 	const c = client(server.url, { reconnectDelay: 30 });
 
 	try {
@@ -345,16 +340,20 @@ Deno.test("a local disconnect() emits close 4900, willReconnect false", async ()
 		await c.connect();
 		c.disconnect();
 
-		assertEquals(closes.length, 1, "a closed socket is one close event");
-		assertEquals(closes[0].code, 4900);
-		assertEquals(closes[0].willReconnect, false);
+		assert.deepEqual(closes.length, 1, "a closed socket is one close event");
+		assert.deepEqual(closes[0].code, 4900);
+		assert.deepEqual(closes[0].willReconnect, false);
 
 		c.disconnect();
-		assertEquals(closes.length, 1, "nothing to close while idle, nothing to report");
+		assert.deepEqual(
+			closes.length,
+			1,
+			"nothing to close while idle, nothing to report",
+		);
 
 		// The superseded socket's own onclose must not arrive late as a second one.
 		await sleep(150);
-		assertEquals(closes.length, 1);
+		assert.deepEqual(closes.length, 1);
 	} finally {
 		c.dispose();
 		await server.stop();
@@ -364,8 +363,10 @@ Deno.test("a local disconnect() emits close 4900, willReconnect false", async ()
 /** A logger that records every warning and error, for asserting there were none. */
 function recordingLogger(): { logger: Record<string, unknown>; lines: string[] } {
 	const lines: string[] = [];
-	const record = (level: string) => (...args: unknown[]) =>
-		lines.push(`${level}: ${args.map(String).join(" ")}`);
+	const record =
+		(level: string) =>
+		(...args: unknown[]) =>
+			lines.push(`${level}: ${args.map(String).join(" ")}`);
 	return {
 		logger: {
 			debug: () => {},
@@ -377,9 +378,9 @@ function recordingLogger(): { logger: Record<string, unknown>; lines: string[] }
 	};
 }
 
-Deno.test("reconnect: false — a lost connection ends idle, quietly, and connect() resumes it", async () => {
-	const port = freePort();
-	let server = startServer({}, port);
+test("reconnect: false — a lost connection ends idle, quietly, and connect() resumes it", async () => {
+	const port = await freePort();
+	let server = await startServer({}, port);
 	const { logger, lines } = recordingLogger();
 	const c = client(server.url, { reconnect: false, reconnectDelay: 30, logger });
 
@@ -397,18 +398,21 @@ Deno.test("reconnect: false — a lost connection ends idle, quietly, and connec
 
 		// The close is reported honestly — nothing is coming — and classified as
 		// neither a retry nor a failure.
-		assertEquals(closes.map((e) => [e.code, e.willReconnect]), [[1001, false]]);
-		assertEquals(reconnecting, [], "no retry may be scheduled");
-		assertEquals(terminated, [], "declining to retry is not a terminal failure");
+		assert.deepEqual(
+			closes.map((e) => [e.code, e.willReconnect]),
+			[[1001, false]],
+		);
+		assert.deepEqual(reconnecting, [], "no retry may be scheduled");
+		assert.deepEqual(terminated, [], "declining to retry is not a terminal failure");
 		await sleep(150);
-		assertEquals(c.connectionState, "idle");
-		assertEquals(c.dump().attempt, 0);
+		assert.deepEqual(c.connectionState, "idle");
+		assert.deepEqual(c.dump().attempt, 0);
 		// The whole point over `on("close", () => disconnect())`: no bogus
 		// "illegal state transition" warning, and no error-level line either.
-		assertEquals(lines, []);
+		assert.deepEqual(lines, []);
 
 		// Idle is resumable, like after disconnect(): the caller decides when.
-		server = startServer({}, port);
+		server = await startServer({}, port);
 		await c.connect();
 		assert(c.connected);
 	} finally {
@@ -417,25 +421,25 @@ Deno.test("reconnect: false — a lost connection ends idle, quietly, and connec
 	}
 });
 
-Deno.test("reconnect: false — a pending connect() rejects when the close is not retried", async () => {
+test("reconnect: false — a pending connect() rejects when the close is not retried", async () => {
 	// Nothing listens here. With retries the await would simply wait for the
 	// server; without them there is nothing to wait for, and it must say so.
-	const c = client(`ws://127.0.0.1:${freePort()}/ws`, { reconnect: false });
+	const c = client(`ws://127.0.0.1:${await freePort()}/ws`, { reconnect: false });
 
 	try {
-		const error = await assertRejects(() => c.connect(), WSTerminatedError);
-		// The code of a refused connection is the runtime's to report (Deno
-		// says 0, browsers 1006); what matters is that it is not a retry.
+		const error = await rejection(() => c.connect(), WSTerminatedError);
+		// The code of a refused connection is the runtime's to report (Node and
+		// browsers say 1006, Deno 0); what matters is that it is not a retry.
 		assert(typeof error.code === "number");
-		assertEquals(c.connectionState, "idle", "declined, not terminated");
+		assert.deepEqual(c.connectionState, "idle", "declined, not terminated");
 	} finally {
 		c.dispose();
 	}
 });
 
-Deno.test("a reconnect function sees code, reason and attempt, and its verdict is honoured", async () => {
-	const port = freePort();
-	const server = startServer({}, port);
+test("a reconnect function sees code, reason and attempt, and its verdict is honoured", async () => {
+	const port = await freePort();
+	const server = await startServer({}, port);
 	const seen: Array<{ code: number; attempt: number }> = [];
 	const c = client(server.url, {
 		reconnectDelay: 30,
@@ -455,18 +459,18 @@ Deno.test("a reconnect function sees code, reason and attempt, and its verdict i
 		// First close: the working connection went away, no attempts failed yet,
 		// so the policy allows one retry. That retry finds nobody listening, and
 		// the policy, now at attempt 1, declines. (The code of the refused
-		// connection is the runtime's: Deno reports 0, browsers 1006.)
-		assertEquals(seen.length, 2);
-		assertEquals(seen[0], { code: 1001, attempt: 0 });
-		assertEquals(seen[1].attempt, 1);
+		// connection is the runtime's: Node and browsers report 1006, Deno 0.)
+		assert.deepEqual(seen.length, 2);
+		assert.deepEqual(seen[0], { code: 1001, attempt: 0 });
+		assert.deepEqual(seen[1].attempt, 1);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("the reconnect policy is not consulted for a terminal close", async () => {
-	const server = startServer({ verify: () => null });
+test("the reconnect policy is not consulted for a terminal close", async () => {
+	const server = await startServer({ verify: () => null });
 	let consulted = 0;
 	const c = client(server.url, {
 		reconnect: () => {
@@ -478,18 +482,18 @@ Deno.test("the reconnect policy is not consulted for a terminal close", async ()
 	try {
 		// `terminalCloseCodes` decides first; a policy cannot talk the client
 		// into retrying rejected credentials.
-		const error = await assertRejects(() => c.connect(), WSTerminatedError);
-		assertEquals(error.code, 4001);
-		assertEquals(c.connectionState, "terminated");
-		assertEquals(consulted, 0);
+		const error = await rejection(() => c.connect(), WSTerminatedError);
+		assert.deepEqual(error.code, 4001);
+		assert.deepEqual(c.connectionState, "terminated");
+		assert.deepEqual(consulted, 0);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("a stale auth() rejection leaves the newer socket alone", async () => {
-	const server = startServer();
+test("a stale auth() rejection leaves the newer socket alone", async () => {
+	const server = await startServer();
 	let attempt = 0;
 	const c = client(server.url, {
 		reconnectDelay: 30,
@@ -524,18 +528,18 @@ Deno.test("a stale auth() rejection leaves the newer socket alone", async () => 
 
 		// The stale auth() rejects in here, two generations too late.
 		await sleep(400);
-		assertEquals(c.connectionState, "open", "the newer socket survived");
-		assertEquals(closes, [4900], "only the disconnect() closed anything");
-		assertEquals(errors, [], "a superseded attempt is not the caller's problem");
+		assert.deepEqual(c.connectionState, "open", "the newer socket survived");
+		assert.deepEqual(closes, [4900], "only the disconnect() closed anything");
+		assert.deepEqual(errors, [], "a superseded attempt is not the caller's problem");
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("outbox overflow drops the oldest and rejects it", async () => {
+test("outbox overflow drops the oldest and rejects it", async () => {
 	// Nothing is listening here, so everything queues.
-	const unreachable = `ws://127.0.0.1:${freePort()}/ws`;
+	const unreachable = `ws://127.0.0.1:${await freePort()}/ws`;
 	const dropped: ClientFrame[] = [];
 	const c = client(unreachable, {
 		autoConnect: false,
@@ -549,34 +553,31 @@ Deno.test("outbox overflow drops the oldest and rejects it", async () => {
 		const second = c.publish("chat", { n: 2 });
 		const third = c.publish("chat", { n: 3 });
 
-		await assertRejects(() => first, WSOutboxDropError);
-		assertEquals(dropped.length, 1);
-		assertEquals((dropped[0] as { payload: unknown }).payload, { n: 1 });
+		await rejection(() => first, WSOutboxDropError);
+		assert.deepEqual(dropped.length, 1);
+		assert.deepEqual((dropped[0] as { payload: unknown }).payload, { n: 1 });
 
 		// The survivors settle on dispose rather than pending to their timeout.
 		c.dispose();
-		await assertRejects(() => second, WSDisposedError);
-		await assertRejects(() => third, WSDisposedError);
+		await rejection(() => second, WSDisposedError);
+		await rejection(() => third, WSDisposedError);
 	} finally {
 		c.dispose();
 	}
 });
 
-Deno.test("outboxMaxSize 0 rejects immediately instead of buffering", async () => {
-	const unreachable = `ws://127.0.0.1:${freePort()}/ws`;
+test("outboxMaxSize 0 rejects immediately instead of buffering", async () => {
+	const unreachable = `ws://127.0.0.1:${await freePort()}/ws`;
 	const c = client(unreachable, { autoConnect: false, outboxMaxSize: 0 });
 	try {
-		await assertRejects(
-			() => c.publish("chat", { n: 1 }),
-			WSNotConnectedError,
-		);
+		await rejection(() => c.publish("chat", { n: 1 }), WSNotConnectedError);
 	} finally {
 		c.dispose();
 	}
 });
 
-Deno.test("connectTimeout bounds the await but not the retrying", async () => {
-	const unreachable = `ws://127.0.0.1:${freePort()}/ws`;
+test("connectTimeout bounds the await but not the retrying", async () => {
+	const unreachable = `ws://127.0.0.1:${await freePort()}/ws`;
 	const c = client(unreachable, {
 		connectTimeout: 200,
 		reconnectDelay: 40,
@@ -584,20 +585,20 @@ Deno.test("connectTimeout bounds the await but not the retrying", async () => {
 	});
 
 	try {
-		await assertRejects(() => c.connect(), WSConnectTimeoutError);
+		await rejection(() => c.connect(), WSConnectTimeoutError);
 		// Rejecting the await must not stop the machine.
 		assert(
 			["connecting", "reconnecting"].includes(c.connectionState),
 			`still trying, got "${c.connectionState}"`,
 		);
-		await until(() => c.dump().attempt as number > 1, "attempts keep climbing");
+		await until(() => (c.dump().attempt as number) > 1, "attempts keep climbing");
 	} finally {
 		c.dispose();
 	}
 });
 
-Deno.test("disconnect() is resumable — handlers and rooms survive", async () => {
-	const server = startServer();
+test("disconnect() is resumable — handlers and rooms survive", async () => {
+	const server = await startServer();
 	const c = client(server.url, { reconnectDelay: 30 });
 
 	try {
@@ -606,11 +607,11 @@ Deno.test("disconnect() is resumable — handlers and rooms survive", async () =
 		await c.subscribe("chat", (m) => seen.push(m));
 
 		c.disconnect();
-		assertEquals(c.connected, false);
+		assert.deepEqual(c.connected, false);
 		// This is the SSEClient behaviour we deliberately did not copy: there,
 		// disconnect() removed every listener and a later connect() delivered
 		// to nobody.
-		assertEquals(c.rooms, ["chat"]);
+		assert.deepEqual(c.rooms, ["chat"]);
 
 		await c.connect();
 		await until(
@@ -626,8 +627,8 @@ Deno.test("disconnect() is resumable — handlers and rooms survive", async () =
 	}
 });
 
-Deno.test("unsub() then dispose() leaves no uncaught rejection", async () => {
-	const server = startServer();
+test("unsub() then dispose() leaves no uncaught rejection", async () => {
+	const server = await startServer();
 	const c = client(server.url);
 
 	try {
@@ -642,24 +643,20 @@ Deno.test("unsub() then dispose() leaves no uncaught rejection", async () => {
 
 		// A checkpoint at which the runtime would report the rejection.
 		await sleep(50);
-		assertEquals(c.rooms, []);
+		assert.deepEqual(c.rooms, []);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("connect() is idempotent and shares one promise", async () => {
-	const server = startServer();
+test("connect() is idempotent and shares one promise", async () => {
+	const server = await startServer();
 	const c = client(server.url);
 
 	try {
-		const [a, b, d] = await Promise.all([
-			c.connect(),
-			c.connect(),
-			c.connect(),
-		]);
-		assertEquals([a, b, d], [undefined, undefined, undefined]);
+		const [a, b, d] = await Promise.all([c.connect(), c.connect(), c.connect()]);
+		assert.deepEqual([a, b, d], [undefined, undefined, undefined]);
 		assert(c.connected);
 		// Already connected: resolves immediately rather than reconnecting.
 		await c.connect();
@@ -670,8 +667,8 @@ Deno.test("connect() is idempotent and shares one promise", async () => {
 	}
 });
 
-Deno.test("a replaced connection does not evict its replacement", async () => {
-	const server = startServer();
+test("a replaced connection does not evict its replacement", async () => {
+	const server = await startServer();
 	const first = client(server.url, { clientId: "same-id" });
 	const second = client(server.url, { clientId: "same-id" });
 
@@ -697,8 +694,8 @@ Deno.test("a replaced connection does not evict its replacement", async () => {
 	}
 });
 
-Deno.test("state store emits immediately and on every change", async () => {
-	const server = startServer();
+test("state store emits immediately and on every change", async () => {
+	const server = await startServer();
 	const c = client(server.url);
 
 	try {
@@ -706,7 +703,7 @@ Deno.test("state store emits immediately and on every change", async () => {
 		const unsub = c.state.subscribe((s) => states.push(s.state));
 
 		// Svelte store contract: fires synchronously with the current value.
-		assertEquals(states, ["idle"]);
+		assert.deepEqual(states, ["idle"]);
 
 		await c.connect();
 		assert(states.includes("connecting"));
@@ -715,15 +712,15 @@ Deno.test("state store emits immediately and on every change", async () => {
 		unsub();
 		const count = states.length;
 		c.disconnect();
-		assertEquals(states.length, count, "unsubscribed observer still notified");
+		assert.deepEqual(states.length, count, "unsubscribed observer still notified");
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("a replaced connection ends terminated with 4005 and does not fight back", async () => {
-	const server = startServer();
+test("a replaced connection ends terminated with 4005 and does not fight back", async () => {
+	const server = await startServer();
 	// Short backoff: were the loser to reconnect, it would do so many times
 	// within the window below, and the survivor would not survive.
 	const first = client(server.url, {
@@ -740,32 +737,32 @@ Deno.test("a replaced connection ends terminated with 4005 and does not fight ba
 	try {
 		await first.connect();
 		const closed = new Promise<{ code: number; willReconnect: boolean }>((r) =>
-			first.once("close", r)
+			first.once("close", r),
 		);
 		const terminated = new Promise<{ code: number }>((r) =>
-			first.once("terminated", r)
+			first.once("terminated", r),
 		);
 
 		await second.connect();
 
 		const ev = await closed;
-		assertEquals(ev.code, CLOSE.REPLACED);
-		assertEquals(ev.willReconnect, false);
-		assertEquals((await terminated).code, CLOSE.REPLACED);
-		assertEquals(first.connectionState, "terminated");
+		assert.deepEqual(ev.code, CLOSE.REPLACED);
+		assert.deepEqual(ev.willReconnect, false);
+		assert.deepEqual((await terminated).code, CLOSE.REPLACED);
+		assert.deepEqual(first.connectionState, "terminated");
 
 		// Several backoff periods later, the newcomer is still the one
 		// connection — the loser did not come back to evict it.
 		await sleep(250);
 		assert(second.connected, "the newcomer keeps its connection");
-		assertEquals(server.service.stats().connections, 1);
-		assertEquals(first.connectionState, "terminated");
+		assert.deepEqual(server.service.stats().connections, 1);
+		assert.deepEqual(first.connectionState, "terminated");
 
 		// A later, explicit connect() is still allowed — the user may know
 		// the other tab is gone — and evicts the other side in turn.
 		await first.connect();
 		await until(() => second.connectionState === "terminated", "roles swap");
-		assertEquals(server.service.stats().connections, 1);
+		assert.deepEqual(server.service.stats().connections, 1);
 	} finally {
 		first.dispose();
 		second.dispose();
@@ -773,8 +770,8 @@ Deno.test("a replaced connection ends terminated with 4005 and does not fight ba
 	}
 });
 
-Deno.test("a send from a connected handler or a state subscriber lands after the re-subscribe", async () => {
-	const server = startServer();
+test("a send from a connected handler or a state subscriber lands after the re-subscribe", async () => {
+	const server = await startServer();
 	const c = client(server.url, { autoConnect: false });
 
 	try {
@@ -784,9 +781,9 @@ Deno.test("a send from a connected handler or a state subscriber lands after the
 
 		let fromHandler = -1;
 		c.on("connected", () => {
-			c.publish("chat", { via: "handler" }).then((
-				r,
-			) => (fromHandler = r.recipients));
+			c.publish("chat", { via: "handler" }).then(
+				(r) => (fromHandler = r.recipients),
+			);
 		});
 		let fromStore = -1;
 		let armed = true;
@@ -801,8 +798,8 @@ Deno.test("a send from a connected handler or a state subscriber lands after the
 
 		// Had either gone out before the `sub`, the server would have had no
 		// subscriber to hand it to — and the client would miss its own echo.
-		assertEquals(fromHandler, 1);
-		assertEquals(fromStore, 1);
+		assert.deepEqual(fromHandler, 1);
+		assert.deepEqual(fromStore, 1);
 		await until(() => seen.length === 2, "both echoes");
 	} finally {
 		c.dispose();
@@ -810,8 +807,8 @@ Deno.test("a send from a connected handler or a state subscriber lands after the
 	}
 });
 
-Deno.test("a throwing event handler is reported as `error`, and a throwing `error` handler does not recurse", async () => {
-	const server = startServer();
+test("a throwing event handler is reported as `error`, and a throwing `error` handler does not recurse", async () => {
+	const server = await startServer();
 	const c = client(server.url);
 
 	try {
@@ -825,18 +822,21 @@ Deno.test("a throwing event handler is reported as `error`, and a throwing `erro
 		});
 
 		await c.connect();
-		assertEquals(errors.map((e) => e.message), ["boom"]);
+		assert.deepEqual(
+			errors.map((e) => e.message),
+			["boom"],
+		);
 		// The throw cost the handler, not the connection.
 		assert(c.connected);
-		assertEquals(await c.publish("x", 1), { recipients: 0 });
+		assert.deepEqual(await c.publish("x", 1), { recipients: 0 });
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("a malformed nack or error frame costs that frame, not the process", async () => {
-	const server = startBadNackServer();
+test("a malformed nack or error frame costs that frame, not the process", async () => {
+	const server = await startBadNackServer();
 	const c = client(server.url, { sendTimeout: 2_000 });
 
 	try {
@@ -845,11 +845,11 @@ Deno.test("a malformed nack or error frame costs that frame, not the process", a
 
 		// `nack` without `error`: the send still gets an answer — a rejection
 		// with a usable WSRemoteError — instead of a throw out of `onmessage`.
-		const err = await assertRejects(
+		const err = await rejection(
 			() => c.send({ op: "x" }, { ack: true }),
 			WSRemoteError,
 		);
-		assertEquals(err.code, "unknown");
+		assert.deepEqual(err.code, "unknown");
 		assert(c.connected);
 
 		// `error` without `error`: an `error` event, and the connection stays.

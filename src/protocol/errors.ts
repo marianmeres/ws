@@ -34,19 +34,21 @@ export class WSError extends Error {
  * it is logged at error level and rejects any pending `connect()`.
  */
 export class WSTerminatedError extends WSError {
+	/** WebSocket close code that caused the termination. */
+	readonly code: number;
+	/** Close reason as sent by the peer. May be an empty string. */
+	readonly reason: string;
+
 	/**
 	 * Built from the close event that ended the connection.
 	 *
 	 * @param code - the close code that ended it
 	 * @param reason - the close reason, possibly empty
 	 */
-	constructor(
-		/** WebSocket close code that caused the termination. */
-		readonly code: number,
-		/** Close reason as sent by the peer. May be an empty string. */
-		readonly reason: string,
-	) {
+	constructor(code: number, reason: string) {
 		super(`Connection terminated (${code})${reason ? `: ${reason}` : ""}`);
+		this.code = code;
+		this.reason = reason;
 	}
 }
 

@@ -1,13 +1,16 @@
 # Reference implementation — a realtime room chat
 
 A complete, standalone app built on `@marianmeres/ws`: a
-[demino](https://jsr.io/@marianmeres/demino) server and a plain HTML client
-written with [`@marianmeres/vanilla`](https://jsr.io/@marianmeres/vanilla) and
-bundled by [`@marianmeres/deno-build`](https://jsr.io/@marianmeres/deno-build).
-Styling is [`@marianmeres/design-tokens`](https://jsr.io/@marianmeres/design-tokens)
+[demino](https://www.npmjs.com/package/@marianmeres/demino) server on Node and a
+plain HTML client written with
+[`@marianmeres/vanilla`](https://www.npmjs.com/package/@marianmeres/vanilla) and
+bundled by [`@marianmeres/bundle`](https://www.npmjs.com/package/@marianmeres/bundle).
+Styling is
+[`@marianmeres/design-tokens`](https://www.npmjs.com/package/@marianmeres/design-tokens)
 with the Bootstrap Reboot bridge, and the controls come from
-[`@marianmeres/vanilla-ui`](https://jsr.io/@marianmeres/vanilla-ui)'s base style
-layer — minimal, but every colour is a token and no button is hand-rolled.
+[`@marianmeres/vanilla-ui`](https://www.npmjs.com/package/@marianmeres/vanilla-ui)'s
+base style layer — minimal, but every colour is a token and no button is
+hand-rolled.
 
 It is a showcase of the **rooms** side of the client. The other way to use it —
 a plain message channel between client and server (`send()` on the client,
@@ -15,7 +18,8 @@ a plain message channel between client and server (`send()` on the client,
 [main README](../README.md#1-messages--a-data-channel-to-your-server).
 
 ```bash
-deno task example        # builds the client bundle, then serves on :8000
+pnpm install
+pnpm run example         # builds the client bundle, then serves on :8000
 ```
 
 Open <http://localhost:8000> in two windows with **two different nicknames**.
@@ -39,7 +43,8 @@ Open <http://localhost:8000> in two windows with **two different nicknames**.
 
 ```
 example/
-├── server.ts          three demino apps: /ws (createWSApp), /api, / (static)
+├── server.ts          three demino apps: /ws (createWSApp), /api, / (static),
+│                      served by @marianmeres/demino/node (upgrades via `ws`)
 ├── history.ts         WSPubSubAdapter decorator → in-memory chat history
 ├── shared.ts          the APPLICATION protocol — what goes inside `payload`
 ├── build-styles.ts    regenerates public/theme.css and public/vui-base.css
@@ -53,20 +58,21 @@ example/
     │                  layer(reset) so it sits under the kit, not over it
     ├── theme.css      generated — design tokens (prefix "vui-") + --bs-* bridge
     ├── vui-base.css   generated — @marianmeres/vanilla-ui's components/base.css
-    └── dist/bundle.js generated — deno task example:build
+    └── dist/bundle.js generated — pnpm run example:build
 ```
 
 ## Tasks
 
-| Task                       | What                                                   |
-| -------------------------- | ------------------------------------------------------ |
-| `deno task example`        | build the bundle, then serve                           |
-| `deno task example:build`  | bundle `client/mod.ts` → `public/dist/bundle.js`       |
-| `deno task example:watch`  | same, rebuilding on change (run the server separately) |
-| `deno task example:styles` | regenerate `theme.css` + `vui-base.css`                |
+| Task                      | What                                                   |
+| ------------------------- | ------------------------------------------------------ |
+| `pnpm run example`        | build the bundle, then serve                           |
+| `pnpm run example:build`  | bundle `client/mod.ts` → `public/dist/bundle.js`       |
+| `pnpm run example:watch`  | same, rebuilding on change (run the server separately) |
+| `pnpm run example:styles` | regenerate `theme.css` + `vui-base.css`                |
 
 `PORT` and `WS_EXAMPLE_TOKEN` are read from the environment (defaults `8000`
-and `dev-secret`).
+and `dev-secret`), or from a `.env` file in the repo root, which
+`pnpm run example` loads when present.
 
 ## Things worth trying
 
@@ -127,14 +133,15 @@ using an id it put in the payload itself.
 
 **`history.ts` uses the adapter seam.** `WSService` hands every publish and
 broadcast to `adapter.publish(envelope)` after local delivery — the one place
-all traffic converges. A real deployment puts Redis or Deno KV there; here a
+all traffic converges. A real deployment puts Redis or Postgres there; here a
 decorator records chat lines and delegates the rest. Broadcasts (`namespace:
 null`) belong to no single room and are deliberately not stored.
 
 **The controls are not this example's.** Buttons, inputs, the field stack, the
 badge, the switch, the alert and the focus ring all come from
-[`@marianmeres/vanilla-ui`](https://jsr.io/@marianmeres/vanilla-ui)'s base style
-layer, copied verbatim to `public/vui-base.css` by `build-styles.ts`. The whole
+[`@marianmeres/vanilla-ui`](https://www.npmjs.com/package/@marianmeres/vanilla-ui)'s
+base style layer, copied verbatim from the installed package to
+`public/vui-base.css` by `build-styles.ts`. The whole
 integration is the token prefix: the layer reads `--vui-color-*`, and that is
 what `generateThemedCss(schema, "vui-")` writes — so one theme file feeds the
 kit, this example's own `app.css` (through the layer's `--vui-surface`-style

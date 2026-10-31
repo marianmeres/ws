@@ -9,7 +9,7 @@
  * message passes through: `WSService` calls `adapter.publish(envelope)` after
  * local delivery for *every* publish and broadcast, whoever originated it —
  * a connected client, `service.publish()`, or the HTTP injection route. A real
- * deployment would put Redis or Deno KV here; we tee into a ring buffer and
+ * deployment would put Redis or Postgres here; we tee into a ring buffer and
  * delegate the actual (non-)propagation to the wrapped adapter.
  *
  * Note this is application code inspecting an application payload. The library
@@ -18,12 +18,12 @@
  * @module
  */
 
+import type { WSRoomMessage } from "../src/protocol.ts";
 import {
 	type WSBroadcastEnvelope,
 	type WSPubSubAdapter,
 	WSPubSubLocal,
 } from "../src/server.ts";
-import type { WSRoomMessage } from "../src/protocol.ts";
 import { HISTORY_LIMIT, isChatPayload } from "./shared.ts";
 
 /** Composite key for the buffer map. `|` cannot appear in a validated namespace. */

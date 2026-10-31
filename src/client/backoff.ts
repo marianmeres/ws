@@ -31,7 +31,7 @@ export function backoffDelay(
 ): number {
 	const n = Math.max(1, Math.floor(attempt));
 	// 2^n overflows to Infinity well before it matters; Math.min handles it.
-	const full = Math.min(max, base * Math.pow(2, n - 1));
+	const full = Math.min(max, base * 2 ** (n - 1));
 	const half = full / 2;
 	return Math.round(half + rnd() * half);
 }

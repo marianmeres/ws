@@ -4,9 +4,9 @@
 /**
  * Client entry point — the views, and nothing else.
  *
- * Bundled to `public/dist/bundle.js` by `@marianmeres/deno-build`:
+ * Bundled to `public/dist/bundle.js` by `@marianmeres/bundle`:
  * ```
- * deno task example:build     # or example:watch
+ * pnpm run example:build      # or example:watch
  * ```
  *
  * Two views swap in `#app`: a login form, then the chat. All state lives in
@@ -47,8 +47,8 @@ import {
 	ROOMS,
 	WORKSPACE_RE,
 } from "../shared.ts";
-import { type ChatStore, createChatStore, type Entry, nickOf } from "./store.ts";
 import type { Session } from "./store.ts";
+import { type ChatStore, createChatStore, type Entry, nickOf } from "./store.ts";
 
 const SESSION_KEY = "ws-chat-session";
 const root = document.getElementById("app")!;
@@ -81,7 +81,8 @@ function createLogin({ initial, error, onSubmit }: LoginProps): ViewInstance {
 				submit: (e: Event) => {
 					e.preventDefault();
 					const nick = (r.nick as HTMLInputElement).value.trim();
-					const workspace = (r.workspace as HTMLInputElement).value.trim() ||
+					const workspace =
+						(r.workspace as HTMLInputElement).value.trim() ||
 						DEFAULT_WORKSPACE;
 
 					// The same rules the server enforces in `verify`. Checking
@@ -183,8 +184,8 @@ function createChat({ store, onLeave }: ChatProps): ViewInstance {
 				r.status.textContent = connected
 					? "connected"
 					: attempt > 0
-					? `reconnecting… (attempt ${attempt})`
-					: state;
+						? `reconnecting… (attempt ${attempt})`
+						: state;
 				r.status.title = lastError?.message ?? "";
 				// Sending while offline is legal — the outbox buffers it — so
 				// the composer deliberately stays enabled.
@@ -199,16 +200,14 @@ function createChat({ store, onLeave }: ChatProps): ViewInstance {
 				const busy = store.joining.get();
 				r.roomName.textContent = `#${current}`;
 				el.querySelectorAll<HTMLButtonElement>("[data-room]").forEach((b) => {
-					b.setAttribute(
-						"aria-pressed",
-						String(b.dataset.room === current),
-					);
+					b.setAttribute("aria-pressed", String(b.dataset.room === current));
 					b.disabled = busy;
 				});
 				// The broadcast gate is server-side; this is only a hint.
-				r.broadcastHint.textContent = current === BROADCAST_ROOM
-					? "allowed here"
-					: `denied outside #${BROADCAST_ROOM}`;
+				r.broadcastHint.textContent =
+					current === BROADCAST_ROOM
+						? "allowed here"
+						: `denied outside #${BROADCAST_ROOM}`;
 			}),
 		);
 
@@ -217,8 +216,8 @@ function createChat({ store, onLeave }: ChatProps): ViewInstance {
 		// size — no diffing, no keys, no surprises.
 		track(
 			store.entries.subscribe((list) => {
-				const atBottom = r.log.scrollHeight - r.log.scrollTop -
-						r.log.clientHeight < 40;
+				const atBottom =
+					r.log.scrollHeight - r.log.scrollTop - r.log.clientHeight < 40;
 				r.log.replaceChildren(...list.map(renderEntry));
 				r.empty.hidden = list.length > 0;
 				if (atBottom) r.log.scrollTop = r.log.scrollHeight;
@@ -247,12 +246,14 @@ function createChat({ store, onLeave }: ChatProps): ViewInstance {
 
 		track(
 			store.members.subscribe((ids) => {
-				r.members.replaceChildren(...ids.map((id) => {
-					const li = fromTemplate<HTMLLIElement>("tpl-member");
-					li.classList.toggle("own", id === store.ws.clientId);
-					applyBindings(li, { nick: nickOf(id), id, title: id });
-					return li;
-				}));
+				r.members.replaceChildren(
+					...ids.map((id) => {
+						const li = fromTemplate<HTMLLIElement>("tpl-member");
+						li.classList.toggle("own", id === store.ws.clientId);
+						applyBindings(li, { nick: nickOf(id), id, title: id });
+						return li;
+					}),
+				);
 			}),
 		);
 		track(
@@ -264,11 +265,12 @@ function createChat({ store, onLeave }: ChatProps): ViewInstance {
 		/* --- typing indicator -------------------------------------------- */
 		track(
 			store.typing.subscribe((nicks) => {
-				r.typing.textContent = nicks.length === 0
-					? ""
-					: nicks.length === 1
-					? `${nicks[0]} is typing…`
-					: `${nicks.slice(0, 3).join(", ")} are typing…`;
+				r.typing.textContent =
+					nicks.length === 0
+						? ""
+						: nicks.length === 1
+							? `${nicks[0]} is typing…`
+							: `${nicks.slice(0, 3).join(", ")} are typing…`;
 			}),
 		);
 
@@ -301,7 +303,9 @@ function loadSession(): Session {
 		if (saved && typeof saved.nick === "string") {
 			return { nick: saved.nick, workspace: saved.workspace || DEFAULT_WORKSPACE };
 		}
-	} catch { /* ignore */ }
+	} catch {
+		/* ignore */
+	}
 	return { nick: "", workspace: DEFAULT_WORKSPACE };
 }
 
@@ -313,7 +317,9 @@ function showLogin(error = ""): void {
 function startChat(session: Session): void {
 	try {
 		localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-	} catch { /* ignore */ }
+	} catch {
+		/* ignore */
+	}
 
 	store = createChatStore(session, (reason) => {
 		// Terminal close — the client gave up on purpose and will not retry, so
@@ -322,13 +328,15 @@ function startChat(session: Session): void {
 		showLogin(`Server refused the connection: ${reason}`);
 	});
 
-	show(createChat({
-		store,
-		onLeave: () => {
-			store?.leave();
-			showLogin();
-		},
-	}));
+	show(
+		createChat({
+			store,
+			onLeave: () => {
+				store?.leave();
+				showLogin();
+			},
+		}),
+	);
 }
 
 showLogin();

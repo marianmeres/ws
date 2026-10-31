@@ -1,23 +1,24 @@
 /**
- * Smoke-tests the built npm package (`deno task npm:smoke`, or
- * `node scripts/smoke-npm.mjs` after `deno task npm:build`).
+ * Smoke-tests the built npm package (`pnpm run smoke`, or
+ * `node scripts/smoke-npm.mjs` after `pnpm run build`).
  *
- * In a throw-away project under the OS temp dir it runs
- * `npm install --install-links <.npm-dist>` - a packed copy, as a consumer
- * gets it, not a symlink into this repo - alone first, then
- * `@marianmeres/demino` (the range of the package's optional peer) and `ws`
- * (the range demino's Node adapter declares as its optional peer), and then,
- * on Node, inside that project:
+ * `pnpm pack`s the repo root - the tarball `pnpm publish` would upload - and in
+ * a throw-away project under the OS temp dir installs it with npm, as a
+ * consumer gets it, then on Node:
  *
- *  - checks the installed package.json: the three `exports` keys, the runtime
- *    dependencies, `@marianmeres/demino` an optional peer and neither it nor
- *    `ws` a dependency, `engines.node`; and that the client-only install left
- *    demino out;
- *  - imports every subpath;
- *  - `createWSApp()` served through `@marianmeres/demino/node`, driven by the
- *    package's own client: authenticates, echoes through `onMessage`, shuts
- *    down. Node has no `Deno.upgradeWebSocket`, so a connect proves the
- *    upgrade came from the adapter's `info.upgradeWebSocket`.
+ *  1. checks the installed package.json (the three `exports` keys and their
+ *     files, the runtime dependencies, `@marianmeres/demino` an optional peer
+ *     and neither it nor `ws` a dependency, `engines.node`) and that the
+ *     tarball carries `dist/` and none of the repo-only directories;
+ *  2. **without demino installed**, imports `.` and `./protocol` - the
+ *     client-only install the optional peer exists for;
+ *  3. installs demino (the range of the package's optional peer) and `ws` (the
+ *     range demino's Node adapter declares as its optional peer), then imports
+ *     every subpath and serves `createWSApp()` through
+ *     `@marianmeres/demino/node`, driven by the package's own client:
+ *     authenticates, echoes through `onMessage`, shuts down. Node has no
+ *     `Deno.upgradeWebSocket`, so a connect proves the upgrade came from the
+ *     adapter's `info.upgradeWebSocket`.
  *
  * Repo tool, Node only (nothing here is shipped).
  */
@@ -25,8 +26,9 @@
 import { execFileSync } from "node:child_process";
 import {
 	existsSync,
-	lstatSync,
+	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
@@ -36,11 +38,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const DIST = join(ROOT, ".npm-dist");
 const PKG = "@marianmeres/ws";
 const DEMINO = "@marianmeres/demino";
 
 const EXPECTED_EXPORTS = [".", "./protocol", "./server"];
+/** Repo directories the published tarball must not carry. */
+const REPO_ONLY = ["src", "tests", "scripts", "tmp", "example", "node_modules"];
 const EXPECTED_DEPENDENCIES = [
 	"@marianmeres/clog",
 	"@marianmeres/pubsub",
@@ -48,8 +51,19 @@ const EXPECTED_DEPENDENCIES = [
 	"@marianmeres/uid",
 ];
 
-/** Runs inside the temp project, where the bare specifiers resolve. */
-const CONSUMER = `
+/** Step 2: runs before demino is installed. */
+const CLIENT_ONLY = `
+import assert from "node:assert/strict";
+import { createWSClient } from "${PKG}";
+import { PROTOCOL_VERSION } from "${PKG}/protocol";
+
+assert.equal(typeof createWSClient, "function", "createWSClient");
+assert.equal(typeof PROTOCOL_VERSION, "number", "PROTOCOL_VERSION");
+console.log("smoke: . and ./protocol import without demino");
+`;
+
+/** Step 3: runs after demino and ws are installed. */
+const ROUND_TRIP = `
 import assert from "node:assert/strict";
 import { createWSClient } from "${PKG}";
 import * as protocol from "${PKG}/protocol";
@@ -119,11 +133,11 @@ function checkInstalledManifest(dir) {
 	check(pkg.name === PKG, `installed package is "${pkg.name}", expected "${PKG}"`);
 	const exportKeys = Object.keys(pkg.exports ?? {}).sort();
 	check(
-		JSON.stringify(exportKeys) === JSON.stringify([...EXPECTED_EXPORTS].sort()),
+		JSON.stringify(exportKeys) === JSON.stringify(EXPECTED_EXPORTS),
 		`exports keys are ${JSON.stringify(exportKeys)}`,
 	);
 	for (const [key, entry] of Object.entries(pkg.exports)) {
-		for (const kind of ["types", "import"]) {
+		for (const kind of ["types", "default"]) {
 			check(
 				typeof entry[kind] === "string" && existsSync(join(dir, entry[kind])),
 				`exports["${key}"].${kind} does not exist: ${entry?.[kind]}`,
@@ -139,39 +153,30 @@ function checkInstalledManifest(dir) {
 			`"${name}" must not be a runtime dependency`,
 		);
 	}
+	check(typeof pkg.peerDependencies?.[DEMINO] === "string", `${DEMINO} is not a peer`);
 	check(
-		typeof pkg.peerDependencies?.[DEMINO] === "string" &&
-			pkg.peerDependenciesMeta?.[DEMINO]?.optional === true,
-		`${DEMINO} must be an optional peer`,
+		pkg.peerDependenciesMeta?.[DEMINO]?.optional === true,
+		`${DEMINO} peer is not optional`,
 	);
 	check(typeof pkg.engines?.node === "string", "engines.node missing");
-	const peer = `${DEMINO} ${pkg.peerDependencies[DEMINO]} (optional peer)`;
+	for (const name of REPO_ONLY) {
+		check(!existsSync(join(dir, name)), `the tarball carries "${name}/"`);
+	}
 	console.log(
-		`smoke: ${pkg.name}@${pkg.version} - exports ${exportKeys.length}/${EXPECTED_EXPORTS.length}, ` +
-			`${peer}, engines.node ${pkg.engines.node}`,
+		`smoke: ${pkg.name}@${pkg.version} - exports ${exportKeys.length}, ` +
+			`peer ${DEMINO} ${pkg.peerDependencies[DEMINO]} (optional), ` +
+			`engines.node ${pkg.engines.node}`,
 	);
+	return pkg.peerDependencies[DEMINO];
 }
 
 check(
-	existsSync(join(DIST, "package.json")),
-	`${DIST} has no package.json - run \`deno task npm:build\` first`,
-);
-const deminoRange = readManifest(DIST).peerDependencies?.[DEMINO];
-check(
-	typeof deminoRange === "string",
-	`${DIST}/package.json declares no ${DEMINO} peer`,
+	existsSync(join(ROOT, "dist", "mod.js")),
+	"dist/mod.js is missing - run `pnpm run build` first",
 );
 
-// `--install-links` on every install: without it a later `npm install` re-links
-// the `file:` dependency, and the consumer would run against `.npm-dist/`
-// (and its node_modules) instead of the packed copy
-const npmInstall = [
-	"install",
-	"--install-links",
-	"--no-audit",
-	"--no-fund",
-	"--loglevel=error",
-];
+const npmInstall = ["install", "--no-audit", "--no-fund", "--loglevel=error"];
+
 const project = mkdtempSync(join(tmpdir(), "ws-npm-smoke-"));
 try {
 	writeFileSync(
@@ -182,35 +187,30 @@ try {
 			"\t",
 		),
 	);
+	const packDir = join(project, "pack");
+	mkdirSync(packDir);
+	run("pnpm", ["pack", "--pack-destination", packDir], ROOT);
+	const tarballs = readdirSync(packDir).filter((f) => f.endsWith(".tgz"));
+	check(tarballs.length === 1, `expected one tarball, got ${JSON.stringify(tarballs)}`);
+
 	// the package alone, as a client-only consumer installs it: an optional
 	// peer is not installed, so no demino may appear
-	run("npm", [...npmInstall, DIST], project);
-	checkInstalledManifest(join(project, "node_modules", PKG));
-	check(
-		!existsSync(join(project, "node_modules", DEMINO)),
-		`a client-only install pulled in ${DEMINO}`,
-	);
-	run(process.execPath, [
-		"--input-type=module",
-		"-e",
-		`const m = await import("${PKG}"); if (typeof m.createWSClient !== "function") process.exit(1);`,
-	], project);
-	console.log(`smoke: client-only install has no ${DEMINO}, and the client imports`);
+	run("npm", [...npmInstall, join(packDir, tarballs[0])], project);
+	const deminoRange = checkInstalledManifest(join(project, "node_modules", PKG));
+	check(!existsSync(join(project, "node_modules", DEMINO)), `${DEMINO} got installed`);
+	writeFileSync(join(project, "client-only.mjs"), CLIENT_ONLY);
+	run(process.execPath, ["client-only.mjs"], project);
 
-	// then demino at the peer range, as whoever imports `./server` installs it
+	// then demino at the peer range, as whoever imports `./server` installs it,
+	// and `ws` at the range demino's Node adapter asks for
 	run("npm", [...npmInstall, `${DEMINO}@${deminoRange}`], project);
-
-	const deminoManifest = readManifest(join(project, "node_modules", DEMINO));
-	const wsRange = deminoManifest.peerDependencies?.ws;
+	const wsRange = readManifest(join(project, "node_modules", DEMINO)).peerDependencies
+		?.ws;
 	check(typeof wsRange === "string", `${DEMINO} declares no "ws" peer`);
 	run("npm", [...npmInstall, `ws@${wsRange}`], project);
-	check(
-		!lstatSync(join(project, "node_modules", PKG)).isSymbolicLink(),
-		`node_modules/${PKG} is a symlink, not a packed copy`,
-	);
 
-	writeFileSync(join(project, "consumer.mjs"), CONSUMER);
-	run(process.execPath, ["consumer.mjs"], project);
+	writeFileSync(join(project, "round-trip.mjs"), ROUND_TRIP);
+	run(process.execPath, ["round-trip.mjs"], project);
 	console.log("smoke: OK");
 } finally {
 	rmSync(project, { recursive: true, force: true });

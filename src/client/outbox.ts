@@ -17,8 +17,8 @@
  * @module
  */
 
-import type { ClientFrame } from "../protocol/frames.ts";
 import { WSOutboxDropError, WSTimeoutError } from "../protocol/errors.ts";
+import type { ClientFrame } from "../protocol/frames.ts";
 
 /** What a settled send resolves with — the parts of the `ack` the caller needs. */
 export interface OutboxResult {

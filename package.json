@@ -1,0 +1,105 @@
+{
+  "name": "@marianmeres/ws",
+  "version": "0.8.0",
+  "description": "WebSocket client with reconnect, half-open detection and buffered sends, for plain messages or namespaces, rooms and presence, plus a demino-mountable reference server.",
+  "license": "MIT",
+  "author": "Marian Meres",
+  "type": "module",
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "main": "./dist/mod.js",
+  "types": "./dist/mod.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/mod.d.ts",
+      "default": "./dist/mod.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "default": "./dist/protocol.js"
+    }
+  },
+  "files": [
+    "dist",
+    "API.md",
+    "AGENTS.md",
+    "PROTOCOL.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marianmeres/ws.git"
+  },
+  "bugs": {
+    "url": "https://github.com/marianmeres/ws/issues"
+  },
+  "homepage": "https://github.com/marianmeres/ws#readme",
+  "keywords": [
+    "websocket",
+    "ws",
+    "reconnect",
+    "realtime",
+    "pubsub",
+    "rooms",
+    "presence",
+    "demino"
+  ],
+  "scripts": {
+    "build": "pnpm run clean && tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "test:watch": "node --test --watch \"tests/**/*.test.ts\"",
+    "test:deno": "deno test -A tests/",
+    "smoke": "pnpm run build && node scripts/smoke-npm.mjs",
+    "jsr:check": "deno doc --lint src/mod.ts src/server.ts src/protocol.ts && deno publish --dry-run --allow-dirty --set-version \"$npm_package_version\"",
+    "ci": "pnpm run typecheck && pnpm run lint && pnpm test && pnpm run smoke",
+    "prepublishOnly": "pnpm run ci && pnpm run build",
+    "example": "pnpm run example:build && node --env-file-if-exists=.env example/server.ts",
+    "example:build": "bundle --root example/client --outdir example/public/dist",
+    "example:watch": "bundle --root example/client --outdir example/public/dist --watch --watch-dir src --watch-dir example",
+    "example:styles": "node example/build-styles.ts",
+    "release": "npx --yes @marianmeres/release@^2.2.0",
+    "publish:jsr": "pnpm run test:deno && deno publish --set-version \"$npm_package_version\"",
+    "publish:all": "pnpm publish && pnpm run publish:jsr",
+    "publish:next": "pnpm publish --tag next --no-git-checks && pnpm run publish:jsr",
+    "rp": "pnpm run release -y && pnpm run publish:all",
+    "rpm": "pnpm run release minor -y && pnpm run publish:all"
+  },
+  "dependencies": {
+    "@marianmeres/clog": "^3.21.0",
+    "@marianmeres/pubsub": "^3.0.0",
+    "@marianmeres/ticker": "^1.17.1",
+    "@marianmeres/uid": "^1.2.0"
+  },
+  "peerDependencies": {
+    "@marianmeres/demino": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@marianmeres/demino": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.3",
+    "@marianmeres/bundle": "^1.0.0",
+    "@marianmeres/demino": "^2.0.0",
+    "@marianmeres/design-tokens": "^1.20.0",
+    "@marianmeres/vanilla": "^1.10.0",
+    "@marianmeres/vanilla-ui": "^0.5.1",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "ws": "^8.18.0"
+  }
+}

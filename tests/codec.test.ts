@@ -1,4 +1,5 @@
-import { assertEquals } from "@std/assert";
+import assert from "node:assert/strict";
+import { test } from "node:test";
 
 import { createWSClient } from "../src/mod.ts";
 import type { WSDecoder, WSEncoder, WSRoomMessage } from "../src/protocol/frames.ts";
@@ -9,8 +10,8 @@ const encode: WSEncoder = (frame) => new TextEncoder().encode(JSON.stringify(fra
 const decode: WSDecoder = (raw) =>
 	JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw));
 
-Deno.test("the stock client connects to a server that answers in binary", async () => {
-	const server = startBinaryHelloServer();
+test("the stock client connects to a server that answers in binary", async () => {
+	const server = await startBinaryHelloServer();
 	// Bounded so a regression fails here instead of hanging: a client that
 	// cannot decode the `hello` never leaves `authenticating`.
 	const c = createWSClient({
@@ -22,16 +23,16 @@ Deno.test("the stock client connects to a server that answers in binary", async 
 
 	try {
 		await c.connect();
-		assertEquals(c.connected, true);
-		assertEquals(c.clientId, "binary");
+		assert.deepEqual(c.connected, true);
+		assert.deepEqual(c.clientId, "binary");
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("a matching binary codec works end to end", async () => {
-	const server = startServer({ encode, decode });
+test("a matching binary codec works end to end", async () => {
+	const server = await startServer({ encode, decode });
 	const c = createWSClient({
 		url: server.url,
 		logger: null,
@@ -47,10 +48,10 @@ Deno.test("a matching binary codec works end to end", async () => {
 		await c.subscribe("chat", (m) => seen.push(m));
 
 		const { recipients } = await c.publish("chat", { text: "binary" });
-		assertEquals(recipients, 1);
+		assert.deepEqual(recipients, 1);
 
 		await until(() => seen.length === 1, "binary delivery");
-		assertEquals(seen[0].payload, { text: "binary" });
+		assert.deepEqual(seen[0].payload, { text: "binary" });
 	} finally {
 		c.dispose();
 		await server.stop();

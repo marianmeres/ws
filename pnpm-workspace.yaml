@@ -1,0 +1,5 @@
+# esbuild (via @marianmeres/bundle, the example bundler) works without its postinstall
+allowBuilds:
+  esbuild: false
+minimumReleaseAgeExclude:
+  - '@marianmeres/demino@2.0.0'
