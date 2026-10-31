@@ -22,6 +22,15 @@ import {
 	FRAME,
 	PROTOCOL_VERSION,
 } from "../protocol/constants.ts";
+import {
+	WSConnectionLostError,
+	WSConnectTimeoutError,
+	WSDisposedError,
+	WSError,
+	WSNotConnectedError,
+	WSRemoteError,
+	WSTerminatedError,
+} from "../protocol/errors.ts";
 import type {
 	ClientFrame,
 	ServerFrame,
@@ -34,15 +43,6 @@ import type {
 	WSPublishResult,
 	WSRoomMessage,
 } from "../protocol/frames.ts";
-import {
-	WSConnectionLostError,
-	WSConnectTimeoutError,
-	WSDisposedError,
-	WSError,
-	WSNotConnectedError,
-	WSRemoteError,
-	WSTerminatedError,
-} from "../protocol/errors.ts";
 import { backoffDelay } from "./backoff.ts";
 import { Heartbeat } from "./heartbeat.ts";
 import { Outbox, type OutboxResult } from "./outbox.ts";
@@ -399,9 +399,11 @@ export class WSClient<TAuth = unknown> {
 	#reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	#handshakeTimer: ReturnType<typeof setTimeout> | undefined;
 	#connectTimer: ReturnType<typeof setTimeout> | undefined;
-	#connectDeferred:
-		| { promise: Promise<void>; resolve: () => void; reject: (e: Error) => void }
-		| null = null;
+	#connectDeferred: {
+		promise: Promise<void>;
+		resolve: () => void;
+		reject: (e: Error) => void;
+	} | null = null;
 	#wakeListeners: Array<() => void> = [];
 
 	/**
@@ -419,12 +421,10 @@ export class WSClient<TAuth = unknown> {
 		this.#requestedClientId = options.clientId;
 		this.#authFn = options.auth;
 		this.#autoConnect = options.autoConnect ?? DEFAULTS.autoConnect;
-		this.#terminalCodes = options.terminalCloseCodes ??
-			DEFAULT_TERMINAL_CLOSE_CODES;
+		this.#terminalCodes = options.terminalCloseCodes ?? DEFAULT_TERMINAL_CLOSE_CODES;
 		this.#reconnect = options.reconnect ?? DEFAULTS.reconnect;
 		this.#reconnectDelay = options.reconnectDelay ?? DEFAULTS.reconnectDelay;
-		this.#reconnectDelayMax = options.reconnectDelayMax ??
-			DEFAULTS.reconnectDelayMax;
+		this.#reconnectDelayMax = options.reconnectDelayMax ?? DEFAULTS.reconnectDelayMax;
 		this.#connectTimeout = options.connectTimeout ?? DEFAULTS.connectTimeout;
 		this.#pongTimeout = options.pongTimeout ?? DEFAULTS.pongTimeout;
 		this.#outboxMaxSize = options.outboxMaxSize ?? DEFAULTS.outboxMaxSize;
@@ -464,9 +464,10 @@ export class WSClient<TAuth = unknown> {
 	 * there is no `location` to resolve a relative path against
 	 */
 	static resolveUrl(input: string | URL): URL {
-		const base = typeof globalThis.location !== "undefined"
-			? globalThis.location.href
-			: undefined;
+		const base =
+			typeof globalThis.location !== "undefined"
+				? globalThis.location.href
+				: undefined;
 		let url: URL;
 		try {
 			url = new URL(String(input), base);
@@ -903,8 +904,12 @@ export class WSClient<TAuth = unknown> {
 		this.#assertUsable();
 		if (options.ack) {
 			const id = this.#nextId();
-			return this.#send({ type: FRAME.MSG, id, payload }, id, true, options.timeout)
-				.then((r) => r.payload);
+			return this.#send(
+				{ type: FRAME.MSG, id, payload },
+				id,
+				true,
+				options.timeout,
+			).then((r) => r.payload);
 		}
 		// No wire id: nothing is coming back. The outbox still needs a key to
 		// buffer it under while offline.
@@ -950,13 +955,16 @@ export class WSClient<TAuth = unknown> {
 	): Promise<WSPublishResult> {
 		this.#assertUsable();
 		const id = this.#nextId();
-		return this.#send({
-			type: FRAME.PUB,
+		return this.#send(
+			{
+				type: FRAME.PUB,
+				id,
+				room,
+				payload,
+				...(namespace ? { namespace } : {}),
+			},
 			id,
-			room,
-			payload,
-			...(namespace ? { namespace } : {}),
-		}, id).then(({ recipients }) => ({ recipients }));
+		).then(({ recipients }) => ({ recipients }));
 	}
 
 	/**
@@ -975,8 +983,9 @@ export class WSClient<TAuth = unknown> {
 	broadcast<T = unknown>(room: string, payload: T): Promise<WSPublishResult> {
 		this.#assertUsable();
 		const id = this.#nextId();
-		return this.#send({ type: FRAME.BROADCAST, id, room, payload }, id)
-			.then(({ recipients }) => ({ recipients }));
+		return this.#send({ type: FRAME.BROADCAST, id, room, payload }, id).then(
+			({ recipients }) => ({ recipients }),
+		);
 	}
 
 	// -------------------------------------------------------------- internals
@@ -1014,8 +1023,7 @@ export class WSClient<TAuth = unknown> {
 			return Promise.reject(this.#terminalError);
 		}
 
-		const canSendNow = this.connected &&
-			this.#socket?.readyState === WebSocket.OPEN;
+		const canSendNow = this.connected && this.#socket?.readyState === WebSocket.OPEN;
 
 		if (!canSendNow && this.#outboxMaxSize === 0) {
 			return Promise.reject(new WSNotConnectedError());
@@ -1205,10 +1213,8 @@ export class WSClient<TAuth = unknown> {
 				// Only a room delivery carries `room`. A direct message from the
 				// server has no room to route by — the firehose is its only way in.
 				if (typeof message.room === "string") {
-					this.#rooms.deliver(
-						message.room,
-						message as WSRoomMessage,
-						(e) => this.#fail(e, "message handler threw"),
+					this.#rooms.deliver(message.room, message as WSRoomMessage, (e) =>
+						this.#fail(e, "message handler threw"),
 					);
 				}
 				break;
@@ -1217,10 +1223,8 @@ export class WSClient<TAuth = unknown> {
 			case FRAME.PRESENCE: {
 				const { type: _t, ...event } = frame;
 				this.#emit("presence", event as WSPresenceEvent);
-				this.#rooms.deliverPresence(
-					event.room,
-					event as WSPresenceEvent,
-					(e) => this.#fail(e, "presence handler threw"),
+				this.#rooms.deliverPresence(event.room, event as WSPresenceEvent, (e) =>
+					this.#fail(e, "presence handler threw"),
 				);
 				break;
 			}
@@ -1303,7 +1307,9 @@ export class WSClient<TAuth = unknown> {
 		this.#socket = null;
 
 		const terminal = this.#terminalCodes.includes(code);
-		const willReconnect = !terminal && this.#state !== "disposed" &&
+		const willReconnect =
+			!terminal &&
+			this.#state !== "disposed" &&
 			this.#shouldReconnect(code, reason);
 
 		this.logger?.debug?.(
@@ -1371,7 +1377,7 @@ export class WSClient<TAuth = unknown> {
 		this.#outbox.settleInFlight((frame) =>
 			frame.type === FRAME.SUB || frame.type === FRAME.UNSUB
 				? null
-				: new WSConnectionLostError()
+				: new WSConnectionLostError(),
 		);
 	}
 
@@ -1432,7 +1438,7 @@ export class WSClient<TAuth = unknown> {
 		if (target.document) {
 			target.addEventListener("visibilitychange", onVisible);
 			this.#wakeListeners.push(() =>
-				target.removeEventListener?.("visibilitychange", onVisible)
+				target.removeEventListener?.("visibilitychange", onVisible),
 			);
 		}
 	}
@@ -1507,7 +1513,8 @@ export class WSClient<TAuth = unknown> {
 		return {
 			state: this.#state,
 			connected: this.#state === "open",
-			connecting: this.#state === "connecting" ||
+			connecting:
+				this.#state === "connecting" ||
 				this.#state === "authenticating" ||
 				this.#state === "reconnecting",
 			attempt: this.#attempt,

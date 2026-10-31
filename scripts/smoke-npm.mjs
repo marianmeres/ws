@@ -181,7 +181,11 @@ const project = mkdtempSync(join(tmpdir(), "ws-npm-smoke-"));
 try {
 	writeFileSync(
 		join(project, "package.json"),
-		JSON.stringify({ name: "ws-npm-smoke", private: true, type: "module" }, null, "\t"),
+		JSON.stringify(
+			{ name: "ws-npm-smoke", private: true, type: "module" },
+			null,
+			"\t",
+		),
 	);
 	const packDir = join(project, "pack");
 	mkdirSync(packDir);

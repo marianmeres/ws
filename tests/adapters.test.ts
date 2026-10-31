@@ -12,7 +12,11 @@ import assert from "node:assert/strict";
 import { versions } from "node:process";
 import { test } from "node:test";
 import type { DeminoServeHandler } from "@marianmeres/demino";
-import { type ServeHandle, type ServeOptions, serve as serveNode } from "@marianmeres/demino/node";
+import {
+	type ServeHandle,
+	type ServeOptions,
+	serve as serveNode,
+} from "@marianmeres/demino/node";
 
 import { createWSClient } from "../src/mod.ts";
 import type { WSDecoder, WSEncoder, WSRoomMessage } from "../src/protocol/frames.ts";
@@ -176,8 +180,8 @@ async function exercise(
 				typeof raw === "string"
 					? "string"
 					: raw instanceof ArrayBuffer
-					? "ArrayBuffer"
-					: Object.prototype.toString.call(raw),
+						? "ArrayBuffer"
+						: Object.prototype.toString.call(raw),
 			);
 			return decode(raw);
 		},
@@ -239,10 +243,14 @@ test("Node adapter (ws): auth, echo and rooms over info.upgradeWebSocket", async
 
 const DENO_ONLY = { skip: !versions.deno && "Deno only" };
 
-test("Deno adapter: auth, echo and rooms over info.upgradeWebSocket", DENO_ONLY, async () => {
-	const { serve } = await import("@marianmeres/demino/deno");
-	await exercise((handler) => serve(handler, OPTIONS));
-});
+test(
+	"Deno adapter: auth, echo and rooms over info.upgradeWebSocket",
+	DENO_ONLY,
+	async () => {
+		const { serve } = await import("@marianmeres/demino/deno");
+		await exercise((handler) => serve(handler, OPTIONS));
+	},
+);
 
 /** The slice of `Deno.serve` a bare host uses; declared here, tsc has no `Deno`. */
 type BareDenoServe = (
@@ -250,11 +258,18 @@ type BareDenoServe = (
 	handler: DeminoServeHandler,
 ) => { addr: { port: number }; shutdown(): Promise<void> };
 
-test("bare Deno.serve(app): auth, echo and rooms over the Deno.upgradeWebSocket fallback", DENO_ONLY, async () => {
-	const deno = (globalThis as unknown as { Deno: { serve: BareDenoServe } }).Deno;
-	await exercise(async (handler) => {
-		// No adapter, so `info` carries no `upgradeWebSocket`
-		const server = deno.serve({ port: 0, hostname: "127.0.0.1", onListen: () => {} }, handler);
-		return { port: server.addr.port, shutdown: () => server.shutdown() };
-	}, false);
-});
+test(
+	"bare Deno.serve(app): auth, echo and rooms over the Deno.upgradeWebSocket fallback",
+	DENO_ONLY,
+	async () => {
+		const deno = (globalThis as unknown as { Deno: { serve: BareDenoServe } }).Deno;
+		await exercise(async (handler) => {
+			// No adapter, so `info` carries no `upgradeWebSocket`
+			const server = deno.serve(
+				{ port: 0, hostname: "127.0.0.1", onListen: () => {} },
+				handler,
+			);
+			return { port: server.addr.port, shutdown: () => server.shutdown() };
+		}, false);
+	},
+);

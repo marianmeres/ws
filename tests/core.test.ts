@@ -15,7 +15,14 @@ import { ERROR_CODE } from "../src/protocol/constants.ts";
 import { WSRemoteError, WSTerminatedError } from "../src/protocol/errors.ts";
 import type { WSMessage, WSRoomMessage } from "../src/protocol/frames.ts";
 import type { WSConnectionContext } from "../src/server/mod.ts";
-import { rawConnect, rejection, sleep, startCoreServer, startServer, until } from "./_helpers.ts";
+import {
+	rawConnect,
+	rejection,
+	sleep,
+	startCoreServer,
+	startServer,
+	until,
+} from "./_helpers.ts";
 
 /** Quiet, heartbeat-free client — liveness has its own tests. */
 const client = (url: string, options: Record<string, unknown> = {}) =>
@@ -29,7 +36,7 @@ test("core-only server: handshake without identity", async () => {
 
 	try {
 		const connected = new Promise<{ clientId: string | null }>((r) =>
-			c.once("connected", r)
+			c.once("connected", r),
 		);
 		await c.connect();
 
@@ -103,10 +110,7 @@ test("core-only server: rooms fail fast with unsupported, not a timeout", async 
 		await c.connect();
 		const started = Date.now();
 
-		const sub = await rejection(
-			() => c.subscribe("chat", () => {}),
-			WSRemoteError,
-		);
+		const sub = await rejection(() => c.subscribe("chat", () => {}), WSRemoteError);
 		assert.deepEqual(sub.code, ERROR_CODE.UNSUPPORTED);
 		// A refused subscription is not held locally.
 		assert.deepEqual(c.isSubscribed("chat"), false);
@@ -193,7 +197,10 @@ test("onMessage receives send() with its context; the return is the reply", asyn
 
 		assert.deepEqual(reply, { ok: true, got: { op: "ask" } });
 		await until(() => seen.length === 2, "both reach the hook");
-		assert.deepEqual(seen.map((s) => s.payload), [{ op: "fire" }, { op: "ask" }]);
+		assert.deepEqual(
+			seen.map((s) => s.payload),
+			[{ op: "fire" }, { op: "ask" }],
+		);
 		assert.deepEqual(seen[0].ctx.clientId, "alice");
 		assert.deepEqual(seen[0].ctx.meta, { role: "admin" });
 	} finally {
@@ -263,10 +270,7 @@ test("onMessage throwing WSRemoteError with details delivers them unchanged", as
 	const c = client(server.url);
 
 	try {
-		const busy = await rejection(
-			() => c.send("busy", { ack: true }),
-			WSRemoteError,
-		);
+		const busy = await rejection(() => c.send("busy", { ack: true }), WSRemoteError);
 		assert.deepEqual(busy.code, "busy");
 		assert.deepEqual(busy.message, "try later");
 		assert.deepEqual(busy.details, details);

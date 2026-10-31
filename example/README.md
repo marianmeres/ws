@@ -63,12 +63,12 @@ example/
 
 ## Tasks
 
-| Task                        | What                                                   |
-| --------------------------- | ------------------------------------------------------ |
-| `pnpm run example`          | build the bundle, then serve                           |
-| `pnpm run example:build`    | bundle `client/mod.ts` → `public/dist/bundle.js`       |
-| `pnpm run example:watch`    | same, rebuilding on change (run the server separately) |
-| `pnpm run example:styles`   | regenerate `theme.css` + `vui-base.css`                |
+| Task                      | What                                                   |
+| ------------------------- | ------------------------------------------------------ |
+| `pnpm run example`        | build the bundle, then serve                           |
+| `pnpm run example:build`  | bundle `client/mod.ts` → `public/dist/bundle.js`       |
+| `pnpm run example:watch`  | same, rebuilding on change (run the server separately) |
+| `pnpm run example:styles` | regenerate `theme.css` + `vui-base.css`                |
 
 `PORT` and `WS_EXAMPLE_TOKEN` are read from the environment (defaults `8000`
 and `dev-secret`), or from a `.env` file in the repo root, which

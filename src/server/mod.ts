@@ -33,18 +33,18 @@
 
 import {
 	type Demino,
-	demino,
 	type DeminoHandler,
 	type DeminoOptions,
 	type DeminoServeInfo,
+	demino,
 } from "@marianmeres/demino";
 import { WSService, type WSServiceOptions } from "./service.ts";
 
-export * from "./adapters/abstract.ts";
-export * from "./adapters/local.ts";
-export type { WSRequestedIdentity } from "../protocol/frames.ts";
 // Re-exported because throwing one is how `onMessage` refuses a message.
 export { WSRemoteError } from "../protocol/errors.ts";
+export type { WSRequestedIdentity } from "../protocol/frames.ts";
+export * from "./adapters/abstract.ts";
+export * from "./adapters/local.ts";
 export {
 	type WSConnectionContext,
 	WSService,

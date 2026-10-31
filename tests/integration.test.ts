@@ -4,12 +4,6 @@ import { test } from "node:test";
 import type { DeminoHandler } from "@marianmeres/demino";
 
 import { createWSClient } from "../src/mod.ts";
-import type {
-	WSEncoder,
-	WSPresenceEvent,
-	WSRequestedIdentity,
-	WSRoomMessage,
-} from "../src/protocol/frames.ts";
 import { FRAME } from "../src/protocol/constants.ts";
 import {
 	WSConnectionLostError,
@@ -17,6 +11,12 @@ import {
 	WSTerminatedError,
 	WSTimeoutError,
 } from "../src/protocol/errors.ts";
+import type {
+	WSEncoder,
+	WSPresenceEvent,
+	WSRequestedIdentity,
+	WSRoomMessage,
+} from "../src/protocol/frames.ts";
 import { rejection, sleep, startServer, startSilentServer, until } from "./_helpers.ts";
 
 /** Quiet, heartbeat-free client — liveness has its own tests. */
@@ -94,10 +94,7 @@ test("publishing into someone else's namespace is refused", async () => {
 	try {
 		await c.connect();
 		// Otherwise the isolation boundary would be decorative.
-		await rejection(
-			() => c.publish("chat", { x: 1 }, "org-2"),
-			WSRemoteError,
-		);
+		await rejection(() => c.publish("chat", { x: 1 }, "org-2"), WSRemoteError);
 	} finally {
 		c.dispose();
 		await server.stop();
@@ -329,7 +326,10 @@ test("a per-send timeout bounds that send while the default governs the rest", a
 
 		let defaultSettled = false;
 		const patient = c.send({ op: "create" }, { ack: true });
-		patient.then(() => defaultSettled = true, () => defaultSettled = true);
+		patient.then(
+			() => (defaultSettled = true),
+			() => (defaultSettled = true),
+		);
 
 		const started = Date.now();
 		const error = await rejection(
@@ -675,7 +675,9 @@ test("the function form decides on its own", async () => {
 });
 
 test("subscribe() rejects forbidden for a room the policy refuses, and the room is not held", async () => {
-	const server = await startServer({ allowSubscribe: (_ctx, room) => room !== "private" });
+	const server = await startServer({
+		allowSubscribe: (_ctx, room) => room !== "private",
+	});
 	const c = client(server.url);
 
 	try {
@@ -699,7 +701,9 @@ test("subscribe() rejects forbidden for a room the policy refuses, and the room 
 
 test("a room refused on reconnect is dropped locally and reported; the rest survive", async () => {
 	let allowed = new Set(["a", "b"]);
-	const server = await startServer({ allowSubscribe: (_ctx, room) => allowed.has(room) });
+	const server = await startServer({
+		allowSubscribe: (_ctx, room) => allowed.has(room),
+	});
 	const c = client(server.url);
 
 	try {

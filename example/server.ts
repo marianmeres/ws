@@ -17,17 +17,17 @@
  * @module
  */
 
+import { dirname, join } from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
 import {
+	type DeminoHandler,
 	demino,
 	deminoCompose,
-	type DeminoHandler,
 	logListenInfo,
 } from "@marianmeres/demino";
 import { serve } from "@marianmeres/demino/node";
 import { base36 } from "@marianmeres/uid";
-import { dirname, join } from "node:path";
-import process from "node:process";
-import { fileURLToPath } from "node:url";
 import { createWSApp } from "../src/server.ts";
 import { HistoryAdapter } from "./history.ts";
 import {
@@ -89,9 +89,10 @@ const { app: wsApp, service } = createWSApp("/ws", [], {
 		if (typeof nick !== "string" || !NICK_RE.test(nick)) return null;
 		if (RESERVED_NICKS.includes(nick.toLowerCase())) return null;
 
-		const namespace = typeof workspace === "string" && WORKSPACE_RE.test(workspace)
-			? workspace.toLowerCase()
-			: DEFAULT_WORKSPACE;
+		const namespace =
+			typeof workspace === "string" && WORKSPACE_RE.test(workspace)
+				? workspace.toLowerCase()
+				: DEFAULT_WORKSPACE;
 
 		// The client proposes a per-tab suffix and we honour it when it looks
 		// sane, so the id survives a reconnect and presence does not churn.

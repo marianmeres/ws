@@ -3,7 +3,6 @@ import { test } from "node:test";
 
 import { createWSClient } from "../src/mod.ts";
 import { CLOSE } from "../src/protocol/constants.ts";
-import type { WSRoomMessage } from "../src/protocol/frames.ts";
 import {
 	WSConnectionLostError,
 	WSConnectTimeoutError,
@@ -14,7 +13,7 @@ import {
 	WSTerminatedError,
 	WSTimeoutError,
 } from "../src/protocol/errors.ts";
-import type { ClientFrame } from "../src/protocol/frames.ts";
+import type { ClientFrame, WSRoomMessage } from "../src/protocol/frames.ts";
 import {
 	freePort,
 	rejection,
@@ -143,10 +142,7 @@ test("an in-flight publish rejects at the close, not at the timeout", async () =
 		await c.connect();
 
 		const started = Date.now();
-		await rejection(
-			() => c.publish("chat", { n: 1 }),
-			WSConnectionLostError,
-		);
+		await rejection(() => c.publish("chat", { n: 1 }), WSConnectionLostError);
 		const elapsed = Date.now() - started;
 		assert(
 			elapsed < 2_000,
@@ -196,7 +192,7 @@ test("a send buffered while offline resolves once flushed, and arrives", async (
 		// Issued while there is no connection at all: nothing can be written,
 		// so neither can resolve yet.
 		let settled = false;
-		const fire = c.send({ n: 1 }).then(() => settled = true);
+		const fire = c.send({ n: 1 }).then(() => (settled = true));
 		const ask = c.send({ n: 2 }, { ack: true });
 		await sleep(100);
 		assert.deepEqual(settled, false, "resolved before it was ever written");
@@ -268,10 +264,7 @@ test("a payload that cannot be encoded rejects with the encoder's error", async 
 
 		// The frame never left, so no ack was ever requested — waiting for one
 		// would report a timeout and hide the real cause.
-		const error = await rejection(
-			() => c.publish("chat", { big: 10n }),
-			Error,
-		);
+		const error = await rejection(() => c.publish("chat", { big: 10n }), Error);
 		assert(
 			!(error instanceof WSTimeoutError),
 			`expected the encoder's error, got ${error.constructor.name}`,
@@ -352,7 +345,11 @@ test("a local disconnect() emits close 4900, willReconnect false", async () => {
 		assert.deepEqual(closes[0].willReconnect, false);
 
 		c.disconnect();
-		assert.deepEqual(closes.length, 1, "nothing to close while idle, nothing to report");
+		assert.deepEqual(
+			closes.length,
+			1,
+			"nothing to close while idle, nothing to report",
+		);
 
 		// The superseded socket's own onclose must not arrive late as a second one.
 		await sleep(150);
@@ -366,8 +363,10 @@ test("a local disconnect() emits close 4900, willReconnect false", async () => {
 /** A logger that records every warning and error, for asserting there were none. */
 function recordingLogger(): { logger: Record<string, unknown>; lines: string[] } {
 	const lines: string[] = [];
-	const record = (level: string) => (...args: unknown[]) =>
-		lines.push(`${level}: ${args.map(String).join(" ")}`);
+	const record =
+		(level: string) =>
+		(...args: unknown[]) =>
+			lines.push(`${level}: ${args.map(String).join(" ")}`);
 	return {
 		logger: {
 			debug: () => {},
@@ -399,7 +398,10 @@ test("reconnect: false — a lost connection ends idle, quietly, and connect() r
 
 		// The close is reported honestly — nothing is coming — and classified as
 		// neither a retry nor a failure.
-		assert.deepEqual(closes.map((e) => [e.code, e.willReconnect]), [[1001, false]]);
+		assert.deepEqual(
+			closes.map((e) => [e.code, e.willReconnect]),
+			[[1001, false]],
+		);
 		assert.deepEqual(reconnecting, [], "no retry may be scheduled");
 		assert.deepEqual(terminated, [], "declining to retry is not a terminal failure");
 		await sleep(150);
@@ -568,10 +570,7 @@ test("outboxMaxSize 0 rejects immediately instead of buffering", async () => {
 	const unreachable = `ws://127.0.0.1:${await freePort()}/ws`;
 	const c = client(unreachable, { autoConnect: false, outboxMaxSize: 0 });
 	try {
-		await rejection(
-			() => c.publish("chat", { n: 1 }),
-			WSNotConnectedError,
-		);
+		await rejection(() => c.publish("chat", { n: 1 }), WSNotConnectedError);
 	} finally {
 		c.dispose();
 	}
@@ -592,7 +591,7 @@ test("connectTimeout bounds the await but not the retrying", async () => {
 			["connecting", "reconnecting"].includes(c.connectionState),
 			`still trying, got "${c.connectionState}"`,
 		);
-		await until(() => c.dump().attempt as number > 1, "attempts keep climbing");
+		await until(() => (c.dump().attempt as number) > 1, "attempts keep climbing");
 	} finally {
 		c.dispose();
 	}
@@ -656,11 +655,7 @@ test("connect() is idempotent and shares one promise", async () => {
 	const c = client(server.url);
 
 	try {
-		const [a, b, d] = await Promise.all([
-			c.connect(),
-			c.connect(),
-			c.connect(),
-		]);
+		const [a, b, d] = await Promise.all([c.connect(), c.connect(), c.connect()]);
 		assert.deepEqual([a, b, d], [undefined, undefined, undefined]);
 		assert(c.connected);
 		// Already connected: resolves immediately rather than reconnecting.
@@ -742,10 +737,10 @@ test("a replaced connection ends terminated with 4005 and does not fight back", 
 	try {
 		await first.connect();
 		const closed = new Promise<{ code: number; willReconnect: boolean }>((r) =>
-			first.once("close", r)
+			first.once("close", r),
 		);
 		const terminated = new Promise<{ code: number }>((r) =>
-			first.once("terminated", r)
+			first.once("terminated", r),
 		);
 
 		await second.connect();
@@ -786,9 +781,9 @@ test("a send from a connected handler or a state subscriber lands after the re-s
 
 		let fromHandler = -1;
 		c.on("connected", () => {
-			c.publish("chat", { via: "handler" }).then((
-				r,
-			) => (fromHandler = r.recipients));
+			c.publish("chat", { via: "handler" }).then(
+				(r) => (fromHandler = r.recipients),
+			);
 		});
 		let fromStore = -1;
 		let armed = true;
@@ -827,7 +822,10 @@ test("a throwing event handler is reported as `error`, and a throwing `error` ha
 		});
 
 		await c.connect();
-		assert.deepEqual(errors.map((e) => e.message), ["boom"]);
+		assert.deepEqual(
+			errors.map((e) => e.message),
+			["boom"],
+		);
 		// The throw cost the handler, not the connection.
 		assert(c.connected);
 		assert.deepEqual(await c.publish("x", 1), { recipients: 0 });

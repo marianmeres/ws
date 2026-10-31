@@ -64,8 +64,7 @@ export function isChatPayload(payload: unknown): payload is ChatPayload {
 /** Narrows an opaque payload to a typing ping. */
 export function isTypingPayload(payload: unknown): payload is TypingPayload {
 	return (
-		isRecord(payload) && payload.kind === "typing" &&
-		typeof payload.nick === "string"
+		isRecord(payload) && payload.kind === "typing" && typeof payload.nick === "string"
 	);
 }
 

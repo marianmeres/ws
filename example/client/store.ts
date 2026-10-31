@@ -253,7 +253,7 @@ export function createChatStore(
 				`/api/history/${encodeURIComponent(ns)}/${encodeURIComponent(target)}`,
 			);
 			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const { messages } = await res.json() as { messages: WSRoomMessage[] };
+			const { messages } = (await res.json()) as { messages: WSRoomMessage[] };
 			if (room.get() !== target) return; // user switched away mid-fetch
 
 			const backlog: Entry[] = [];
@@ -347,7 +347,7 @@ export function createChatStore(
 			// The message itself already arrived — the server delivers before it
 			// acknowledges — so the ack only fills in the recipient count.
 			entries.update((list) =>
-				list.map((e) => (e.key === payload.id ? { ...e, recipients } : e))
+				list.map((e) => (e.key === payload.id ? { ...e, recipients } : e)),
 			);
 		} catch (err) {
 			notice(`✗ ${(err as Error).message}`, "error");
@@ -360,9 +360,7 @@ export function createChatStore(
 		lastTypingSent = now;
 		// Best-effort: a dropped typing ping is not worth surfacing, and it must
 		// not produce an unhandled rejection while the socket is down.
-		ws.publish(room.get(), { kind: "typing", nick: session.nick }).catch(
-			() => {},
-		);
+		ws.publish(room.get(), { kind: "typing", nick: session.nick }).catch(() => {});
 	}
 
 	function leave(): void {

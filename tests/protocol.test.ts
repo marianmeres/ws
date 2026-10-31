@@ -8,10 +8,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-
+import type { Logger } from "@marianmeres/clog";
 import { CLOSE, ERROR_CODE, PROTOCOL_VERSION } from "../src/protocol/constants.ts";
 import type { WSFrame } from "../src/protocol/frames.ts";
-import type { Logger } from "@marianmeres/clog";
 import {
 	connectNonReadingPeer,
 	rawConnect,
@@ -326,7 +325,10 @@ test("a sub past maxRoomsPerConnection is refused whole; re-subscribing is free"
 });
 
 test("a room name over maxRoomNameLength is a bad_request on sub, pub and broadcast", async () => {
-	const server = await startServer({ maxRoomNameLength: 8, allowBroadcast: () => true });
+	const server = await startServer({
+		maxRoomNameLength: 8,
+		allowBroadcast: () => true,
+	});
 	const a = await rawConnect(server.url);
 	const long = "x".repeat(9);
 
@@ -418,7 +420,11 @@ test("an async allowSubscribe still keeps a following pub behind the sub", async
 		a.send({ type: "pub", id: "p", room: "r", payload: { late: true } });
 
 		const ack = await a.waitFor((f) => f.type === "ack" && f.id === "p", "ack p");
-		assert.deepEqual(ack.recipients, 1, "the pub waited for the sub to be registered");
+		assert.deepEqual(
+			ack.recipients,
+			1,
+			"the pub waited for the sub to be registered",
+		);
 		const msg = await a.waitFor(
 			(f) => f.type === "msg" && f.room === "r",
 			"own echo",
@@ -436,7 +442,9 @@ test("an async allowSubscribe still keeps a following pub behind the sub", async
 });
 
 test("allowPublish: a refused pub is nacked forbidden and delivers nothing", async () => {
-	const server = await startServer({ allowPublish: (_ctx, room) => room !== "readonly" });
+	const server = await startServer({
+		allowPublish: (_ctx, room) => room !== "readonly",
+	});
 	const a = await rawConnect(server.url);
 	const b = await rawConnect(server.url);
 

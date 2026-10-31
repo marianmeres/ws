@@ -124,7 +124,9 @@ async function startStub(
 			for (const socket of sockets) {
 				try {
 					socket.close();
-				} catch { /* already gone */ }
+				} catch {
+					/* already gone */
+				}
 			}
 			sockets.clear();
 			await server.shutdown();
@@ -143,12 +145,14 @@ export function startSilentServer(port = 0): Promise<StubServer> {
 			const frame = JSON.parse(event.data);
 			// Answer the handshake so the client reaches "open"...
 			if (frame.type === "auth") {
-				socket.send(JSON.stringify({
-					type: "hello",
-					clientId: "silent",
-					namespace: "default",
-					protocol: 1,
-				}));
+				socket.send(
+					JSON.stringify({
+						type: "hello",
+						clientId: "silent",
+						namespace: "default",
+						protocol: 1,
+					}),
+				);
 			}
 			// ...and then ignore everything else, pings included.
 		};
@@ -165,12 +169,14 @@ export function startNoAckServer(port = 0): Promise<StubServer> {
 		socket.onmessage = (event) => {
 			const frame = JSON.parse(event.data);
 			if (frame.type === "auth") {
-				socket.send(JSON.stringify({
-					type: "hello",
-					clientId: "no-ack",
-					namespace: "default",
-					protocol: PROTOCOL_VERSION,
-				}));
+				socket.send(
+					JSON.stringify({
+						type: "hello",
+						clientId: "no-ack",
+						namespace: "default",
+						protocol: PROTOCOL_VERSION,
+					}),
+				);
 			} else if (frame.type === "pub" || frame.type === "msg") {
 				socket.close(1001, "gone mid-publish");
 			}
@@ -187,12 +193,16 @@ export function startBinaryHelloServer(port = 0): Promise<StubServer> {
 		socket.onmessage = (event) => {
 			const frame = JSON.parse(event.data);
 			if (frame.type === "auth") {
-				socket.send(new TextEncoder().encode(JSON.stringify({
-					type: "hello",
-					clientId: "binary",
-					namespace: "default",
-					protocol: PROTOCOL_VERSION,
-				})));
+				socket.send(
+					new TextEncoder().encode(
+						JSON.stringify({
+							type: "hello",
+							clientId: "binary",
+							namespace: "default",
+							protocol: PROTOCOL_VERSION,
+						}),
+					),
+				);
 			}
 		};
 	});
@@ -452,12 +462,16 @@ export async function connectNonReadingPeer(
 		conn.destroy();
 		throw new Error("upgrade refused");
 	}
-	conn.write(maskedTextFrame(JSON.stringify({
-		type: "auth",
-		protocol: PROTOCOL_VERSION,
-		payload: null,
-		...auth,
-	})));
+	conn.write(
+		maskedTextFrame(
+			JSON.stringify({
+				type: "auth",
+				protocol: PROTOCOL_VERSION,
+				payload: null,
+				...auth,
+			}),
+		),
+	);
 	return {
 		conn,
 		close() {
@@ -471,9 +485,10 @@ function maskedTextFrame(text: string): Uint8Array {
 	const data = new TextEncoder().encode(text);
 	const mask = crypto.getRandomValues(new Uint8Array(4));
 	const len = data.length;
-	const header = len < 126
-		? [0x81, 0x80 | len]
-		: [0x81, 0x80 | 126, (len >> 8) & 0xff, len & 0xff];
+	const header =
+		len < 126
+			? [0x81, 0x80 | len]
+			: [0x81, 0x80 | 126, (len >> 8) & 0xff, len & 0xff];
 	const out = new Uint8Array(header.length + 4 + len);
 	out.set(header);
 	out.set(mask, header.length);

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { backoffDelay } from "../src/client/backoff.ts";
+import { Heartbeat } from "../src/client/heartbeat.ts";
 import { Outbox } from "../src/client/outbox.ts";
 import { RoomRegistry } from "../src/client/rooms.ts";
-import { Heartbeat } from "../src/client/heartbeat.ts";
 import {
 	WSConnectionLostError,
 	WSDisposedError,
@@ -41,8 +41,14 @@ test("backoff — equal jitter keeps a floor of half the delay", () => {
 	const max = 30_000;
 
 	// Full jitter would allow ~0 here, which hammers a recovering server.
-	assert.deepEqual(backoffDelay(3, base, max, () => 0), 2000);
-	assert.deepEqual(backoffDelay(3, base, max, () => 1), 4000);
+	assert.deepEqual(
+		backoffDelay(3, base, max, () => 0),
+		2000,
+	);
+	assert.deepEqual(
+		backoffDelay(3, base, max, () => 1),
+		4000,
+	);
 
 	for (let i = 0; i < 200; i++) {
 		const d = backoffDelay(3, base, max);
@@ -58,7 +64,10 @@ test("outbox — queues while disconnected, drains in FIFO order", async () => {
 	assert.deepEqual(outbox.queuedCount, 2);
 
 	const drained = outbox.drain();
-	assert.deepEqual(drained.map((f) => (f as { id: string }).id), ["a", "b"]);
+	assert.deepEqual(
+		drained.map((f) => (f as { id: string }).id),
+		["a", "b"],
+	);
 	assert.deepEqual(outbox.queuedCount, 0);
 	// Draining transmits; it does not resolve. They await acks now.
 	assert.deepEqual(outbox.pendingCount, 2);
@@ -84,7 +93,10 @@ test("outbox — cap drops the oldest and rejects its promise", async () => {
 
 	// "a" is the oldest, so "a" goes — the freshest state is what survives.
 	await rejection(() => a, WSOutboxDropError);
-	assert.deepEqual(dropped.map((f) => (f as { id: string }).id), ["a"]);
+	assert.deepEqual(
+		dropped.map((f) => (f as { id: string }).id),
+		["a"],
+	);
 	assert.deepEqual(outbox.droppedCount, 1);
 	assert.deepEqual(outbox.queuedCount, 2);
 
@@ -140,7 +152,7 @@ test("outbox — settleInFlight answers transmitted frames, spares queued ones",
 	const resolved = outbox.track("s", frame("s"), false);
 
 	outbox.settleInFlight((f) =>
-		(f as { id: string }).id === "s" ? null : new WSConnectionLostError()
+		(f as { id: string }).id === "s" ? null : new WSConnectionLostError(),
 	);
 
 	await rejection(() => rejected, WSConnectionLostError);
@@ -160,7 +172,10 @@ test("outbox — an unacked frame completes when transmitted, an acked one waits
 	const acked = outbox.track("a", { type: "msg", id: "a", payload: 2 }, true);
 
 	const drained = outbox.drain();
-	assert.deepEqual(drained.map((e) => e.id), ["u", "a"]);
+	assert.deepEqual(
+		drained.map((e) => e.id),
+		["u", "a"],
+	);
 
 	outbox.transmitted("u");
 	outbox.transmitted("a");
@@ -238,7 +253,11 @@ test("rooms — presence upgrade re-subscribes", () => {
 	rooms.add("chat", () => {});
 	assert.deepEqual(rooms.wantsPresence("chat"), false);
 
-	const result = rooms.add("chat", () => {}, () => {});
+	const result = rooms.add(
+		"chat",
+		() => {},
+		() => {},
+	);
 	assert.deepEqual(result.created, false);
 	assert.deepEqual(result.presenceUpgraded, true);
 	assert.deepEqual(rooms.wantsPresence("chat"), true);
@@ -284,13 +303,17 @@ test("rooms — a throwing handler does not stop the others", () => {
 	});
 	rooms.add("chat", () => seen.push("survivor"));
 
-	rooms.deliver("chat", {
-		room: "chat",
-		namespace: "default",
-		from: null,
-		payload: null,
-		timestamp: 0,
-	}, (e) => errors.push(e));
+	rooms.deliver(
+		"chat",
+		{
+			room: "chat",
+			namespace: "default",
+			from: null,
+			payload: null,
+			timestamp: 0,
+		},
+		(e) => errors.push(e),
+	);
 
 	assert.deepEqual(seen, ["survivor"]);
 	assert.deepEqual(errors.length, 1);

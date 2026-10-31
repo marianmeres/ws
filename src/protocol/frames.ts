@@ -114,55 +114,55 @@ export interface SubRequest {
 /** Frames sent by the client. */
 export type ClientFrame =
 	| {
-		type: typeof FRAME.AUTH;
-		/**
-		 * Not sent since protocol 2 and never acknowledged. Kept optional so a
-		 * server keeps accepting a protocol-1 client that still sends it.
-		 */
-		id?: string;
-		protocol: number;
-		payload: unknown;
-		/** Preferred client id — the server may override it. */
-		clientId?: string;
-		/** Requested namespace — sent only when the application chose one. */
-		namespace?: string;
-	}
+			type: typeof FRAME.AUTH;
+			/**
+			 * Not sent since protocol 2 and never acknowledged. Kept optional so a
+			 * server keeps accepting a protocol-1 client that still sends it.
+			 */
+			id?: string;
+			protocol: number;
+			payload: unknown;
+			/** Preferred client id — the server may override it. */
+			clientId?: string;
+			/** Requested namespace — sent only when the application chose one. */
+			namespace?: string;
+	  }
 	| {
-		type: typeof FRAME.MSG;
-		/** Present only when the sender awaits an `ack`/`nack`. */
-		id?: string;
-		payload: unknown;
-	}
+			type: typeof FRAME.MSG;
+			/** Present only when the sender awaits an `ack`/`nack`. */
+			id?: string;
+			payload: unknown;
+	  }
 	| { type: typeof FRAME.PING }
 	| { type: typeof FRAME.SUB; id: string; rooms: SubRequest[] }
 	| { type: typeof FRAME.UNSUB; id: string; rooms: string[] }
 	| {
-		type: typeof FRAME.PUB;
-		id: string;
-		room: string;
-		namespace?: string;
-		payload: unknown;
-	}
+			type: typeof FRAME.PUB;
+			id: string;
+			room: string;
+			namespace?: string;
+			payload: unknown;
+	  }
 	| { type: typeof FRAME.BROADCAST; id: string; room: string; payload: unknown };
 
 /** Frames sent by the server. */
 export type ServerFrame =
 	| {
-		type: typeof FRAME.HELLO;
-		protocol: number;
-		/** Assigned client id. Optional in the core; always sent with rooms. */
-		clientId?: string;
-		/** Assigned namespace. Optional in the core; always sent with rooms. */
-		namespace?: string;
-	}
+			type: typeof FRAME.HELLO;
+			protocol: number;
+			/** Assigned client id. Optional in the core; always sent with rooms. */
+			clientId?: string;
+			/** Assigned namespace. Optional in the core; always sent with rooms. */
+			namespace?: string;
+	  }
 	| {
-		type: typeof FRAME.ACK;
-		id: string;
-		/** Delivery count, on `pub`/`broadcast` acks only. */
-		recipients?: number;
-		/** The server's reply, on `msg` acks only. Any JSON value. */
-		payload?: unknown;
-	}
+			type: typeof FRAME.ACK;
+			id: string;
+			/** Delivery count, on `pub`/`broadcast` acks only. */
+			recipients?: number;
+			/** The server's reply, on `msg` acks only. Any JSON value. */
+			payload?: unknown;
+	  }
 	| { type: typeof FRAME.NACK; id: string; error: WSErrorInfo }
 	| ({ type: typeof FRAME.MSG } & WSMessage)
 	| { type: typeof FRAME.PONG }

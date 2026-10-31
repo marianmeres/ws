@@ -2065,7 +2065,8 @@ async function rejects<E extends Error>(
 	}
 	assert.fail(`expected a rejection with ${ErrorClass.name}`);
 }
-let passed = 0, failed = 0;
+let passed = 0,
+	failed = 0;
 async function test(name: string, fn: () => Promise<void>) {
 	try {
 		await fn();
@@ -2081,9 +2082,9 @@ async function test(name: string, fn: () => Promise<void>) {
 async function raw() {
 	const ws = new WebSocket(URL);
 	const frames: Record<string, unknown>[] = [];
-	const closed = new Promise<CloseEvent>((r) => ws.onclose = r);
+	const closed = new Promise<CloseEvent>((r) => (ws.onclose = r));
 	ws.onmessage = (e) => frames.push(JSON.parse(e.data));
-	await new Promise((r) => ws.onopen = r);
+	await new Promise((r) => (ws.onopen = r));
 	return { ws, frames, closed, send: (f: unknown) => ws.send(JSON.stringify(f)) };
 }
 
@@ -2123,7 +2124,10 @@ await test("core: fire-and-forget send; the push arrives as a direct message", a
 	try {
 		const got: WSMessage[] = [];
 		c.on("message", (m) => got.push(m));
-		assert.deepEqual(await c.send({ op: "push", data: { hello: "there" } }), undefined);
+		assert.deepEqual(
+			await c.send({ op: "push", data: { hello: "there" } }),
+			undefined,
+		);
 		await until(() => got.length === 1, "pushed message");
 		assert.deepEqual(got[0].payload, { hello: "there" });
 		assert.deepEqual(got[0].room, undefined, "a direct message has no room");
@@ -2181,7 +2185,7 @@ await test("core: unknown frame -> nack unsupported with an id, error without", 
 await test("core: heartbeat — ping is answered, connection stays up", async () => {
 	const hb = client({ pingInterval: 200, pongTimeout: 400 });
 	let closed = false;
-	hb.on("close", () => closed = true);
+	hb.on("close", () => (closed = true));
 	try {
 		await hb.connect();
 		await sleep(1500);
@@ -2213,7 +2217,7 @@ await test("core: idle reap 4008, then a send buffered meanwhile is flushed (nee
 	try {
 		await c.connect();
 		const ev = await new Promise<{ code: number; willReconnect: boolean }>((r) =>
-			c.on("close", r)
+			c.on("close", r),
 		);
 		assert.deepEqual(ev.code, 4008);
 		assert.deepEqual(ev.willReconnect, true);
@@ -2231,10 +2235,7 @@ if (!ROOMS) {
 		try {
 			await c.connect();
 			const t0 = Date.now();
-			const err = await rejects(
-				() => c.subscribe("r", () => {}),
-				WSRemoteError,
-			);
+			const err = await rejects(() => c.subscribe("r", () => {}), WSRemoteError);
 			assert.deepEqual(err.code, "unsupported");
 			assert(Date.now() - t0 < 2_000, "answered, not timed out");
 		} finally {
@@ -2359,10 +2360,7 @@ if (ROOMS) {
 			assert.deepEqual(recipients, 1);
 			await sleep(200);
 			assert.deepEqual(cMsgs.length, 0);
-			const err = await rejects(
-				() => a.publish("room", 1, "org-2"),
-				WSRemoteError,
-			);
+			const err = await rejects(() => a.publish("room", 1, "org-2"), WSRemoteError);
 			assert.deepEqual(err.code, "forbidden");
 		} finally {
 			a.dispose();
@@ -2389,7 +2387,11 @@ if (ROOMS) {
 				() => cMsgs.length === 1 && aMsgs.length === 1,
 				"broadcast delivery",
 			);
-			assert.deepEqual(cMsgs[0].namespace, "org-2", "receiver sees its own namespace");
+			assert.deepEqual(
+				cMsgs[0].namespace,
+				"org-2",
+				"receiver sees its own namespace",
+			);
 			assert.deepEqual(aMsgs[0].namespace, "default");
 			assert.deepEqual(cMsgs[0].from, "alice");
 		} finally {
@@ -2408,7 +2410,7 @@ if (ROOMS) {
 		try {
 			await d1.connect();
 			const closeEv = new Promise<{ code: number; willReconnect: boolean }>((r) =>
-				d1.on("close", r)
+				d1.on("close", r),
 			);
 			await d2.connect();
 			const ev = await closeEv;
@@ -2501,7 +2503,7 @@ process.exit(failed ? 1 : 0);
 Handshake
 
 - [ ] `auth` is accepted as the first frame; `hello` with `protocol: 2` goes out
-      well within 10 s
+  well within 10 s
 - [ ] Rejected credentials close with 4001; "not allowed" closes with 4003
 - [ ] No `auth` within your deadline closes with 4002
 - [ ] Non-`auth` frames before authentication get `error` `unauthorized`
@@ -2511,15 +2513,15 @@ Messages
 
 - [ ] A `msg` without `id` is handled and answered with nothing
 - [ ] A `msg` with `id` is answered with exactly one `ack` or `nack` echoing it;
-      the `ack` carries the reply in `payload`, or no `payload` at all
+  the `ack` carries the reply in `payload`, or no `payload` at all
 - [ ] A refusal is a `nack` with a meaningful `code`; a crash is `internal`,
-      without internals in the message, and the socket stays open
+  without internals in the message, and the socket stays open
 - [ ] `error.details`, when the application supplies any, is passed through
-      unchanged — and omitted, not `null`, when it supplies none
+  unchanged — and omitted, not `null`, when it supplies none
 - [ ] A direct message to the client is `{"type": "msg", "payload": …}`, with no
-      `room`
+  `room`
 - [ ] Unknown frame types get `nack` `unsupported` with an `id`, `error`
-      `unsupported` without; the socket stays open
+  `unsupported` without; the socket stays open
 
 Liveness and closing
 
@@ -2533,40 +2535,40 @@ Identity
 
 - [ ] `hello` carries `clientId` and `namespace`
 - [ ] Server-assigned id/namespace override the client's proposal; otherwise the
-      proposal is honoured; otherwise generated / `"default"`
+  proposal is honoured; otherwise generated / `"default"`
 - [ ] A duplicate client id evicts the older connection with 4005 and does not
-      lose the newer registration when the old socket's close fires
+  lose the newer registration when the old socket's close fires
 
 Rooms and messages
 
 - [ ] Rooms frames of one connection are handled in arrival order — policy
-      hooks included: a `pub` never overtakes the `sub` before it
+  hooks included: a `pub` never overtakes the `sub` before it
 - [ ] `sub` registers rooms, re-subscribing is harmless, and it is answered
-      with exactly one `ack {id}` — or one `nack` `forbidden` whose
-      `details.refused` names the rooms the policy refused, with the others
-      registered regardless
+  with exactly one `ack {id}` — or one `nack` `forbidden` whose
+  `details.refused` names the rooms the policy refused, with the others
+  registered regardless
 - [ ] A `sub` past the per-connection room limit is nacked `forbidden` whole,
-      with `details.limit`; an over-long room name is `bad_request`
+  with `details.limit`; an over-long room name is `bad_request`
 - [ ] `pub` into a room the policy refuses is nacked `forbidden`
 - [ ] `unsub` is acknowledged; unknown rooms are ignored
 - [ ] `pub` delivers `msg` to every subscriber of `(room, namespace)`, the
-      publisher included, and acks with `recipients`
+  publisher included, and acks with `recipients`
 - [ ] A delivered `msg` carries `room`, `namespace`, `from`, `payload`
-      (untouched), `timestamp` (integer epoch ms)
+  (untouched), `timestamp` (integer epoch ms)
 - [ ] `pub` with a foreign `namespace` is nacked `forbidden`
 - [ ] `pub` without a `room` and `sub`/`unsub` with a non-array `rooms` are
-      answered `nack` `bad_request` without closing the socket
+  answered `nack` `bad_request` without closing the socket
 - [ ] `broadcast` is nacked `forbidden` unless allowed; when allowed, every
-      receiver sees its own namespace
+  receiver sees its own namespace
 
 Presence
 
 - [ ] `sub` with `presence: true` yields a `sync` (before the `ack`) with the
-      full membership
+  full membership
 - [ ] Other presence subscribers get `join` on a new member and `leave` on
-      `unsub` and on disconnect, with `members` reflecting the state after the
-      event
+  `unsub` and on disconnect, with `members` reflecting the state after the
+  event
 - [ ] Subscribers without presence are counted in `members` but receive no
-      presence frames
+  presence frames
 - [ ] Closing a connection for any reason removes it from all rooms and emits
-      `leave` events
+  `leave` events

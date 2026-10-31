@@ -16,6 +16,7 @@ import {
 	PRESENCE,
 	PROTOCOL_VERSION,
 } from "../protocol/constants.ts";
+import { WSRemoteError } from "../protocol/errors.ts";
 import type {
 	AuthResult,
 	ClientFrame,
@@ -28,7 +29,6 @@ import type {
 	WSRequestedIdentity,
 	WSRoomMessage,
 } from "../protocol/frames.ts";
-import { WSRemoteError } from "../protocol/errors.ts";
 import type { WSBroadcastEnvelope, WSPubSubAdapter } from "./adapters/abstract.ts";
 import { WSPubSubLocal } from "./adapters/local.ts";
 
@@ -160,10 +160,7 @@ export interface WSServiceOptions {
 	 * delivered. Same serialization as {@link allowSubscribe}; does not apply
 	 * to `broadcast`, which has {@link allowBroadcast}.
 	 */
-	allowPublish?: (
-		ctx: WSConnectionContext,
-		room: string,
-	) => boolean | Promise<boolean>;
+	allowPublish?: (ctx: WSConnectionContext, room: string) => boolean | Promise<boolean>;
 	/**
 	 * Deadline for the client's `auth` frame. Default 5_000.
 	 *
@@ -269,9 +266,11 @@ function nonEmptyString(value: unknown): string | undefined {
  * no 1.x host remains. Read per call, not at import.
  */
 function denoUpgrade(): WSUpgradeWebSocket | undefined {
-	const deno = (globalThis as unknown as {
-		Deno?: { upgradeWebSocket?: WSUpgradeWebSocket };
-	}).Deno;
+	const deno = (
+		globalThis as unknown as {
+			Deno?: { upgradeWebSocket?: WSUpgradeWebSocket };
+		}
+	).Deno;
 	return deno?.upgradeWebSocket?.bind(deno);
 }
 
@@ -330,18 +329,16 @@ export class WSService {
 	 * @param options - see {@link WSServiceOptions}
 	 */
 	constructor(options: WSServiceOptions = {}) {
-		this.logger = options.logger === undefined
-			? createClog("ws:server")
-			: options.logger;
+		this.logger =
+			options.logger === undefined ? createClog("ws:server") : options.logger;
 
 		this.#options = {
 			authTimeout: options.authTimeout ?? DEFAULTS.authTimeout,
 			idleTimeout: options.idleTimeout ?? DEFAULTS.idleTimeout,
 			maxFrameSize: options.maxFrameSize ?? DEFAULTS.maxFrameSize,
-			maxFramesPerSecond: options.maxFramesPerSecond ??
-				DEFAULTS.maxFramesPerSecond,
-			maxRoomsPerConnection: options.maxRoomsPerConnection ??
-				DEFAULTS.maxRoomsPerConnection,
+			maxFramesPerSecond: options.maxFramesPerSecond ?? DEFAULTS.maxFramesPerSecond,
+			maxRoomsPerConnection:
+				options.maxRoomsPerConnection ?? DEFAULTS.maxRoomsPerConnection,
 			maxRoomNameLength: options.maxRoomNameLength ?? DEFAULTS.maxRoomNameLength,
 			maxBufferedAmount: options.maxBufferedAmount ?? DEFAULTS.maxBufferedAmount,
 		};
@@ -613,10 +610,7 @@ export class WSService {
 		return origin === null || this.#allowedOrigins.includes(origin);
 	}
 
-	async #propagate(
-		envelope: WSBroadcastEnvelope,
-		recipients: number,
-	): Promise<number> {
+	async #propagate(envelope: WSBroadcastEnvelope, recipients: number): Promise<number> {
 		try {
 			await this.#adapter.publish(envelope);
 		} catch (e) {
@@ -704,15 +698,13 @@ export class WSService {
 			// land in a room the server has not registered yet, even while
 			// `allowSubscribe` is still deciding.
 			case FRAME.SUB:
-				return await this.#serial(
-					conn,
-					() => this.#onSub(conn, frame.id, frame.rooms),
+				return await this.#serial(conn, () =>
+					this.#onSub(conn, frame.id, frame.rooms),
 				);
 
 			case FRAME.UNSUB:
-				return await this.#serial(
-					conn,
-					() => this.#onUnsub(conn, frame.id, frame.rooms),
+				return await this.#serial(conn, () =>
+					this.#onUnsub(conn, frame.id, frame.rooms),
 				);
 
 			case FRAME.PUB:
@@ -1070,11 +1062,11 @@ export class WSService {
 
 		const allowed = this.#allowBroadcast
 			? await this.#allowed(
-				this.#allowBroadcast,
-				this.#context(conn),
-				room,
-				"allowBroadcast",
-			)
+					this.#allowBroadcast,
+					this.#context(conn),
+					room,
+					"allowBroadcast",
+				)
 			: false;
 		if (conn.closed) return;
 

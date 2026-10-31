@@ -44,6 +44,9 @@
  * @module
  */
 
+export { backoffDelay } from "./client/backoff.ts";
+
+export type { MessageHandler, PresenceHandler } from "./client/rooms.ts";
 export {
 	createWSClient,
 	type SubscribeOptions,
@@ -55,9 +58,5 @@ export {
 	type WSSendOptions,
 	type WSState,
 } from "./client/ws-client.ts";
-
-export type { MessageHandler, PresenceHandler } from "./client/rooms.ts";
-
-export { backoffDelay } from "./client/backoff.ts";
 
 export * from "./protocol/mod.ts";

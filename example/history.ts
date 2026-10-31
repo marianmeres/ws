@@ -18,12 +18,12 @@
  * @module
  */
 
+import type { WSRoomMessage } from "../src/protocol.ts";
 import {
 	type WSBroadcastEnvelope,
 	type WSPubSubAdapter,
 	WSPubSubLocal,
 } from "../src/server.ts";
-import type { WSRoomMessage } from "../src/protocol.ts";
 import { HISTORY_LIMIT, isChatPayload } from "./shared.ts";
 
 /** Composite key for the buffer map. `|` cannot appear in a validated namespace. */
