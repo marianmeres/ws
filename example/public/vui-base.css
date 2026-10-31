@@ -1,7 +1,7 @@
 /*
- * @marianmeres/vanilla-ui 0.5.2 — components/base.css, copied verbatim by
+ * @marianmeres/vanilla-ui 0.5.1 — components/base.css, copied verbatim by
  * example/build-styles.ts. Do not edit by hand; edit the kit and re-run
- * `deno task example:styles`.
+ * `pnpm run example:styles`.
  */
 /*
  * vui · base — the kit's shared style layer. NOT a component: no template, no

@@ -1058,7 +1058,9 @@ export class WSClient<TAuth = unknown> {
 		const socket = this.#socket;
 		if (!socket || socket.readyState !== WebSocket.OPEN) return null;
 		try {
-			socket.send(this.#encode(frame));
+			// `WSEncoder` admits any `ArrayBufferView`; `send()` refuses one over a
+			// SharedArrayBuffer at runtime, which lands in the catch below.
+			socket.send(this.#encode(frame) as string | BufferSource);
 		} catch (e) {
 			return this.#fail(e, "send failed");
 		}

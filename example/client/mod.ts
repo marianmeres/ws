@@ -4,9 +4,9 @@
 /**
  * Client entry point — the views, and nothing else.
  *
- * Bundled to `public/dist/bundle.js` by `@marianmeres/deno-build`:
+ * Bundled to `public/dist/bundle.js` by `@marianmeres/bundle`:
  * ```
- * deno task example:build     # or example:watch
+ * pnpm run example:build      # or example:watch
  * ```
  *
  * Two views swap in `#app`: a login form, then the chat. All state lives in

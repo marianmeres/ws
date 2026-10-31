@@ -442,7 +442,7 @@ export class WSService {
 		socket.onmessage = (event: MessageEvent) => {
 			// Last line of defence. `#onMessage` contains its own throws; if one
 			// ever escapes anyway, it must cost this socket and not the process —
-			// an unhandled rejection is fatal in Deno.
+			// an unhandled rejection is fatal in Node and Deno.
 			void this.#onMessage(conn, event.data).catch((e) => {
 				this.logger?.error?.(`unhandled frame error (${conn.id}): ${e}`);
 				this.#close(conn, CLOSE.INTERNAL_ERROR, "internal error");
@@ -1327,7 +1327,9 @@ export class WSService {
 	): boolean {
 		if (conn.socket.readyState !== WebSocket.OPEN) return false;
 		try {
-			conn.socket.send(wire);
+			// `WSEncoder` admits any `ArrayBufferView`; `send()` refuses one over a
+			// SharedArrayBuffer at runtime, which lands in the catch below.
+			conn.socket.send(wire as string | BufferSource);
 		} catch (e) {
 			this.logger?.debug?.(`send failed (${conn.id}): ${e}`);
 			return false;

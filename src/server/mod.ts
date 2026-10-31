@@ -2,15 +2,15 @@
  * Reference server — a demino app implementing the whole wire protocol: the
  * core (messages between client and server) and the rooms extension.
  *
- * Runs under any demino 2.0 adapter — `@marianmeres/demino/deno`, or
- * `@marianmeres/demino/node` with the optional `ws` package — through the
- * `info.upgradeWebSocket` it provides; a bare `Deno.serve(app)` host still
- * works through `Deno.upgradeWebSocket`. Import it from
+ * Runs under any demino 2.0 adapter — `@marianmeres/demino/node` with the
+ * optional `ws` package, or `@marianmeres/demino/deno` — through the
+ * `info.upgradeWebSocket` it provides; on Deno a bare `Deno.serve(app)` host
+ * also works, through `Deno.upgradeWebSocket`. Import it from
  * `@marianmeres/ws/server` so `demino` never reaches a browser bundle.
  *
  * @example
  * ```ts
- * import { serve } from "@marianmeres/demino/deno"; // or "@marianmeres/demino/node"
+ * import { serve } from "@marianmeres/demino/node"; // or "@marianmeres/demino/deno"
  * import { createWSApp } from "@marianmeres/ws/server";
  *
  * const { app, service } = createWSApp("/ws", [], {
@@ -104,11 +104,13 @@ export interface WSApp {
  *
  * @example
  * ```ts
+ * import { serve } from "@marianmeres/demino/node";
+ *
  * const { app, service } = createWSApp("/ws", [], {
  *     verify: (payload) => ({ clientId: String(payload) }),
  * });
  *
- * Deno.serve(app);
+ * await serve(app, { port: 8000 });
  * await service.publish("general", { text: "hi" });
  * ```
  */

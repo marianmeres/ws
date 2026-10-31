@@ -9,7 +9,7 @@
  * message passes through: `WSService` calls `adapter.publish(envelope)` after
  * local delivery for *every* publish and broadcast, whoever originated it —
  * a connected client, `service.publish()`, or the HTTP injection route. A real
- * deployment would put Redis or Deno KV here; we tee into a ring buffer and
+ * deployment would put Redis or Postgres here; we tee into a ring buffer and
  * delegate the actual (non-)propagation to the wrapped adapter.
  *
  * Note this is application code inspecting an application payload. The library

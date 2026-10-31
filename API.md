@@ -5,7 +5,7 @@ Three entry points:
 | Import                     | Contains                                   | Runtime                                    |
 | -------------------------- | ------------------------------------------ | ------------------------------------------ |
 | `@marianmeres/ws`          | the client, plus everything from protocol  | any                                        |
-| `@marianmeres/ws/server`   | the reference server, plus `WSRemoteError` | any demino 2.0 adapter (Deno; Node + `ws`) |
+| `@marianmeres/ws/server`   | the reference server, plus `WSRemoteError` | any demino 2.0 adapter (Node + `ws`; Deno) |
 | `@marianmeres/ws/protocol` | wire definitions only, dependency-free     | any                                        |
 
 ---
@@ -497,13 +497,13 @@ component and any other store-compatible consumer works too:
 
 ## Server
 
-Import from `@marianmeres/ws/server` (JSR and npm; on npm `@marianmeres/demino`
+Import from `@marianmeres/ws/server` (npm and JSR; on npm `@marianmeres/demino`
 is an optional peer dependency — install it next to this package).
 
-It runs under any demino 2.0 adapter — `@marianmeres/demino/deno`, or
-`@marianmeres/demino/node` with the optional `ws` package installed — through
-the `info.upgradeWebSocket` the adapter provides. A bare `Deno.serve(app)` host
-still works, through `Deno.upgradeWebSocket`. With neither (Node without a
+It runs under any demino 2.0 adapter — `@marianmeres/demino/node` with the
+optional `ws` package installed, or `@marianmeres/demino/deno` — through the
+`info.upgradeWebSocket` the adapter provides. On Deno, a bare `Deno.serve(app)`
+host also works, through `Deno.upgradeWebSocket`. With neither (Node without a
 demino adapter), the upgrade route throws.
 
 ```typescript
@@ -560,6 +560,7 @@ is not valid JSON answers `400`.
 **Example**
 
 ```typescript
+import { serve } from "@marianmeres/demino/node";
 import { createWSApp } from "@marianmeres/ws/server";
 
 const { app, service } = createWSApp("/ws", [], {
@@ -575,7 +576,7 @@ const { app, service } = createWSApp("/ws", [], {
 
 await service.publish("notifications", { text: "deploy finished" }, "org-123");
 
-Deno.serve(app);
+await serve(app, { port: 8000 });
 ```
 
 #### Messages: `onMessage`
@@ -706,8 +707,8 @@ createWSApp("/ws", [], {
 
 An unlisted `Origin` is answered `403 Origin not allowed` and never reaches
 `verify`. The array form **permits a missing `Origin`**, because only browsers
-send the header and non-browser clients (the stock Deno client included) send
-none — the check exists to stop browsers. Pass a function instead when that is
+send the header and non-browser clients (Node's and Deno's own `WebSocket`
+included) send none — the check exists to stop browsers. Pass a function instead when that is
 too lax, or when the allowed set is dynamic:
 
 ```typescript
@@ -870,7 +871,7 @@ fail a publish that already succeeded locally.
 
 The default adapter, and the only one that ships today: there are no peer
 instances, so propagation is a no-op. Everything still works — the service
-delivers locally regardless of adapter. Redis / Deno-KV adapters are an
+delivers locally regardless of adapter. Redis / Postgres adapters are an
 unimplemented seam.
 
 ### `WSBroadcastEnvelope`

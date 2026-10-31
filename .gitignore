@@ -1,12 +1,26 @@
 node_modules/
-.idea
-.DS_Store
-.npm-dist
-tmp/*
+/dist/
+*.tsbuildinfo
+
 .env
 .env.*
 !.env.example
 
+# pnpm's lockfile is the one committed; another installer must not add a second
+package-lock.json
+npm-shrinkwrap.json
+bun.lock
+bun.lockb
+yarn.lock
 
-# example: generated client bundle (deno task example:build)
+tmp/*
+*.log
+.coverage
+
+.DS_Store
+.idea/
+.vscode/
+.claude/settings.local.json
+
+# example: generated client bundle (pnpm run example:build)
 example/public/dist/

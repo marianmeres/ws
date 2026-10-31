@@ -11,7 +11,7 @@
  *
  * Run:
  * ```
- * deno task example          # builds the client bundle, then serves
+ * pnpm run example          # builds the client bundle, then serves
  * ```
  *
  * @module
@@ -23,8 +23,11 @@ import {
 	type DeminoHandler,
 	logListenInfo,
 } from "@marianmeres/demino";
+import { serve } from "@marianmeres/demino/node";
 import { base36 } from "@marianmeres/uid";
-import { dirname, fromFileUrl, join } from "@std/path";
+import { dirname, join } from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
 import { createWSApp } from "../src/server.ts";
 import { HistoryAdapter } from "./history.ts";
 import {
@@ -36,16 +39,16 @@ import {
 	WORKSPACE_RE,
 } from "./shared.ts";
 
-const HERE = dirname(fromFileUrl(import.meta.url));
+const HERE = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(HERE, "public");
 
-const PORT = Number(Deno.env.get("PORT")) || 8000;
+const PORT = Number(process.env.PORT) || 8000;
 
 /**
  * Shared secret for the HTTP injection routes. Hard-coded default because this
  * is a demo; the point is that the routes exist *only* because `httpAuth` does.
  */
-const ADMIN_TOKEN = Deno.env.get("WS_EXAMPLE_TOKEN") || "dev-secret";
+const ADMIN_TOKEN = process.env.WS_EXAMPLE_TOKEN || "dev-secret";
 
 /**
  * Every message passes through here on its way out. See `history.ts` — this is
@@ -140,13 +143,13 @@ const siteApp = demino();
 siteApp.static("/", PUBLIC_DIR);
 
 if (import.meta.main) {
-	Deno.serve(
-		{
-			port: PORT,
-			onListen: (addr: Deno.NetAddr) => {
-				logListenInfo(addr);
-				const base = `http://localhost:${addr.port}`;
-				console.log(`
+	// Upgrades go through the `ws` package, the Node adapter's optional peer
+	await serve(deminoCompose([siteApp, apiApp, wsApp]), {
+		port: PORT,
+		onListen: (addr) => {
+			logListenInfo(addr);
+			const base = `http://localhost:${addr.port}`;
+			console.log(`
   Open ${base} in two windows, with two different nicknames.
 
   Server-side injection (arrives with from: null, rendered as a system line):
@@ -158,16 +161,14 @@ if (import.meta.main) {
 
   Connection stats:  ${base}/ws/stats  (guarded by the same token)
 `);
-			},
 		},
-		deminoCompose([siteApp, apiApp, wsApp]),
-	);
+	});
 
 	// Close every socket with 1001 on Ctrl-C. Clients treat that as recoverable
 	// and reconnect — restart the server and watch them come back.
-	Deno.addSignalListener("SIGINT", () => {
+	process.on("SIGINT", () => {
 		console.log("\nshutting down…");
-		service.close().finally(() => Deno.exit(0));
+		service.close().finally(() => process.exit(0));
 	});
 }
 

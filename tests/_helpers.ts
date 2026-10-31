@@ -1,7 +1,11 @@
-import { createWSApp, type WSAppOptions } from "../src/server/mod.ts";
-import type { WSService } from "../src/server/mod.ts";
+import assert from "node:assert/strict";
+import { connect, createServer, type Socket } from "node:net";
+import { versions } from "node:process";
+import type { DeminoServeHandler } from "@marianmeres/demino";
+import type { ServeFn, ServeHandle } from "@marianmeres/demino/node";
 import { PROTOCOL_VERSION } from "../src/protocol/constants.ts";
 import type { WSErrorInfo } from "../src/protocol/frames.ts";
+import { createWSApp, type WSAppOptions, type WSService } from "../src/server/mod.ts";
 
 export interface TestServer {
 	url: string;
@@ -10,33 +14,119 @@ export interface TestServer {
 	stop(): Promise<void>;
 }
 
+let servePromise: Promise<ServeFn> | undefined;
+
+/**
+ * The runtime's own demino adapter, so each runtime is tested the way its
+ * consumers serve the app: `/node` (upgrading through `ws`) on Node, `/deno`
+ * on Deno.
+ */
+function pickServe(): Promise<ServeFn> {
+	servePromise ??= versions.deno
+		? import("@marianmeres/demino/deno").then((m) => m.serve)
+		: import("@marianmeres/demino/node").then((m) => m.serve);
+	return servePromise;
+}
+
+/** Serves `handler` silently on `127.0.0.1:port` (or an ephemeral port). */
+export async function listen(
+	handler: DeminoServeHandler,
+	port = 0,
+): Promise<ServeHandle> {
+	const serve = await pickServe();
+	return serve(handler, { port, hostname: "127.0.0.1", onListen: () => {} });
+}
+
 /** Grabs a port, releases it, and hands back the number. */
-export function freePort(): number {
-	const listener = Deno.listen({ port: 0 });
-	const { port } = listener.addr as Deno.NetAddr;
-	listener.close();
-	return port;
+export function freePort(): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const server = createServer();
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", () => {
+			const { port } = server.address() as { port: number };
+			server.close(() => resolve(port));
+		});
+	});
+}
+
+/**
+ * Asserts that `fn` rejects with an instance of `ErrorClass` and returns the
+ * error, which `assert.rejects` does not.
+ */
+export async function rejection<E extends Error>(
+	fn: () => Promise<unknown>,
+	ErrorClass: new (...args: never[]) => E,
+): Promise<E> {
+	try {
+		await fn();
+	} catch (e) {
+		assert.ok(e instanceof ErrorClass, `expected ${ErrorClass.name}, got ${e}`);
+		return e;
+	}
+	assert.fail(`expected a rejection with ${ErrorClass.name}`);
 }
 
 /** Boots the reference server on `port` (or an ephemeral one). */
-export function startServer(
+export async function startServer(
 	options: WSAppOptions = {},
 	port = 0,
-): TestServer {
+): Promise<TestServer> {
 	const { app, service } = createWSApp("/ws", [], {
 		logger: null,
 		deminoOptions: { logger: null },
 		...options,
 	});
-	const server = Deno.serve({ port, onListen: () => {}, hostname: "127.0.0.1" }, app);
-	const actual = (server.addr as Deno.NetAddr).port;
+	const server = await listen(app, port);
 
 	return {
-		url: `ws://127.0.0.1:${actual}/ws`,
-		httpUrl: `http://127.0.0.1:${actual}/ws`,
+		url: `ws://127.0.0.1:${server.port}/ws`,
+		httpUrl: `http://127.0.0.1:${server.port}/ws`,
 		service,
 		async stop() {
 			await service.close();
+			await server.shutdown();
+		},
+	};
+}
+
+/** A hand-written server, for behaviour the reference server never shows. */
+export interface StubServer {
+	url: string;
+	stop(): Promise<void>;
+}
+
+/**
+ * The base of every stub server below: upgrades through the runtime's demino
+ * adapter, hands each socket to `onSocket` to wire up, and closes whatever is
+ * still open on `stop()`. Anything but an upgrade gets a 426.
+ */
+async function startStub(
+	port: number,
+	onSocket: (socket: WebSocket) => void,
+): Promise<StubServer> {
+	const sockets = new Set<WebSocket>();
+
+	const server = await listen((req, info) => {
+		const upgrade = info?.upgradeWebSocket;
+		if (!upgrade || req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+			return new Response("nope", { status: 426 });
+		}
+		const { socket, response } = upgrade(req);
+		sockets.add(socket);
+		socket.addEventListener("close", () => sockets.delete(socket));
+		onSocket(socket);
+		return response;
+	}, port);
+
+	return {
+		url: `ws://127.0.0.1:${server.port}/ws`,
+		async stop() {
+			for (const socket of sockets) {
+				try {
+					socket.close();
+				} catch { /* already gone */ }
+			}
+			sockets.clear();
 			await server.shutdown();
 		},
 	};
@@ -47,51 +137,22 @@ export function startServer(
  * never answering a ping, never closing. This is a half-open connection, the
  * failure the heartbeat exists to catch.
  */
-export function startSilentServer(port = 0): {
-	url: string;
-	stop(): Promise<void>;
-} {
-	const sockets = new Set<WebSocket>();
-
-	const server = Deno.serve(
-		{ port, onListen: () => {}, hostname: "127.0.0.1" },
-		(req) => {
-			if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-				return new Response("nope", { status: 426 });
+export function startSilentServer(port = 0): Promise<StubServer> {
+	return startStub(port, (socket) => {
+		socket.onmessage = (event) => {
+			const frame = JSON.parse(event.data);
+			// Answer the handshake so the client reaches "open"...
+			if (frame.type === "auth") {
+				socket.send(JSON.stringify({
+					type: "hello",
+					clientId: "silent",
+					namespace: "default",
+					protocol: 1,
+				}));
 			}
-			const { socket, response } = Deno.upgradeWebSocket(req);
-			sockets.add(socket);
-			socket.onmessage = (event) => {
-				const frame = JSON.parse(event.data);
-				// Answer the handshake so the client reaches "open"...
-				if (frame.type === "auth") {
-					socket.send(JSON.stringify({
-						type: "hello",
-						clientId: "silent",
-						namespace: "default",
-						protocol: 1,
-					}));
-				}
-				// ...and then ignore everything else, pings included.
-			};
-			socket.onclose = () => sockets.delete(socket);
-			return response;
-		},
-	);
-
-	const { port: actual } = server.addr as Deno.NetAddr;
-	return {
-		url: `ws://127.0.0.1:${actual}/ws`,
-		async stop() {
-			for (const socket of sockets) {
-				try {
-					socket.close();
-				} catch { /* already gone */ }
-			}
-			sockets.clear();
-			await server.shutdown();
-		},
-	};
+			// ...and then ignore everything else, pings included.
+		};
+	});
 }
 
 /**
@@ -99,100 +160,42 @@ export function startSilentServer(port = 0): {
  * it is asked to publish, or sent a message — so the frame is definitely
  * transmitted and its ack definitely cannot arrive.
  */
-export function startNoAckServer(port = 0): {
-	url: string;
-	stop(): Promise<void>;
-} {
-	const sockets = new Set<WebSocket>();
-
-	const server = Deno.serve(
-		{ port, onListen: () => {}, hostname: "127.0.0.1" },
-		(req) => {
-			if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-				return new Response("nope", { status: 426 });
+export function startNoAckServer(port = 0): Promise<StubServer> {
+	return startStub(port, (socket) => {
+		socket.onmessage = (event) => {
+			const frame = JSON.parse(event.data);
+			if (frame.type === "auth") {
+				socket.send(JSON.stringify({
+					type: "hello",
+					clientId: "no-ack",
+					namespace: "default",
+					protocol: PROTOCOL_VERSION,
+				}));
+			} else if (frame.type === "pub" || frame.type === "msg") {
+				socket.close(1001, "gone mid-publish");
 			}
-			const { socket, response } = Deno.upgradeWebSocket(req);
-			sockets.add(socket);
-			socket.onmessage = (event) => {
-				const frame = JSON.parse(event.data);
-				if (frame.type === "auth") {
-					socket.send(JSON.stringify({
-						type: "hello",
-						clientId: "no-ack",
-						namespace: "default",
-						protocol: PROTOCOL_VERSION,
-					}));
-				} else if (frame.type === "pub" || frame.type === "msg") {
-					socket.close(1001, "gone mid-publish");
-				}
-			};
-			socket.onclose = () => sockets.delete(socket);
-			return response;
-		},
-	);
-
-	const { port: actual } = server.addr as Deno.NetAddr;
-	return {
-		url: `ws://127.0.0.1:${actual}/ws`,
-		async stop() {
-			for (const socket of sockets) {
-				try {
-					socket.close();
-				} catch { /* already gone */ }
-			}
-			sockets.clear();
-			await server.shutdown();
-		},
-	};
+		};
+	});
 }
 
 /**
  * A server that answers the handshake with a *binary* `hello` — the frame is
  * still UTF-8 JSON, only the WebSocket message type differs.
  */
-export function startBinaryHelloServer(port = 0): {
-	url: string;
-	stop(): Promise<void>;
-} {
-	const sockets = new Set<WebSocket>();
-
-	const server = Deno.serve(
-		{ port, onListen: () => {}, hostname: "127.0.0.1" },
-		(req) => {
-			if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-				return new Response("nope", { status: 426 });
+export function startBinaryHelloServer(port = 0): Promise<StubServer> {
+	return startStub(port, (socket) => {
+		socket.onmessage = (event) => {
+			const frame = JSON.parse(event.data);
+			if (frame.type === "auth") {
+				socket.send(new TextEncoder().encode(JSON.stringify({
+					type: "hello",
+					clientId: "binary",
+					namespace: "default",
+					protocol: PROTOCOL_VERSION,
+				})));
 			}
-			const { socket, response } = Deno.upgradeWebSocket(req);
-			sockets.add(socket);
-			socket.onmessage = (event) => {
-				const frame = JSON.parse(event.data);
-				if (frame.type === "auth") {
-					socket.send(new TextEncoder().encode(JSON.stringify({
-						type: "hello",
-						clientId: "binary",
-						namespace: "default",
-						protocol: PROTOCOL_VERSION,
-					})));
-				}
-			};
-			socket.onclose = () => sockets.delete(socket);
-			return response;
-		},
-	);
-
-	const { port: actual } = server.addr as Deno.NetAddr;
-	return {
-		url: `ws://127.0.0.1:${actual}/ws`,
-		async stop() {
-			for (const socket of sockets) {
-				try {
-					socket.close();
-				} catch { /* already gone */ }
-			}
-			sockets.clear();
-			await server.shutdown();
-		},
-	};
+		};
+	});
 }
 
 /**
@@ -206,102 +209,79 @@ export function startBinaryHelloServer(port = 0): {
  * the `details` the payload asked for (a `nack` with an id, an `error` frame
  * without).
  */
-export function startCoreServer(port = 0): {
-	url: string;
-	/** Every `auth` frame received, as sent. */
-	auths: Record<string, unknown>[];
-	/** Every `msg` payload received, in order. */
-	received: unknown[];
-	/** Pushes a direct message to every connected socket. */
-	push(payload: unknown): void;
-	stop(): Promise<void>;
-} {
-	const sockets = new Set<WebSocket>();
+export async function startCoreServer(port = 0): Promise<
+	StubServer & {
+		/** Every `auth` frame received, as sent. */
+		auths: Record<string, unknown>[];
+		/** Every `msg` payload received, in order. */
+		received: unknown[];
+		/** Pushes a direct message to every connected socket. */
+		push(payload: unknown): void;
+	}
+> {
 	/** Sockets past the handshake — the only ones a push may reach. */
 	const ready = new Set<WebSocket>();
 	const auths: Record<string, unknown>[] = [];
 	const received: unknown[] = [];
 
-	const server = Deno.serve(
-		{ port, onListen: () => {}, hostname: "127.0.0.1" },
-		(req) => {
-			if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-				return new Response("nope", { status: 426 });
-			}
-			const { socket, response } = Deno.upgradeWebSocket(req);
-			sockets.add(socket);
-			const send = (frame: unknown) => socket.send(JSON.stringify(frame));
+	const server = await startStub(port, (socket) => {
+		const send = (frame: unknown) => socket.send(JSON.stringify(frame));
 
-			socket.onmessage = (event) => {
-				const frame = JSON.parse(event.data);
-				if (frame.type === "auth") {
-					auths.push(frame);
-					if (frame.payload?.token === "bad") {
-						socket.close(4001, "authentication failed");
-						return;
-					}
-					ready.add(socket);
-					send({ type: "hello", protocol: PROTOCOL_VERSION });
-				} else if (!ready.has(socket)) {
-					send({ type: "error", error: { code: "unauthorized", message: "" } });
-				} else if (frame.type === "ping") {
-					send({ type: "pong" });
-				} else if (frame.type === "msg") {
-					received.push(frame.payload);
-					if (frame.payload?.op === "refuse") {
-						const { details } = frame.payload;
-						const error = {
-							code: "refused",
-							message: "refused on request",
-							...(details === undefined ? {} : { details }),
-						};
-						send(
-							typeof frame.id === "string"
-								? { type: "nack", id: frame.id, error }
-								: { type: "error", error },
-						);
-					} else if (typeof frame.id === "string") {
-						send({
-							type: "ack",
-							id: frame.id,
-							payload: { echo: frame.payload },
-						});
-					}
-				} else {
-					const error = { code: "unsupported", message: "rooms not supported" };
+		socket.onmessage = (event) => {
+			const frame = JSON.parse(event.data);
+			if (frame.type === "auth") {
+				auths.push(frame);
+				if (frame.payload?.token === "bad") {
+					socket.close(4001, "authentication failed");
+					return;
+				}
+				ready.add(socket);
+				send({ type: "hello", protocol: PROTOCOL_VERSION });
+			} else if (!ready.has(socket)) {
+				send({ type: "error", error: { code: "unauthorized", message: "" } });
+			} else if (frame.type === "ping") {
+				send({ type: "pong" });
+			} else if (frame.type === "msg") {
+				received.push(frame.payload);
+				if (frame.payload?.op === "refuse") {
+					const { details } = frame.payload;
+					const error = {
+						code: "refused",
+						message: "refused on request",
+						...(details === undefined ? {} : { details }),
+					};
 					send(
 						typeof frame.id === "string"
 							? { type: "nack", id: frame.id, error }
 							: { type: "error", error },
 					);
+				} else if (typeof frame.id === "string") {
+					send({
+						type: "ack",
+						id: frame.id,
+						payload: { echo: frame.payload },
+					});
 				}
-			};
-			socket.onclose = () => {
-				sockets.delete(socket);
-				ready.delete(socket);
-			};
-			return response;
-		},
-	);
+			} else {
+				const error = { code: "unsupported", message: "rooms not supported" };
+				send(
+					typeof frame.id === "string"
+						? { type: "nack", id: frame.id, error }
+						: { type: "error", error },
+				);
+			}
+		};
+		socket.addEventListener("close", () => ready.delete(socket));
+	});
 
-	const { port: actual } = server.addr as Deno.NetAddr;
 	return {
-		url: `ws://127.0.0.1:${actual}/ws`,
+		...server,
 		auths,
 		received,
 		push(payload) {
 			for (const socket of ready) {
 				socket.send(JSON.stringify({ type: "msg", payload }));
 			}
-		},
-		async stop() {
-			for (const socket of sockets) {
-				try {
-					socket.close();
-				} catch { /* already gone */ }
-			}
-			sockets.clear();
-			await server.shutdown();
 		},
 	};
 }
@@ -416,52 +396,23 @@ export async function rawConnect(url: string): Promise<RawSocket> {
  * `error`, an `error` frame without `error`. The reference server never sends
  * either; a third-party one with a bug might, and the client must survive it.
  */
-export function startBadNackServer(port = 0): {
-	url: string;
-	stop(): Promise<void>;
-} {
-	const sockets = new Set<WebSocket>();
-
-	const server = Deno.serve(
-		{ port, onListen: () => {}, hostname: "127.0.0.1" },
-		(req) => {
-			if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-				return new Response("nope", { status: 426 });
+export function startBadNackServer(port = 0): Promise<StubServer> {
+	return startStub(port, (socket) => {
+		socket.onmessage = (event) => {
+			const frame = JSON.parse(event.data);
+			if (frame.type === "auth") {
+				socket.send(
+					JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION }),
+				);
+			} else if (frame.type === "msg" && typeof frame.id === "string") {
+				socket.send(JSON.stringify({ type: "nack", id: frame.id }));
+			} else if (frame.type === "msg") {
+				socket.send(JSON.stringify({ type: "error" }));
+			} else if (frame.type === "ping") {
+				socket.send(JSON.stringify({ type: "pong" }));
 			}
-			const { socket, response } = Deno.upgradeWebSocket(req);
-			sockets.add(socket);
-			socket.onmessage = (event) => {
-				const frame = JSON.parse(event.data);
-				if (frame.type === "auth") {
-					socket.send(
-						JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION }),
-					);
-				} else if (frame.type === "msg" && typeof frame.id === "string") {
-					socket.send(JSON.stringify({ type: "nack", id: frame.id }));
-				} else if (frame.type === "msg") {
-					socket.send(JSON.stringify({ type: "error" }));
-				} else if (frame.type === "ping") {
-					socket.send(JSON.stringify({ type: "pong" }));
-				}
-			};
-			socket.onclose = () => sockets.delete(socket);
-			return response;
-		},
-	);
-
-	const { port: actual } = server.addr as Deno.NetAddr;
-	return {
-		url: `ws://127.0.0.1:${actual}/ws`,
-		async stop() {
-			for (const socket of sockets) {
-				try {
-					socket.close();
-				} catch { /* already gone */ }
-			}
-			sockets.clear();
-			await server.shutdown();
-		},
-	};
+		};
+	});
 }
 
 /**
@@ -472,27 +423,36 @@ export function startBadNackServer(port = 0): {
 export async function connectNonReadingPeer(
 	url: string,
 	auth: Record<string, unknown> = {},
-): Promise<{ conn: Deno.TcpConn; close(): void }> {
-	const { hostname, port } = new URL(url);
-	const conn = await Deno.connect({ hostname, port: Number(port) });
-	const text = new TextEncoder();
-	await conn.write(text.encode(
-		`GET ${new URL(url).pathname} HTTP/1.1\r\nHost: ${hostname}\r\n` +
+): Promise<{ conn: Socket; close(): void }> {
+	const { hostname, port, pathname } = new URL(url);
+	const conn = connect({ host: hostname, port: Number(port) });
+	await new Promise<void>((resolve, reject) => {
+		conn.once("connect", resolve);
+		conn.once("error", reject);
+	});
+	// From here the server ends this connection, one way or another: a reset
+	// must not surface as an unhandled 'error' event, fatal to the process.
+	conn.on("error", () => {});
+	conn.write(
+		`GET ${pathname} HTTP/1.1\r\nHost: ${hostname}\r\n` +
 			"Upgrade: websocket\r\nConnection: Upgrade\r\n" +
 			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-	));
+	);
 	// The 101 is the one thing this peer reads: it is small, and it proves
-	// the upgrade happened before the auth frame goes out.
-	const response = new Uint8Array(4096);
-	const n = await conn.read(response);
-	if (
-		!n ||
-		!new TextDecoder().decode(response.subarray(0, n)).startsWith("HTTP/1.1 101")
-	) {
-		conn.close();
+	// the upgrade happened before the auth frame goes out. After it the socket
+	// is paused, so nothing drains it again.
+	const response: Buffer = await new Promise((resolve, reject) => {
+		conn.once("data", (chunk: Buffer) => {
+			conn.pause();
+			resolve(chunk);
+		});
+		conn.once("close", () => reject(new Error("closed before the upgrade")));
+	});
+	if (!response.toString("latin1").startsWith("HTTP/1.1 101")) {
+		conn.destroy();
 		throw new Error("upgrade refused");
 	}
-	await conn.write(maskedTextFrame(JSON.stringify({
+	conn.write(maskedTextFrame(JSON.stringify({
 		type: "auth",
 		protocol: PROTOCOL_VERSION,
 		payload: null,
@@ -501,9 +461,7 @@ export async function connectNonReadingPeer(
 	return {
 		conn,
 		close() {
-			try {
-				conn.close();
-			} catch { /* already gone */ }
+			conn.destroy();
 		},
 	};
 }

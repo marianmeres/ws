@@ -1,0 +1,67 @@
+# Each job runs `package.json` scripts only, so CI checks what `pnpm run ...`
+# checks locally - nothing is defined only here.
+#
+# - Node is the dev runtime, the reference and the gate: `pnpm run ci` is the
+#   typecheck (tsc --noEmit, the only type gate - the suite is type-stripped),
+#   Biome, the suite, and the npm smoke (build, pack, install, round trip).
+# - Deno is a consumer runtime while JSR consumers exist: the same suite on
+#   Deno (demino's `/deno` adapter, plus the bare `Deno.serve` fallback) and
+#   the JSR checks (`deno doc --lint`, publish dry run: type check, slow types,
+#   file list). Pinned to the exact version used locally; the runtime is in
+#   bug-fix-only mode, bump it deliberately.
+# - Nothing runs on Bun.
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["24.x", "26.x"]
+    steps:
+      - uses: actions/checkout@v7
+      # pnpm version is read from package.json "packageManager"
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run ci
+
+  deno:
+    name: Deno ${{ matrix.deno }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        deno: ["2.9.8"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ matrix.deno }}
+      # pnpm only runs the scripts here; Deno resolves through deno.json
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+      - run: pnpm run test:deno
+      - run: pnpm run jsr:check

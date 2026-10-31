@@ -9,9 +9,9 @@
  * - **Rooms** — `subscribe()` / `publish()` / `broadcast()` and presence, for
  *   a server that relays between clients (the rooms extension).
  *
- * The client is dependency-light and runs in browsers, Deno, Node 22+, Bun and
- * Workers — `WebSocket` is a global in all of them, so there is no polyfill and
- * no transport dependency.
+ * The client is dependency-light and uses the global `WebSocket` — built into
+ * browsers, Node 22+, Deno and Workers — so there is no polyfill and no
+ * transport dependency.
  *
  * The reference server lives behind a separate entry point,
  * `@marianmeres/ws/server`, so `demino` never lands in a browser bundle.

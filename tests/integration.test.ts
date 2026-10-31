@@ -1,4 +1,6 @@
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import assert from "node:assert/strict";
+import { request } from "node:http";
+import { test } from "node:test";
 import type { DeminoHandler } from "@marianmeres/demino";
 
 import { createWSClient } from "../src/mod.ts";
@@ -15,7 +17,7 @@ import {
 	WSTerminatedError,
 	WSTimeoutError,
 } from "../src/protocol/errors.ts";
-import { sleep, startServer, startSilentServer, until } from "./_helpers.ts";
+import { rejection, sleep, startServer, startSilentServer, until } from "./_helpers.ts";
 
 /** Quiet, heartbeat-free client — liveness has its own tests. */
 const client = (url: string, options: Record<string, unknown> = {}) =>
@@ -28,27 +30,27 @@ const adminOnly: DeminoHandler = (req: Request) => {
 	}
 };
 
-Deno.test("connect, subscribe, publish, deliver", async () => {
-	const server = startServer();
+test("connect, subscribe, publish, deliver", async () => {
+	const server = await startServer();
 	const alice = client(server.url, { clientId: "alice" });
 	const bob = client(server.url, { clientId: "bob" });
 
 	try {
 		await alice.connect();
 		await bob.connect();
-		assertEquals(alice.clientId, "alice");
-		assertEquals(alice.namespace, "default");
+		assert.deepEqual(alice.clientId, "alice");
+		assert.deepEqual(alice.namespace, "default");
 
 		const received: WSRoomMessage[] = [];
 		await bob.subscribe("chat", (msg) => received.push(msg));
 
 		const { recipients } = await alice.publish("chat", { text: "hi" });
-		assertEquals(recipients, 1);
+		assert.deepEqual(recipients, 1);
 
 		await until(() => received.length === 1, "bob receives the message");
-		assertEquals(received[0].payload, { text: "hi" });
-		assertEquals(received[0].room, "chat");
-		assertEquals(received[0].from, "alice");
+		assert.deepEqual(received[0].payload, { text: "hi" });
+		assert.deepEqual(received[0].room, "chat");
+		assert.deepEqual(received[0].from, "alice");
 		assert(received[0].timestamp > 0);
 	} finally {
 		alice.dispose();
@@ -57,8 +59,8 @@ Deno.test("connect, subscribe, publish, deliver", async () => {
 	}
 });
 
-Deno.test("namespaces isolate identically named rooms", async () => {
-	const server = startServer();
+test("namespaces isolate identically named rooms", async () => {
+	const server = await startServer();
 	const one = client(server.url, { namespace: "org-1", clientId: "one" });
 	const two = client(server.url, { namespace: "org-2", clientId: "two" });
 
@@ -75,9 +77,9 @@ Deno.test("namespaces isolate identically named rooms", async () => {
 		const { recipients } = await one.publish("chat", { text: "org-1 only" });
 
 		// Only the publisher's own namespace sees it.
-		assertEquals(recipients, 1);
+		assert.deepEqual(recipients, 1);
 		await until(() => seenByOne.length === 1, "same-namespace delivery");
-		assertEquals(seenByTwo.length, 0, "namespace boundary leaked");
+		assert.deepEqual(seenByTwo.length, 0, "namespace boundary leaked");
 	} finally {
 		one.dispose();
 		two.dispose();
@@ -85,14 +87,14 @@ Deno.test("namespaces isolate identically named rooms", async () => {
 	}
 });
 
-Deno.test("publishing into someone else's namespace is refused", async () => {
-	const server = startServer();
+test("publishing into someone else's namespace is refused", async () => {
+	const server = await startServer();
 	const c = client(server.url, { namespace: "org-1" });
 
 	try {
 		await c.connect();
 		// Otherwise the isolation boundary would be decorative.
-		await assertRejects(
+		await rejection(
 			() => c.publish("chat", { x: 1 }, "org-2"),
 			WSRemoteError,
 		);
@@ -102,21 +104,21 @@ Deno.test("publishing into someone else's namespace is refused", async () => {
 	}
 });
 
-Deno.test("broadcast is denied by default", async () => {
-	const server = startServer();
+test("broadcast is denied by default", async () => {
+	const server = await startServer();
 	const c = client(server.url);
 
 	try {
 		await c.connect();
-		await assertRejects(() => c.broadcast("alerts", { x: 1 }), WSRemoteError);
+		await rejection(() => c.broadcast("alerts", { x: 1 }), WSRemoteError);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("broadcast crosses namespaces when allowed", async () => {
-	const server = startServer({ allowBroadcast: () => true });
+test("broadcast crosses namespaces when allowed", async () => {
+	const server = await startServer({ allowBroadcast: () => true });
 	const one = client(server.url, { namespace: "org-1" });
 	const two = client(server.url, { namespace: "org-2" });
 
@@ -130,14 +132,14 @@ Deno.test("broadcast crosses namespaces when allowed", async () => {
 		await two.subscribe("alerts", (m) => seenByTwo.push(m));
 
 		const { recipients } = await one.broadcast("alerts", { text: "maintenance" });
-		assertEquals(recipients, 2);
+		assert.deepEqual(recipients, 2);
 
 		await until(
 			() => seenByOne.length === 1 && seenByTwo.length === 1,
 			"both namespaces receive the broadcast",
 		);
 		// Receivers always see the namespace they actually live in.
-		assertEquals(seenByTwo[0].namespace, "org-2");
+		assert.deepEqual(seenByTwo[0].namespace, "org-2");
 	} finally {
 		one.dispose();
 		two.dispose();
@@ -157,9 +159,9 @@ function countingEncoder(): { encode: WSEncoder; count: () => number } {
 	};
 }
 
-Deno.test("a fan-out frame is encoded once, not once per subscriber", async () => {
+test("a fan-out frame is encoded once, not once per subscriber", async () => {
 	const encoder = countingEncoder();
-	const server = startServer({ encode: encoder.encode });
+	const server = await startServer({ encode: encoder.encode });
 	const clients = ["a", "b", "c"].map((id) => client(server.url, { clientId: id }));
 
 	try {
@@ -170,18 +172,18 @@ Deno.test("a fan-out frame is encoded once, not once per subscriber", async () =
 		}
 
 		const { recipients } = await clients[0].publish("chat", { text: "hi" });
-		assertEquals(recipients, 3);
+		assert.deepEqual(recipients, 3);
 		await until(() => seen.length === 3, "all three subscribers receive it");
-		assertEquals(encoder.count(), 1, "one namespace, one encoding");
+		assert.deepEqual(encoder.count(), 1, "one namespace, one encoding");
 	} finally {
 		for (const c of clients) c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("a broadcast is encoded once per namespace", async () => {
+test("a broadcast is encoded once per namespace", async () => {
 	const encoder = countingEncoder();
-	const server = startServer({
+	const server = await startServer({
 		encode: encoder.encode,
 		allowBroadcast: () => true,
 	});
@@ -196,9 +198,9 @@ Deno.test("a broadcast is encoded once per namespace", async () => {
 		await two.subscribe("alerts", (m) => seen.push(m));
 
 		const { recipients } = await one.broadcast("alerts", { text: "maintenance" });
-		assertEquals(recipients, 2);
+		assert.deepEqual(recipients, 2);
 		await until(() => seen.length === 2, "both namespaces receive it");
-		assertEquals(encoder.count(), 2, "two namespaces, two encodings");
+		assert.deepEqual(encoder.count(), 2, "two namespaces, two encodings");
 	} finally {
 		one.dispose();
 		two.dispose();
@@ -206,8 +208,8 @@ Deno.test("a broadcast is encoded once per namespace", async () => {
 	}
 });
 
-Deno.test("presence: sync on subscribe, then join and leave deltas", async () => {
-	const server = startServer();
+test("presence: sync on subscribe, then join and leave deltas", async () => {
+	const server = await startServer();
 	const alice = client(server.url, { clientId: "alice" });
 	const bob = client(server.url, { clientId: "bob" });
 
@@ -220,8 +222,8 @@ Deno.test("presence: sync on subscribe, then join and leave deltas", async () =>
 
 		// Alice is alone, and her snapshot says so.
 		await until(() => aliceEvents.length === 1, "alice gets a sync");
-		assertEquals(aliceEvents[0].event, "sync");
-		assertEquals(aliceEvents[0].members, ["alice"]);
+		assert.deepEqual(aliceEvents[0].event, "sync");
+		assert.deepEqual(aliceEvents[0].members, ["alice"]);
 
 		await bob.connect();
 		const bobEvents: WSPresenceEvent[] = [];
@@ -231,21 +233,21 @@ Deno.test("presence: sync on subscribe, then join and leave deltas", async () =>
 
 		// Bob's own snapshot already includes both.
 		await until(() => bobEvents.length === 1, "bob gets a sync");
-		assertEquals(bobEvents[0].event, "sync");
-		assertEquals(bobEvents[0].members.sort(), ["alice", "bob"]);
+		assert.deepEqual(bobEvents[0].event, "sync");
+		assert.deepEqual(bobEvents[0].members.sort(), ["alice", "bob"]);
 
 		// Alice is told about the arrival.
 		await until(() => aliceEvents.length === 2, "alice sees bob join");
-		assertEquals(aliceEvents[1].event, "join");
-		assertEquals(aliceEvents[1].clientId, "bob");
-		assertEquals(alice.members("room").sort(), ["alice", "bob"]);
+		assert.deepEqual(aliceEvents[1].event, "join");
+		assert.deepEqual(aliceEvents[1].clientId, "bob");
+		assert.deepEqual(alice.members("room").sort(), ["alice", "bob"]);
 
 		bob.dispose();
 
 		await until(() => aliceEvents.length === 3, "alice sees bob leave");
-		assertEquals(aliceEvents[2].event, "leave");
-		assertEquals(aliceEvents[2].clientId, "bob");
-		assertEquals(alice.members("room"), ["alice"]);
+		assert.deepEqual(aliceEvents[2].event, "leave");
+		assert.deepEqual(aliceEvents[2].clientId, "bob");
+		assert.deepEqual(alice.members("room"), ["alice"]);
 	} finally {
 		alice.dispose();
 		bob.dispose();
@@ -253,8 +255,8 @@ Deno.test("presence: sync on subscribe, then join and leave deltas", async () =>
 	}
 });
 
-Deno.test("server-injected messages arrive with from: null", async () => {
-	const server = startServer();
+test("server-injected messages arrive with from: null", async () => {
+	const server = await startServer();
 	const c = client(server.url);
 
 	try {
@@ -263,19 +265,19 @@ Deno.test("server-injected messages arrive with from: null", async () => {
 		await c.subscribe("notifications", (m) => received.push(m));
 
 		const recipients = await server.service.publish("notifications", { n: 1 });
-		assertEquals(recipients, 1);
+		assert.deepEqual(recipients, 1);
 
 		await until(() => received.length === 1, "injected message arrives");
 		// This is how a client tells server pushes from peer traffic.
-		assertEquals(received[0].from, null);
+		assert.deepEqual(received[0].from, null);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("refcounting: one handler leaving does not unsubscribe the room", async () => {
-	const server = startServer();
+test("refcounting: one handler leaving does not unsubscribe the room", async () => {
+	const server = await startServer();
 	const c = client(server.url);
 
 	try {
@@ -290,15 +292,15 @@ Deno.test("refcounting: one handler leaving does not unsubscribe the room", asyn
 
 		await server.service.publish("chat", { n: 1 });
 		await until(() => b.length === 1, "surviving handler still receives");
-		assertEquals(a.length, 0, "detached handler still received");
+		assert.deepEqual(a.length, 0, "detached handler still received");
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("unsubscribe stops delivery", async () => {
-	const server = startServer();
+test("unsubscribe stops delivery", async () => {
+	const server = await startServer();
 	const c = client(server.url);
 
 	try {
@@ -306,20 +308,20 @@ Deno.test("unsubscribe stops delivery", async () => {
 		const seen: WSRoomMessage[] = [];
 		await c.subscribe("chat", (m) => seen.push(m));
 		await c.unsubscribe("chat");
-		assertEquals(c.isSubscribed("chat"), false);
+		assert.deepEqual(c.isSubscribed("chat"), false);
 
 		const recipients = await server.service.publish("chat", { n: 1 });
-		assertEquals(recipients, 0);
+		assert.deepEqual(recipients, 0);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("a per-send timeout bounds that send while the default governs the rest", async () => {
+test("a per-send timeout bounds that send while the default governs the rest", async () => {
 	// The silent server completes the handshake and then answers nothing, so
 	// an acked send can only end by its deadline.
-	const silent = startSilentServer();
+	const silent = await startSilentServer();
 	const c = client(silent.url, { sendTimeout: 30_000 });
 
 	try {
@@ -330,7 +332,7 @@ Deno.test("a per-send timeout bounds that send while the default governs the res
 		patient.then(() => defaultSettled = true, () => defaultSettled = true);
 
 		const started = Date.now();
-		const error = await assertRejects(
+		const error = await rejection(
 			() => c.send({ op: "start" }, { ack: true, timeout: 50 }),
 			WSTimeoutError,
 		);
@@ -341,19 +343,19 @@ Deno.test("a per-send timeout bounds that send while the default governs the res
 
 		// The send on the default deadline is still waiting — 30 s, not 50 ms.
 		await sleep(100);
-		assertEquals(defaultSettled, false, "the default deadline was shortened too");
+		assert.deepEqual(defaultSettled, false, "the default deadline was shortened too");
 
 		// Still in flight, so the close settles it — not the dispose after it.
 		c.dispose();
-		await assertRejects(() => patient, WSConnectionLostError);
+		await rejection(() => patient, WSConnectionLostError);
 	} finally {
 		c.dispose();
 		await silent.stop();
 	}
 });
 
-Deno.test("autoConnect: publish works without an explicit connect()", async () => {
-	const server = startServer();
+test("autoConnect: publish works without an explicit connect()", async () => {
+	const server = await startServer();
 	const producer = client(server.url);
 	const consumer = client(server.url);
 
@@ -364,7 +366,7 @@ Deno.test("autoConnect: publish works without an explicit connect()", async () =
 
 		// No connect() call: the send starts the machine and buffers until open.
 		const { recipients } = await producer.publish("chat", { text: "lazy" });
-		assertEquals(recipients, 1);
+		assert.deepEqual(recipients, 1);
 		await until(() => seen.length === 1, "buffered publish is delivered");
 	} finally {
 		producer.dispose();
@@ -373,8 +375,8 @@ Deno.test("autoConnect: publish works without an explicit connect()", async () =
 	}
 });
 
-Deno.test("terminal auth failure rejects connect() and emits terminated", async () => {
-	const server = startServer({ verify: () => null });
+test("terminal auth failure rejects connect() and emits terminated", async () => {
+	const server = await startServer({ verify: () => null });
 	const c = client(server.url, { reconnectDelay: 20 });
 
 	try {
@@ -383,25 +385,25 @@ Deno.test("terminal auth failure rejects connect() and emits terminated", async 
 
 		// The whole point of rejecting: a bad token throws where you await,
 		// instead of firing an event you forgot to subscribe to.
-		const error = await assertRejects(() => c.connect(), WSTerminatedError);
-		assertEquals(error.code, 4001);
+		const error = await rejection(() => c.connect(), WSTerminatedError);
+		assert.deepEqual(error.code, 4001);
 
-		assertEquals(terminated.length, 1);
-		assertEquals(c.connectionState, "terminated");
+		assert.deepEqual(terminated.length, 1);
+		assert.deepEqual(c.connectionState, "terminated");
 
 		// And it must stay given-up rather than quietly retrying forever.
 		const attemptsBefore = c.dump().attempt;
 		await new Promise((r) => setTimeout(r, 300));
-		assertEquals(c.dump().attempt, attemptsBefore);
-		assertEquals(c.connectionState, "terminated");
+		assert.deepEqual(c.dump().attempt, attemptsBefore);
+		assert.deepEqual(c.connectionState, "terminated");
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("verify assigns clientId and namespace", async () => {
-	const server = startServer({
+test("verify assigns clientId and namespace", async () => {
+	const server = await startServer({
 		verify: (payload) => {
 			const token = (payload as { token?: string })?.token;
 			if (token !== "good") return null;
@@ -416,17 +418,17 @@ Deno.test("verify assigns clientId and namespace", async () => {
 	try {
 		await c.connect();
 		// The server's assignment wins over the client's request.
-		assertEquals(c.clientId, "assigned-id");
-		assertEquals(c.namespace, "assigned-ns");
+		assert.deepEqual(c.clientId, "assigned-id");
+		assert.deepEqual(c.namespace, "assigned-ns");
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("verify sees the identity the client requested", async () => {
+test("verify sees the identity the client requested", async () => {
 	const seen: WSRequestedIdentity[] = [];
-	const server = startServer({
+	const server = await startServer({
 		verify: (_payload, _request, requested) => {
 			seen.push(requested);
 			return {};
@@ -436,18 +438,18 @@ Deno.test("verify sees the identity the client requested", async () => {
 
 	try {
 		await c.connect();
-		assertEquals(seen, [{ clientId: "alice", namespace: "org-1" }]);
+		assert.deepEqual(seen, [{ clientId: "alice", namespace: "org-1" }]);
 		// Unchanged fallback: nothing assigned, so the proposals are honoured.
-		assertEquals(c.clientId, "alice");
-		assertEquals(c.namespace, "org-1");
+		assert.deepEqual(c.clientId, "alice");
+		assert.deepEqual(c.namespace, "org-1");
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("verify can reject a namespace the client is not entitled to", async () => {
-	const server = startServer({
+test("verify can reject a namespace the client is not entitled to", async () => {
+	const server = await startServer({
 		verify: (payload, _request, requested) => {
 			const org = (payload as { org?: string })?.org;
 			return requested.namespace === org ? {} : null;
@@ -463,11 +465,11 @@ Deno.test("verify can reject a namespace the client is not entitled to", async (
 	});
 
 	try {
-		const error = await assertRejects(() => intruder.connect(), WSTerminatedError);
-		assertEquals(error.code, 4001);
+		const error = await rejection(() => intruder.connect(), WSTerminatedError);
+		assert.deepEqual(error.code, 4001);
 
 		await tenant.connect();
-		assertEquals(tenant.namespace, "org-1");
+		assert.deepEqual(tenant.namespace, "org-1");
 	} finally {
 		intruder.dispose();
 		tenant.dispose();
@@ -475,8 +477,8 @@ Deno.test("verify can reject a namespace the client is not entitled to", async (
 	}
 });
 
-Deno.test("HTTP routes are absent without httpAuth", async () => {
-	const server = startServer();
+test("HTTP routes are absent without httpAuth", async () => {
+	const server = await startServer();
 	try {
 		// Mounting an unauthenticated "push into any room" endpoint by default
 		// would be a real vulnerability; and /stats names every namespace that
@@ -486,18 +488,18 @@ Deno.test("HTTP routes are absent without httpAuth", async () => {
 			body: JSON.stringify({ x: 1 }),
 		});
 		await injected.body?.cancel();
-		assertEquals(injected.status, 404);
+		assert.deepEqual(injected.status, 404);
 
 		const stats = await fetch(`${server.httpUrl}/stats`);
 		await stats.body?.cancel();
-		assertEquals(stats.status, 404);
+		assert.deepEqual(stats.status, 404);
 	} finally {
 		await server.stop();
 	}
 });
 
-Deno.test("a malformed injection body is the client's mistake, not a 500", async () => {
-	const server = startServer({ httpAuth: adminOnly });
+test("a malformed injection body is the client's mistake, not a 500", async () => {
+	const server = await startServer({ httpAuth: adminOnly });
 	try {
 		const res = await fetch(`${server.httpUrl}/publish/default/chat`, {
 			method: "POST",
@@ -505,14 +507,14 @@ Deno.test("a malformed injection body is the client's mistake, not a 500", async
 			body: "{ not json",
 		});
 		await res.body?.cancel();
-		assertEquals(res.status, 400);
+		assert.deepEqual(res.status, 400);
 	} finally {
 		await server.stop();
 	}
 });
 
-Deno.test("HTTP injection works when guarded", async () => {
-	const server = startServer({ httpAuth: adminOnly, allowBroadcast: () => true });
+test("HTTP injection works when guarded", async () => {
+	const server = await startServer({ httpAuth: adminOnly, allowBroadcast: () => true });
 	const c = client(server.url);
 
 	try {
@@ -525,26 +527,26 @@ Deno.test("HTTP injection works when guarded", async () => {
 			body: JSON.stringify({ x: 1 }),
 		});
 		await denied.body?.cancel();
-		assertEquals(denied.status, 401);
+		assert.deepEqual(denied.status, 401);
 
 		const res = await fetch(`${server.httpUrl}/publish/default/chat`, {
 			method: "POST",
 			headers: { "x-key": "secret", "content-type": "application/json" },
 			body: JSON.stringify({ text: "from http" }),
 		});
-		assertEquals(res.status, 200);
-		assertEquals(await res.json(), { ok: true, recipients: 1 });
+		assert.deepEqual(res.status, 200);
+		assert.deepEqual(await res.json(), { ok: true, recipients: 1 });
 
 		await until(() => seen.length === 1, "http-injected message arrives");
-		assertEquals(seen[0].from, null);
+		assert.deepEqual(seen[0].from, null);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("stats reports connections, rooms and namespaces", async () => {
-	const server = startServer({ httpAuth: adminOnly });
+test("stats reports connections, rooms and namespaces", async () => {
+	const server = await startServer({ httpAuth: adminOnly });
 	const one = client(server.url, { namespace: "org-1" });
 	const two = client(server.url, { namespace: "org-1" });
 
@@ -556,11 +558,11 @@ Deno.test("stats reports connections, rooms and namespaces", async () => {
 		const res = await fetch(`${server.httpUrl}/stats`, {
 			headers: { "x-key": "secret" },
 		});
-		assertEquals(res.status, 200);
+		assert.deepEqual(res.status, 200);
 		const stats = await res.json();
-		assertEquals(stats.connections, 2);
-		assertEquals(stats.rooms, 1);
-		assertEquals(stats.namespaces, { "org-1": 2 });
+		assert.deepEqual(stats.connections, 2);
+		assert.deepEqual(stats.rooms, 1);
+		assert.deepEqual(stats.namespaces, { "org-1": 2 });
 	} finally {
 		one.dispose();
 		two.dispose();
@@ -568,19 +570,26 @@ Deno.test("stats reports connections, rooms and namespaces", async () => {
 	}
 });
 
-Deno.test("a plain GET on the upgrade route explains itself", async () => {
-	const server = startServer();
+test("a plain GET on the upgrade route explains itself", async () => {
+	const server = await startServer();
 	try {
 		const res = await fetch(server.httpUrl);
 		await res.body?.cancel();
-		assertEquals(res.status, 426);
+		assert.deepEqual(res.status, 426);
 	} finally {
 		await server.stop();
 	}
 });
 
-/** A handshake request built by hand, so the `Origin` can be chosen freely. */
-function upgradeFetch(url: string, origin?: string): Promise<Response> {
+/**
+ * A handshake request built by hand, so the `Origin` can be chosen freely.
+ * Over `node:http`, because `fetch` refuses an `upgrade` header on Node. A
+ * `101` is answered by closing the socket; anything else is read to the end.
+ */
+function upgradeFetch(
+	url: string,
+	origin?: string,
+): Promise<{ status: number; body: string }> {
 	const headers: Record<string, string> = {
 		upgrade: "websocket",
 		connection: "Upgrade",
@@ -588,12 +597,26 @@ function upgradeFetch(url: string, origin?: string): Promise<Response> {
 		"sec-websocket-version": "13",
 	};
 	if (origin !== undefined) headers.origin = origin;
-	return fetch(url, { headers });
+	return new Promise((resolve, reject) => {
+		const req = request(url, { headers });
+		req.once("upgrade", (res, socket) => {
+			socket.destroy();
+			resolve({ status: res.statusCode ?? 0, body: "" });
+		});
+		req.once("response", (res) => {
+			let body = "";
+			res.setEncoding("utf8");
+			res.on("data", (chunk: string) => (body += chunk));
+			res.once("end", () => resolve({ status: res.statusCode ?? 0, body }));
+		});
+		req.once("error", reject);
+		req.end();
+	});
 }
 
-Deno.test("an unlisted Origin is refused before verify runs", async () => {
+test("an unlisted Origin is refused before verify runs", async () => {
 	let verifyCalls = 0;
-	const server = startServer({
+	const server = await startServer({
 		allowedOrigins: ["https://app.example"],
 		verify: () => {
 			verifyCalls++;
@@ -603,35 +626,34 @@ Deno.test("an unlisted Origin is refused before verify runs", async () => {
 
 	try {
 		const res = await upgradeFetch(server.httpUrl, "https://evil.example");
-		assertEquals(res.status, 403);
-		assertEquals(await res.text(), "Origin not allowed");
-		assertEquals(verifyCalls, 0);
+		assert.deepEqual(res.status, 403);
+		assert.deepEqual(res.body, "Origin not allowed");
+		assert.deepEqual(verifyCalls, 0);
 
 		const allowed = await upgradeFetch(server.httpUrl, "https://app.example");
-		assertEquals(allowed.status, 101);
-		await allowed.body?.cancel();
+		assert.deepEqual(allowed.status, 101);
 	} finally {
 		await server.stop();
 	}
 });
 
-Deno.test("the array form lets a client that sends no Origin through", async () => {
-	// Only browsers send the header; Deno's own WebSocket sends none.
-	const server = startServer({ allowedOrigins: ["https://app.example"] });
+test("the array form lets a client that sends no Origin through", async () => {
+	// Only browsers send the header; Node's and Deno's own WebSocket send none.
+	const server = await startServer({ allowedOrigins: ["https://app.example"] });
 	const c = client(server.url);
 
 	try {
 		await c.connect();
-		assertEquals(c.connected, true);
+		assert.deepEqual(c.connected, true);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("the function form decides on its own", async () => {
+test("the function form decides on its own", async () => {
 	const seen: (string | null)[] = [];
-	const server = startServer({
+	const server = await startServer({
 		allowedOrigins: (origin) => {
 			seen.push(origin);
 			return origin === "https://app.example";
@@ -641,45 +663,43 @@ Deno.test("the function form decides on its own", async () => {
 	try {
 		// Unlike the array form, a missing Origin is not a free pass here.
 		const missing = await upgradeFetch(server.httpUrl);
-		await missing.body?.cancel();
-		assertEquals(missing.status, 403);
+		assert.deepEqual(missing.status, 403);
 
 		const allowed = await upgradeFetch(server.httpUrl, "https://app.example");
-		assertEquals(allowed.status, 101);
-		await allowed.body?.cancel();
+		assert.deepEqual(allowed.status, 101);
 
-		assertEquals(seen, [null, "https://app.example"]);
+		assert.deepEqual(seen, [null, "https://app.example"]);
 	} finally {
 		await server.stop();
 	}
 });
 
-Deno.test("subscribe() rejects forbidden for a room the policy refuses, and the room is not held", async () => {
-	const server = startServer({ allowSubscribe: (_ctx, room) => room !== "private" });
+test("subscribe() rejects forbidden for a room the policy refuses, and the room is not held", async () => {
+	const server = await startServer({ allowSubscribe: (_ctx, room) => room !== "private" });
 	const c = client(server.url);
 
 	try {
 		await c.connect();
-		const err = await assertRejects(
+		const err = await rejection(
 			() => c.subscribe("private", () => {}),
 			WSRemoteError,
 		);
-		assertEquals(err.code, "forbidden");
-		assertEquals(err.details, { refused: ["private"] });
-		assertEquals(c.isSubscribed("private"), false);
-		assertEquals(server.service.members("private"), []);
+		assert.deepEqual(err.code, "forbidden");
+		assert.deepEqual(err.details, { refused: ["private"] });
+		assert.deepEqual(c.isSubscribed("private"), false);
+		assert.deepEqual(server.service.members("private"), []);
 
 		await c.subscribe("public", () => {});
-		assertEquals(c.isSubscribed("public"), true);
+		assert.deepEqual(c.isSubscribed("public"), true);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("a room refused on reconnect is dropped locally and reported; the rest survive", async () => {
+test("a room refused on reconnect is dropped locally and reported; the rest survive", async () => {
 	let allowed = new Set(["a", "b"]);
-	const server = startServer({ allowSubscribe: (_ctx, room) => allowed.has(room) });
+	const server = await startServer({ allowSubscribe: (_ctx, room) => allowed.has(room) });
 	const c = client(server.url);
 
 	try {
@@ -699,25 +719,25 @@ Deno.test("a room refused on reconnect is dropped locally and reported; the rest
 		await until(() => errors.length === 1, "the refusal is reported");
 		const err = errors[0];
 		assert(err instanceof WSRemoteError);
-		assertEquals(err.code, "forbidden");
-		assertEquals(err.details, { refused: ["b"] });
+		assert.deepEqual(err.code, "forbidden");
+		assert.deepEqual(err.details, { refused: ["b"] });
 
 		// "a" is live on both sides; "b" is gone on both.
-		assertEquals(c.isSubscribed("a"), true);
-		assertEquals(c.isSubscribed("b"), false);
-		assertEquals(server.service.members("a"), [c.clientId]);
-		assertEquals(server.service.members("b"), []);
+		assert.deepEqual(c.isSubscribed("a"), true);
+		assert.deepEqual(c.isSubscribed("b"), false);
+		assert.deepEqual(server.service.members("a"), [c.clientId]);
+		assert.deepEqual(server.service.members("b"), []);
 		await server.service.publish("a", { still: true });
 		await until(() => seenA.length === 1, "a still delivers");
-		assertEquals(seenB.length, 0);
+		assert.deepEqual(seenB.length, 0);
 	} finally {
 		c.dispose();
 		await server.stop();
 	}
 });
 
-Deno.test("publish() rejects forbidden when allowPublish refuses", async () => {
-	const server = startServer({
+test("publish() rejects forbidden when allowPublish refuses", async () => {
+	const server = await startServer({
 		// `meta` is whatever verify returns; here, the role the auth payload names.
 		verify: (payload) => ({ meta: { role: payload } }),
 		allowPublish: (ctx, room) => ctx.meta.role === "editor" || room === "lobby",
@@ -728,10 +748,10 @@ Deno.test("publish() rejects forbidden when allowPublish refuses", async () => {
 	try {
 		await reader.connect();
 		await editor.connect();
-		const err = await assertRejects(() => reader.publish("docs", 1), WSRemoteError);
-		assertEquals(err.code, "forbidden");
-		assertEquals(await reader.publish("lobby", 1), { recipients: 0 });
-		assertEquals(await editor.publish("docs", 1), { recipients: 0 });
+		const err = await rejection(() => reader.publish("docs", 1), WSRemoteError);
+		assert.deepEqual(err.code, "forbidden");
+		assert.deepEqual(await reader.publish("lobby", 1), { recipients: 0 });
+		assert.deepEqual(await editor.publish("docs", 1), { recipients: 0 });
 	} finally {
 		reader.dispose();
 		editor.dispose();

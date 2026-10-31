@@ -22,33 +22,26 @@ any language.
   (re)connect
 - **Two ways to talk** — plain messages to and from the server, fire-and-forget
   or request/response; or namespaces, rooms, presence and broadcast
-- **Runs everywhere** — `WebSocket` is a global in browsers, Deno, Node 22+, Bun
-  and Workers, so there is no polyfill and no transport dependency
+- **Runs everywhere** — `WebSocket` is a global in browsers, Node 22+, Deno and
+  Workers, so there is no polyfill and no transport dependency
 - **Svelte-store compatible** reactive connection state
 
 ## Installation
 
 ```bash
 npm install @marianmeres/ws
+# only if you run the reference server (/server), on Node:
+npm install @marianmeres/demino ws
 ```
 
-```bash
-deno add jsr:@marianmeres/ws
-```
+The reference server is `@marianmeres/ws/server`. It runs under any demino 2.0
+adapter — `@marianmeres/demino/node`, which upgrades through the `ws` package,
+or `@marianmeres/demino/deno`. `@marianmeres/demino` is an optional peer
+dependency, so the server shares your app's demino instead of bringing a second
+copy, and a client-only install never pulls in a server framework.
 
-The reference server is `@marianmeres/ws/server` on both registries. It runs
-under any demino 2.0 adapter — `@marianmeres/demino/deno`, or
-`@marianmeres/demino/node` with the optional `ws` package — and a bare
-`Deno.serve(app)` host still works through `Deno.upgradeWebSocket`. On Node:
-
-```bash
-npm install @marianmeres/ws @marianmeres/demino ws
-```
-
-`@marianmeres/demino` is an optional peer dependency of the npm package, so the
-server shares your app's demino instead of bringing a second copy. The client is
-fully runtime-agnostic and needs none of that: `npm install @marianmeres/ws`
-alone does not pull demino in.
+The package is also on JSR (`deno add jsr:@marianmeres/ws`). On Deno, a bare
+`Deno.serve(app)` host works too, through `Deno.upgradeWebSocket`.
 
 ## Two ways to use it
 
@@ -115,6 +108,7 @@ server, and Appendix A is a conformance script that drives this client against
 yours. The reference server does it with one hook and one method:
 
 ```typescript
+import { serve } from "@marianmeres/demino/node";
 import { createWSApp, WSRemoteError } from "@marianmeres/ws/server";
 
 const { app, service } = createWSApp("/ws", [], {
@@ -134,7 +128,7 @@ const { app, service } = createWSApp("/ws", [], {
 // Push to one client, any time.
 service.send(userId, { op: "progress", done: 42 });
 
-Deno.serve(app);
+await serve(app, { port: 8000 });
 ```
 
 ### 2. Rooms — the server as a relay
@@ -182,6 +176,7 @@ ws.members("room"); // last known membership
 **The server:**
 
 ```typescript
+import { serve } from "@marianmeres/demino/node";
 import { createWSApp } from "@marianmeres/ws/server";
 
 const { app, service } = createWSApp("/ws", [], {
@@ -202,7 +197,7 @@ const { app, service } = createWSApp("/ws", [], {
 // Push into a room from anywhere in your app.
 await service.publish("notifications", { text: "deploy finished" }, "org-123");
 
-Deno.serve(app);
+await serve(app, { port: 8000 });
 ```
 
 Namespace is the isolation boundary, and it falls back to what the client asked
@@ -279,7 +274,8 @@ A complete room chat — demino server plus a plain HTML client — lives in
 [example/](https://github.com/marianmeres/ws/tree/master/example):
 
 ```bash
-deno task example    # builds the client bundle, then serves on :8000
+pnpm install
+pnpm run example     # builds the client bundle, then serves on :8000
 ```
 
 It exercises the rooms side end to end: the handshake, namespaces, rooms,
